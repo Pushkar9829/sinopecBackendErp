@@ -3,6 +3,8 @@ const dotenv = require('dotenv');
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
+process.env.MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
+
 const required = [
   'MONGO_URI',
   'JWT_ACCESS_SECRET',
