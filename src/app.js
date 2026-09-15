@@ -2,7 +2,7 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const express = require('express');
 const helmet = require('helmet');
-const env = require('./config/env');
+const { applyCorsHeaders, isAllowedOrigin } = require('./config/cors');
 const errorHandler = require('./middlewares/errorHandler');
 const authRoutes = require('./modules/auth/auth.routes');
 const permissionRoutes = require('./modules/permission/permission.routes');
@@ -19,20 +19,6 @@ const ApiError = require('./utils/ApiError');
 
 const app = express();
 
-const allowedOrigins = new Set([
-  ...env.clientOrigins,
-  'http://localhost:5173',
-  'https://sinopecerpfrontend.vercel.app',
-]);
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  if (allowedOrigins.has(origin)) return true;
-  if (/^http:\/\/localhost:\d+$/.test(origin)) return true;
-  if (/^https:\/\/sinopecerpfrontend([.-][\w-]+)*\.vercel\.app$/.test(origin)) return true;
-  return false;
-}
-
 const corsOptions = {
   origin(origin, callback) {
     if (isAllowedOrigin(origin)) {
@@ -45,6 +31,14 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization'],
   optionsSuccessStatus: 204,
 };
+
+app.use((req, res, next) => {
+  applyCorsHeaders(req, res);
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
 
 app.use(
   helmet({

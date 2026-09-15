@@ -1,9 +1,12 @@
+const { applyCorsHeaders } = require('../config/cors');
 const env = require('../config/env');
 
 function errorHandler(err, req, res, next) {
   if (res.headersSent) {
     return next(err);
   }
+
+  applyCorsHeaders(req, res);
 
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({ success: false, message: 'File is too large (max 15 MB)' });
