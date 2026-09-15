@@ -27,10 +27,10 @@ app.use(
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || origin === env.clientOrigin) {
+      if (!origin || env.clientOrigins.includes(origin)) {
         return callback(null, true);
       }
-      if (!env.isProd && /^http:\/\/localhost:\d+$/.test(origin)) {
+      if (/^http:\/\/localhost:\d+$/.test(origin)) {
         return callback(null, true);
       }
       return callback(new Error('Not allowed by CORS'));

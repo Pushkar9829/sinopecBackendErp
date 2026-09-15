@@ -26,6 +26,10 @@ const env = {
   accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '15m',
   refreshTokenTtl: process.env.REFRESH_TOKEN_TTL || '7d',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
+  clientOrigins: String(process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
   superAdminUsername: process.env.SUPERADMIN_USERNAME,
   superAdminPassword: process.env.SUPERADMIN_PASSWORD,
   nodeEnv: process.env.NODE_ENV || 'development',
