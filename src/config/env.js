@@ -26,7 +26,10 @@ const env = {
   accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '15m',
   refreshTokenTtl: process.env.REFRESH_TOKEN_TTL || '7d',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
-  clientOrigins: String(process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+  clientOrigins: String(
+    process.env.CLIENT_ORIGIN ||
+      'http://localhost:5173,https://sinopecerpfrontend.vercel.app'
+  )
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
