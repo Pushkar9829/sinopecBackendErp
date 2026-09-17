@@ -33,11 +33,20 @@ function parseDurationMs(value) {
   return amount * map[unit];
 }
 
+function useCrossSiteCookies() {
+  const origins = env.clientOrigins || [env.clientOrigin];
+  return (
+    env.isProd ||
+    origins.some((origin) => String(origin || '').startsWith('https://'))
+  );
+}
+
 function cookieOptions(maxAge) {
+  const crossSite = useCrossSiteCookies();
   return {
     httpOnly: true,
-    secure: env.isProd,
-    sameSite: env.isProd ? 'none' : 'lax',
+    secure: crossSite,
+    sameSite: crossSite ? 'none' : 'lax',
     path: '/',
     maxAge,
   };
@@ -49,10 +58,11 @@ function setAuthCookies(res, accessToken, refreshToken) {
 }
 
 function clearAuthCookies(res) {
+  const crossSite = useCrossSiteCookies();
   const base = {
     httpOnly: true,
-    secure: env.isProd,
-    sameSite: env.isProd ? 'none' : 'lax',
+    secure: crossSite,
+    sameSite: crossSite ? 'none' : 'lax',
     path: '/',
   };
   res.clearCookie(COOKIES.ACCESS, base);

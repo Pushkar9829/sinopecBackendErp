@@ -4,8 +4,16 @@ const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
 const { verifyAccessToken } = require('../utils/tokens');
 
+function readAccessToken(req) {
+  const header = req.headers.authorization || req.headers.Authorization;
+  if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+    return header.slice(7).trim();
+  }
+  return req.cookies?.[COOKIES.ACCESS] || null;
+}
+
 const authenticate = asyncHandler(async (req, res, next) => {
-  const token = req.cookies?.[COOKIES.ACCESS];
+  const token = readAccessToken(req);
   if (!token) {
     throw new ApiError(401, 'Authentication required');
   }

@@ -33,6 +33,15 @@ async function issueSession(res, user) {
   });
 
   setAuthCookies(res, accessToken, refreshToken);
+  return { accessToken, refreshToken };
+}
+
+function withTokens(user, tokens) {
+  return {
+    ...toPublicUser(user),
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+  };
 }
 
 async function login(res, username, password) {
@@ -53,12 +62,12 @@ async function login(res, username, password) {
   await userRepo.updateById(user._id, { lastLoginAt: new Date() });
   user.lastLoginAt = new Date();
 
-  await issueSession(res, user);
-  return toPublicUser(user);
+  const tokens = await issueSession(res, user);
+  return withTokens(user, tokens);
 }
 
 async function logout(req, res) {
-  const refreshToken = req.cookies?.[COOKIES.REFRESH];
+  const refreshToken = req.cookies?.[COOKIES.REFRESH] || req.body?.refreshToken;
   if (refreshToken) {
     await authRepo.revokeByHash(hashToken(refreshToken));
   }
@@ -66,7 +75,7 @@ async function logout(req, res) {
 }
 
 async function refresh(req, res) {
-  const refreshToken = req.cookies?.[COOKIES.REFRESH];
+  const refreshToken = req.cookies?.[COOKIES.REFRESH] || req.body?.refreshToken;
   if (!refreshToken) {
     throw new ApiError(401, 'Refresh token missing');
   }
@@ -93,8 +102,8 @@ async function refresh(req, res) {
   }
 
   await authRepo.revokeByHash(hashToken(refreshToken));
-  await issueSession(res, user);
-  return toPublicUser(user);
+  const tokens = await issueSession(res, user);
+  return withTokens(user, tokens);
 }
 
 function me(user) {
