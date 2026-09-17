@@ -1856,7 +1856,8 @@ async function dropStaleUserEmailIndex() {
     await collection.dropIndex('email_1');
     console.log('Dropped stale users.email_1 index');
   } catch (error) {
-    if (error?.codeName !== 'IndexNotFound' && error?.code !== 27) {
+    // IndexNotFound (27) or NamespaceNotFound (26) when users collection is empty/new
+    if (error?.codeName !== 'IndexNotFound' && error?.codeName !== 'NamespaceNotFound' && error?.code !== 27 && error?.code !== 26) {
       throw error;
     }
   }
