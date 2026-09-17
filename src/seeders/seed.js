@@ -1850,7 +1850,20 @@ async function resetDemoCollections() {
   console.log('Reset demo customers, sales orders, inventory, and sales settings');
 }
 
+async function dropStaleUserEmailIndex() {
+  const collection = mongoose.connection.collection('users');
+  try {
+    await collection.dropIndex('email_1');
+    console.log('Dropped stale users.email_1 index');
+  } catch (error) {
+    if (error?.codeName !== 'IndexNotFound' && error?.code !== 27) {
+      throw error;
+    }
+  }
+}
+
 async function seed() {
+  await dropStaleUserEmailIndex();
   const permissions = await seedPermissions();
   await seedRoles(permissions);
   await seedSuperAdmin();
