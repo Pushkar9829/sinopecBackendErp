@@ -4,6 +4,10 @@ const dotenv = require('dotenv');
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 process.env.MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
+process.env.S3_BUCKET =
+  process.env.S3_BUCKET || process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_BUCKET || '';
+process.env.S3_PUBLIC_URL =
+  process.env.S3_PUBLIC_URL || process.env.CLOUDFRONT_DOMAIN || process.env.AWS_CLOUDFRONT_DOMAIN || '';
 
 const required = [
   'MONGO_URI',
@@ -38,6 +42,19 @@ const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
   isProd: process.env.NODE_ENV === 'production',
   uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, '../../uploads'),
+  s3: {
+    enabled: Boolean(
+      process.env.AWS_ACCESS_KEY_ID &&
+        process.env.AWS_SECRET_ACCESS_KEY &&
+        process.env.AWS_REGION &&
+        process.env.S3_BUCKET
+    ),
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+    region: process.env.AWS_REGION || '',
+    bucket: process.env.S3_BUCKET || '',
+    publicBaseUrl: process.env.S3_PUBLIC_URL || '',
+  },
 };
 
 module.exports = env;

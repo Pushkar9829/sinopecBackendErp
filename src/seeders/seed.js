@@ -312,8 +312,108 @@ async function seedDemoMachines(stagesBySlug) {
 }
 
 async function seedDemoCustomers() {
-  const existingCount = await customerRepo.countAll();
-  if (existingCount > 0) return customerRepo.findAll();
+  const abcProducts = [
+    demoItem({}),
+    demoItem({
+      product: 'Plain film roll',
+      productCode: 'FILM-010',
+      productType: 'Semi-finished',
+      size: '500 mm',
+      material: 'HDPE',
+      thickness: '40 micron',
+      width: '500 mm',
+      length: '1000 m',
+      color: 'Natural',
+      quantity: 20,
+      unit: 'roll',
+      rate: 1200,
+      productionRoute: PRODUCTION_ROUTES.ROLL_DISPATCH,
+      manufacturing: {
+        rawMaterial: 'HDPE granules',
+        materialType: 'Polymer',
+        materialGrade: 'Film grade',
+        requiredWeight: '400 kg',
+        requiredQuantity: '20 rolls',
+        width: '500 mm',
+        length: '1000 m',
+        thickness: '40 micron',
+        color: 'Natural',
+        additives: '',
+        specialRequirements: 'No print, dispatch as rolls',
+      },
+      roll: { width: '500 mm', length: '1000 m', weight: '20 kg' },
+      bag: { width: '', length: '', gusset: '' },
+      printing: { required: false, artwork: '', impressions: '', colorCount: '', colors: '', design: '', requirement: '' },
+      holes: { required: false, count: '', type: '', size: '', position: '' },
+      tape: { required: false, type: '' },
+    }),
+  ];
+
+  const deltaProducts = [
+    demoItem({
+      product: 'Printed courier bag',
+      productCode: 'BAG-220',
+      size: '12 × 16 inch',
+      width: '12 inch',
+      length: '16 inch',
+      quantity: 5000,
+      rate: 7,
+      productionRoute: PRODUCTION_ROUTES.ROLL_PRINT_DISPATCH,
+      manufacturing: {
+        rawMaterial: 'LDPE granules',
+        materialType: 'Polymer',
+        materialGrade: 'Bag grade',
+        requiredWeight: '180 kg',
+        requiredQuantity: '5000 pcs',
+        width: '12 inch',
+        length: '16 inch',
+        thickness: '50 micron',
+        color: 'White',
+        additives: '',
+        specialRequirements: 'Dispatch as printed rolls',
+      },
+      bag: { width: '', length: '', gusset: '' },
+      printing: {
+        required: true,
+        artwork: 'Delta_Logo.ai',
+        impressions: '1',
+        colorCount: '1',
+        colors: 'Black',
+        design: 'Company logo',
+        requirement: 'Single colour',
+      },
+      holes: { required: false, count: '', type: '', size: '', position: '' },
+      tape: { required: false, type: '' },
+    }),
+    demoItem({
+      product: 'Plain cutting bag',
+      productCode: 'BAG-080',
+      size: '10 × 14 inch',
+      width: '10 inch',
+      length: '14 inch',
+      color: 'Natural',
+      quantity: 8000,
+      rate: 4.25,
+      productionRoute: PRODUCTION_ROUTES.ROLL_CUT_DISPATCH,
+      manufacturing: {
+        rawMaterial: 'HDPE granules',
+        materialType: 'Polymer',
+        materialGrade: 'Bag grade',
+        requiredWeight: '220 kg',
+        requiredQuantity: '8000 pcs',
+        width: '10 inch',
+        length: '14 inch',
+        thickness: '40 micron',
+        color: 'Natural',
+        additives: '',
+        specialRequirements: 'No printing',
+      },
+      printing: { required: false, artwork: '', impressions: '', colorCount: '', colors: '', design: '', requirement: '' },
+      bag: { width: '250 mm', length: '350 mm', gusset: '40 mm' },
+      holes: { required: true, count: '1', type: 'Die cut', size: 'Handle', position: 'Top' },
+      tape: { required: false, type: '' },
+    }),
+  ];
 
   const samples = [
     {
@@ -326,6 +426,7 @@ async function seedDemoCustomers() {
       billingAddress: '12 Industrial Estate, Pune 411019',
       shippingAddress: '12 Industrial Estate, Pune 411019',
       priceCategory: 'Standard',
+      products: abcProducts,
     },
     {
       name: 'Delta Plastics',
@@ -337,8 +438,20 @@ async function seedDemoCustomers() {
       billingAddress: '88 Ring Road, Ahmedabad 380015',
       shippingAddress: 'Warehouse 4, Sanand, Ahmedabad 382110',
       priceCategory: 'Wholesale',
+      products: deltaProducts,
     },
   ];
+
+  const existing = await customerRepo.findAll();
+  if (existing.length > 0) {
+    for (const sample of samples) {
+      const customer = existing.find((row) => row.name === sample.name);
+      if (!customer) continue;
+      if ((customer.products || []).length > 0) continue;
+      await customerRepo.updateById(customer._id, { products: sample.products });
+    }
+    return customerRepo.findAll();
+  }
 
   const created = [];
   for (const sample of samples) {
@@ -1702,9 +1815,10 @@ async function seedProductionFloor() {
 }
 
 async function seedSalesSettings() {
-  if ((await salesSettingsRepo.countOptions()) === 0) {
-    for (const [group, values] of Object.entries(DEFAULT_SALES_OPTIONS)) {
-      for (const value of values) {
+  for (const [group, values] of Object.entries(DEFAULT_SALES_OPTIONS)) {
+    for (const value of values) {
+      const existing = await salesSettingsRepo.findOptionByGroupValue(group, value);
+      if (!existing) {
         await salesSettingsRepo.createOption({ group, value, isActive: true });
       }
     }

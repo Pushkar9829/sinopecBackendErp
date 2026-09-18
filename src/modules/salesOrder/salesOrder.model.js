@@ -63,6 +63,7 @@ const lineItemSchema = new mongoose.Schema(
       colors: { type: String, default: '', trim: true },
       design: { type: String, default: '', trim: true },
       requirement: { type: String, default: '', trim: true },
+      specialRequirements: { type: String, default: '', trim: true },
     },
     holes: {
       required: { type: Boolean, default: false },
@@ -70,10 +71,19 @@ const lineItemSchema = new mongoose.Schema(
       type: { type: String, default: '', trim: true },
       size: { type: String, default: '', trim: true },
       position: { type: String, default: '', trim: true },
+      specialRequirements: { type: String, default: '', trim: true },
     },
     tape: {
       required: { type: Boolean, default: false },
       type: { type: String, default: '', trim: true },
+    },
+    image: {
+      originalName: { type: String, default: '', trim: true },
+      mimeType: { type: String, default: '', trim: true },
+      dataUrl: { type: String, default: '' },
+      url: { type: String, default: '', trim: true },
+      key: { type: String, default: '', trim: true },
+      storage: { type: String, enum: ['', 'local', 's3'], default: '' },
     },
     currentStage: { type: String, default: '', trim: true },
     stagePickup: {
@@ -119,6 +129,9 @@ const attachmentSchema = new mongoose.Schema(
   {
     originalName: { type: String, required: true, trim: true },
     storedName: { type: String, required: true, trim: true },
+    key: { type: String, default: '', trim: true },
+    url: { type: String, default: '', trim: true },
+    storage: { type: String, enum: ['local', 's3'], default: 'local' },
     mimeType: { type: String, default: '', trim: true },
     size: { type: Number, default: 0 },
     kind: {

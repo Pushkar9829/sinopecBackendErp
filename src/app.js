@@ -15,7 +15,9 @@ const salesOrderRoutes = require('./modules/salesOrder/salesOrder.routes');
 const salesSettingsRoutes = require('./modules/salesSettings/salesSettings.routes');
 const productionRoutes = require('./modules/production/production.routes');
 const analyticsRoutes = require('./modules/analytics/analytics.routes');
+const mediaRoutes = require('./modules/media/media.routes');
 const ApiError = require('./utils/ApiError');
+const env = require('./config/env');
 
 const app = express();
 
@@ -48,6 +50,7 @@ app.use(
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
+app.use('/uploads', express.static(env.uploadsDir));
 
 app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'Sinopec API is running' });
@@ -64,6 +67,7 @@ app.use('/api/sales-orders', salesOrderRoutes);
 app.use('/api/sales-settings', salesSettingsRoutes);
 app.use('/api/production', productionRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/media', mediaRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));

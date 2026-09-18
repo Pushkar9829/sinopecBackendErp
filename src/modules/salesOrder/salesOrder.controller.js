@@ -1,4 +1,3 @@
-const fs = require('fs/promises');
 const asyncHandler = require('../../utils/asyncHandler');
 const salesOrderService = require('./salesOrder.service');
 
@@ -62,13 +61,8 @@ const cancel = asyncHandler(async (req, res) => {
 });
 
 const addAttachment = asyncHandler(async (req, res) => {
-  try {
-    const order = await salesOrderService.addAttachment(req.user, req.params.id, req.file, req.body.kind);
-    res.status(201).json({ success: true, data: order });
-  } catch (err) {
-    if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
-    throw err;
-  }
+  const order = await salesOrderService.addAttachment(req.user, req.params.id, req.file, req.body.kind);
+  res.status(201).json({ success: true, data: order });
 });
 
 const removeAttachment = asyncHandler(async (req, res) => {
@@ -77,11 +71,11 @@ const removeAttachment = asyncHandler(async (req, res) => {
 });
 
 const downloadAttachment = asyncHandler(async (req, res) => {
-  const { filePath, originalName } = await salesOrderService.getAttachmentFile(
-    req.params.id,
-    req.params.attachmentId
-  );
-  res.download(filePath, originalName);
+  const file = await salesOrderService.getAttachmentFile(req.params.id, req.params.attachmentId);
+  if (file.redirectUrl) {
+    return res.redirect(file.redirectUrl);
+  }
+  res.download(file.filePath, file.originalName);
 });
 
 module.exports = {

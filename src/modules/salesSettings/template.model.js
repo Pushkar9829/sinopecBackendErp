@@ -31,6 +31,7 @@ const templateSchema = new mongoose.Schema(
     printing: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     holes: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     tape: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    image: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   },
   { timestamps: true }
 );

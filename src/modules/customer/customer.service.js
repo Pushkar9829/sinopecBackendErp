@@ -3,6 +3,65 @@ const { nextCustomerCode } = require('../../utils/counter');
 const customerRepo = require('./customer.repo');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 
+function productKey(item) {
+  const code = String(item?.productCode || '')
+    .trim()
+    .toLowerCase();
+  if (code) return `code:${code}`;
+  const name = String(item?.product || '')
+    .trim()
+    .toLowerCase();
+  return name ? `name:${name}` : '';
+}
+
+function toPublicProduct(product) {
+  // Lazy require avoids circular import with salesOrder.service
+  const { normalizeItem } = require('../salesOrder/salesOrder.service');
+  const spec = normalizeItem(product);
+  return {
+    id: product._id ? String(product._id) : undefined,
+    product: spec.product,
+    productCode: spec.productCode,
+    productType: spec.productType,
+    size: spec.size,
+    material: spec.material,
+    thickness: spec.thickness,
+    width: spec.width,
+    length: spec.length,
+    color: spec.color,
+    quantity: spec.quantity,
+    unit: spec.unit,
+    rate: spec.rate,
+    discount: spec.discount,
+    taxPercent: spec.taxPercent,
+    productionRoute: spec.productionRoute,
+    manufacturing: spec.manufacturing,
+    roll: spec.roll,
+    bag: spec.bag,
+    printing: spec.printing,
+    holes: spec.holes,
+    tape: spec.tape,
+    image: spec.image,
+  };
+}
+
+function normalizeCustomerProducts(list) {
+  if (!Array.isArray(list)) return [];
+  const { normalizeItem } = require('../salesOrder/salesOrder.service');
+  const products = [];
+  for (const raw of list) {
+    const name = String(raw?.product || '').trim();
+    if (!name) continue;
+    const spec = normalizeItem(raw);
+    delete spec.currentStage;
+    delete spec.stageWork;
+    delete spec.amount;
+    if (raw._id || raw.id) spec._id = raw._id || raw.id;
+    products.push(spec);
+  }
+  return products;
+}
+
 function toPublicCustomer(customer) {
   return {
     id: String(customer._id),
@@ -16,6 +75,7 @@ function toPublicCustomer(customer) {
     billingAddress: customer.billingAddress || '',
     shippingAddress: customer.shippingAddress || '',
     priceCategory: customer.priceCategory || '',
+    products: (customer.products || []).map(toPublicProduct),
     isActive: customer.isActive,
     createdAt: customer.createdAt,
     updatedAt: customer.updatedAt,
@@ -75,6 +135,7 @@ async function createCustomer(payload) {
   }
   data.code = await nextCustomerCode();
   data.isActive = payload.isActive !== false;
+  data.products = normalizeCustomerProducts(payload.products);
   const customer = await customerRepo.create(data);
   return toPublicCustomer(customer);
 }
@@ -90,9 +151,44 @@ async function updateCustomer(id, payload) {
     throw new ApiError(400, 'Customer name is required');
   }
   if (payload.isActive !== undefined) data.isActive = payload.isActive;
+  if (payload.products !== undefined) {
+    data.products = normalizeCustomerProducts(payload.products);
+  }
 
   const updated = await customerRepo.updateById(id, data);
   return toPublicCustomer(updated);
+}
+
+async function attachProductsFromOrder(customerId, items) {
+  if (!customerId || !Array.isArray(items) || !items.length) return;
+
+  const customer = await customerRepo.findById(customerId);
+  if (!customer) return;
+
+  const existing = [...(customer.products || [])];
+  const known = new Set(existing.map(productKey).filter(Boolean));
+  let changed = false;
+
+  for (const item of items) {
+    const name = String(item?.product || '').trim();
+    if (!name) continue;
+    const key = productKey(item);
+    if (!key || known.has(key)) continue;
+
+    const { normalizeItem } = require('../salesOrder/salesOrder.service');
+    const spec = normalizeItem(item);
+    delete spec.currentStage;
+    delete spec.stageWork;
+    delete spec.amount;
+    delete spec._id;
+    existing.push(spec);
+    known.add(key);
+    changed = true;
+  }
+
+  if (changed) {
+    await customerRepo.updateById(customerId, { products: existing });
+  }
 }
 
 async function deleteCustomer(id) {
@@ -114,5 +210,6 @@ module.exports = {
   getCustomer,
   createCustomer,
   updateCustomer,
+  attachProductsFromOrder,
   deleteCustomer,
 };

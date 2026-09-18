@@ -16,8 +16,9 @@ const ApiError = require('../../utils/ApiError');
 const { nextSalesOrderNumber } = require('../../utils/counter');
 const { hasPermission } = require('../../utils/permissions');
 const customerRepo = require('../customer/customer.repo');
-const { snapshotFromCustomer } = require('../customer/customer.service');
+const { snapshotFromCustomer, attachProductsFromOrder } = require('../customer/customer.service');
 const { firstStage, itemProgress, nextStage, operatorStations, routeStages, stageRequirements } = require('../production/production.flow');
+const { uploadBuffer, deleteStoredObject } = require('../../utils/storage');
 const salesOrderRepo = require('./salesOrder.repo');
 
 const ROUTE_IDS = Object.values(PRODUCTION_ROUTES);
@@ -178,6 +179,7 @@ function toPublicItem(item) {
       colors: item.printing?.colors || '',
       design: item.printing?.design || '',
       requirement: item.printing?.requirement || '',
+      specialRequirements: item.printing?.specialRequirements || '',
     },
     holes: {
       required: Boolean(item.holes?.required),
@@ -185,10 +187,19 @@ function toPublicItem(item) {
       type: item.holes?.type || '',
       size: item.holes?.size || '',
       position: item.holes?.position || '',
+      specialRequirements: item.holes?.specialRequirements || '',
     },
     tape: {
       required: Boolean(item.tape?.required),
       type: item.tape?.type || '',
+    },
+    image: {
+      originalName: item.image?.originalName || '',
+      mimeType: item.image?.mimeType || '',
+      dataUrl: item.image?.dataUrl || '',
+      url: item.image?.url || '',
+      key: item.image?.key || '',
+      storage: item.image?.storage || '',
     },
     currentStage: item.currentStage || '',
     nextStage: item.currentStage && item.currentStage !== 'completed' ? nextStage(item.productionRoute, item.currentStage) : '',
@@ -203,6 +214,9 @@ function toPublicAttachment(attachment) {
     mimeType: attachment.mimeType || '',
     size: attachment.size || 0,
     kind: attachment.kind,
+    url: attachment.url || '',
+    key: attachment.key || attachment.storedName || '',
+    storage: attachment.storage || 'local',
     uploadedBy: toPublicUser(attachment.uploadedBy),
     createdAt: attachment.createdAt,
   };
@@ -371,13 +385,21 @@ function normalizeItem(raw = {}) {
   const printingSource = raw.printing || {};
   const printing = {
     required: routeHasPrint(productionRoute) || bool(printingSource.required),
-    ...normalizeGroup(printingSource, ['artwork', 'impressions', 'colorCount', 'colors', 'design', 'requirement']),
+    ...normalizeGroup(printingSource, [
+      'artwork',
+      'impressions',
+      'colorCount',
+      'colors',
+      'design',
+      'requirement',
+      'specialRequirements',
+    ]),
   };
 
   const holesSource = raw.holes || {};
   const holes = {
     required: bool(holesSource.required),
-    ...normalizeGroup(holesSource, ['count', 'type', 'size', 'position']),
+    ...normalizeGroup(holesSource, ['count', 'type', 'size', 'position', 'specialRequirements']),
   };
 
   const tapeSource = raw.tape || {};
@@ -385,6 +407,22 @@ function normalizeItem(raw = {}) {
     required: bool(tapeSource.required),
     type: str(tapeSource.type),
   };
+
+  const imageSource = raw.image || {};
+  const image = {
+    originalName: str(imageSource.originalName),
+    mimeType: str(imageSource.mimeType),
+    dataUrl: typeof imageSource.dataUrl === 'string' ? imageSource.dataUrl : '',
+    url: str(imageSource.url),
+    key: str(imageSource.key),
+    storage: str(imageSource.storage),
+  };
+  // Prefer S3/local URL; keep tiny legacy data URLs only when no url is present
+  if (image.url) {
+    image.dataUrl = '';
+  } else if (image.dataUrl.length > 2_500_000) {
+    throw new ApiError(400, 'Product image is too large (max about 2 MB). Configure S3 and upload via /api/media.');
+  }
 
   const item = {
     product: str(raw.product),
@@ -408,6 +446,7 @@ function normalizeItem(raw = {}) {
     printing,
     holes,
     tape,
+    image,
     currentStage: str(raw.currentStage),
     stageWork: Array.isArray(raw.stageWork) ? raw.stageWork : [],
   };
@@ -582,6 +621,7 @@ async function createOrder(user, payload) {
 
   applyTotals(doc, items, payload.discount, doc.advanceAmount);
   const created = await salesOrderRepo.create(doc);
+  await attachProductsFromOrder(customer._id, items);
   const loaded = await salesOrderRepo.findById(created._id);
   return present(loaded, user);
 }
@@ -604,6 +644,7 @@ async function updateOrder(user, id, payload) {
   applyTotals(order, items, payload.discount !== undefined ? payload.discount : order.discount, order.advanceAmount);
 
   await salesOrderRepo.save(order);
+  await attachProductsFromOrder(order.customer, items);
   const loaded = await salesOrderRepo.findById(order._id);
   return present(loaded, user);
 }
@@ -723,11 +764,21 @@ async function addAttachment(user, id, file, kind) {
     throw new ApiError(400, 'Invalid attachment type');
   }
 
-  order.attachments.push({
+  const uploaded = await uploadBuffer({
+    buffer: file.buffer,
     originalName: file.originalname,
-    storedName: file.filename,
     mimeType: file.mimetype,
-    size: file.size,
+    folder: `sales-orders/${id}`,
+  });
+
+  order.attachments.push({
+    originalName: uploaded.originalName,
+    storedName: uploaded.key,
+    key: uploaded.key,
+    url: uploaded.url,
+    storage: uploaded.storage,
+    mimeType: uploaded.mimeType,
+    size: uploaded.size,
     kind: attachmentKind,
     uploadedBy: user._id,
   });
@@ -744,8 +795,7 @@ async function removeAttachment(user, id, attachmentId) {
   if (!attachment) {
     throw new ApiError(404, 'Attachment not found');
   }
-  const filePath = path.join(attachmentDir(id), attachment.storedName);
-  await fs.unlink(filePath).catch(() => {});
+  await deleteStoredObject(attachment.key || attachment.storedName, attachment.storage || 'local');
   attachment.deleteOne();
   await salesOrderRepo.save(order);
   return present(await salesOrderRepo.findById(order._id), user);
@@ -757,11 +807,28 @@ async function getAttachmentFile(id, attachmentId) {
   if (!attachment) {
     throw new ApiError(404, 'Attachment not found');
   }
-  const filePath = path.join(attachmentDir(id), attachment.storedName);
+
+  if (attachment.url && (attachment.storage === 's3' || String(attachment.url).startsWith('http'))) {
+    return {
+      redirectUrl: attachment.url,
+      originalName: attachment.originalName,
+      mimeType: attachment.mimeType,
+    };
+  }
+
+  const key = attachment.key || attachment.storedName;
+  const filePath = path.isAbsolute(key) ? key : path.join(env.uploadsDir, key);
   try {
     await fs.access(filePath);
   } catch {
-    throw new ApiError(404, 'File is missing');
+    // Legacy path layout
+    const legacy = path.join(attachmentDir(id), attachment.storedName);
+    try {
+      await fs.access(legacy);
+      return { filePath: legacy, originalName: attachment.originalName, mimeType: attachment.mimeType };
+    } catch {
+      throw new ApiError(404, 'File is missing');
+    }
   }
   return { filePath, originalName: attachment.originalName, mimeType: attachment.mimeType };
 }
