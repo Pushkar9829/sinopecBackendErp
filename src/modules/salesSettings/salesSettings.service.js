@@ -123,6 +123,104 @@ async function deleteTemplate(id) {
   await repo.deleteTemplate(id);
 }
 
+const OPTION_FIELDS = [
+  ['productType', 'productType'],
+  ['material', 'material'],
+  ['unit', 'unit'],
+  ['color', 'color'],
+  ['thickness', 'thickness'],
+  ['size', 'size'],
+  ['manufacturing.rawMaterial', 'rawMaterial'],
+  ['manufacturing.materialType', 'materialType'],
+  ['manufacturing.materialGrade', 'materialGrade'],
+  ['manufacturing.additives', 'additive'],
+  ['manufacturing.width', 'width'],
+  ['manufacturing.length', 'length'],
+  ['manufacturing.thickness', 'thickness'],
+  ['manufacturing.color', 'color'],
+  ['roll.width', 'width'],
+  ['roll.length', 'length'],
+  ['roll.size', 'size'],
+  ['bag.width', 'width'],
+  ['bag.length', 'length'],
+  ['bag.size', 'size'],
+  ['holes.count', 'holeCount'],
+  ['holes.type', 'holeType'],
+  ['holes.size', 'holeSize'],
+  ['holes.position', 'holePosition'],
+  ['tape.type', 'tapeType'],
+  ['printing.impressions', 'printImpression'],
+  ['printing.colors', 'printColor'],
+  ['printing.design', 'printDesign'],
+];
+
+function readPath(source, path) {
+  return path.split('.').reduce((current, key) => (current == null ? undefined : current[key]), source);
+}
+
+async function rememberNewOptions(items) {
+  const options = await repo.findOptions();
+  const known = new Set(options.map((option) => `${option.group}::${String(option.value || '').trim().toLowerCase()}`));
+
+  for (const item of items) {
+    for (const [path, group] of OPTION_FIELDS) {
+      const value = String(readPath(item, path) || '').trim();
+      if (!value || value.length > 80) continue;
+      const key = `${group}::${value.toLowerCase()}`;
+      if (known.has(key)) continue;
+      known.add(key);
+      await repo.createOption({ group, value, isActive: true });
+    }
+  }
+}
+
+async function ensureTemplatesFromItems(rawItems = [], items = []) {
+  const templates = await repo.findTemplates();
+  const byId = new Map(templates.map((template) => [String(template._id), template]));
+  const names = new Set(
+    templates.map((template) => String(template.product || template.name || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const codes = new Set(
+    templates.map((template) => String(template.code || template.productCode || '').trim().toLowerCase()).filter(Boolean)
+  );
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const name = String(item?.product || '').trim();
+    if (!name) continue;
+
+    const templateId = String(rawItems[index]?.templateId || '').trim();
+    const linked = templateId ? byId.get(templateId) : null;
+    const linkedName = String(linked?.product || linked?.name || '').trim().toLowerCase();
+    if (linked && linkedName === name.toLowerCase()) continue;
+    if (names.has(name.toLowerCase())) continue;
+
+    const code = String(item.productCode || '').trim().toLowerCase();
+    if (code && codes.has(code)) continue;
+
+    const spec = { ...item };
+    delete spec._id;
+    delete spec.id;
+    delete spec.currentStage;
+    delete spec.stageWork;
+    delete spec.amount;
+    const created = await repo.createTemplate(
+      templatePayload({
+        ...spec,
+        name,
+        code: item.productCode || '',
+        product: name,
+        isActive: true,
+      })
+    );
+    names.add(name.toLowerCase());
+    if (code) codes.add(code);
+    byId.set(String(created._id), created);
+  }
+
+  await rememberNewOptions(items);
+}
+
 module.exports = {
   listOptions,
   createOption,
@@ -133,4 +231,5 @@ module.exports = {
   createTemplate,
   updateTemplate,
   deleteTemplate,
+  ensureTemplatesFromItems,
 };

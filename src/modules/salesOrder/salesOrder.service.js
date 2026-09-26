@@ -622,6 +622,7 @@ async function createOrder(user, payload) {
   applyTotals(doc, items, payload.discount, doc.advanceAmount);
   const created = await salesOrderRepo.create(doc);
   await attachProductsFromOrder(customer._id, items);
+  await require('../salesSettings/salesSettings.service').ensureTemplatesFromItems(payload.items, items);
   const loaded = await salesOrderRepo.findById(created._id);
   return present(loaded, user);
 }
@@ -645,6 +646,7 @@ async function updateOrder(user, id, payload) {
 
   await salesOrderRepo.save(order);
   await attachProductsFromOrder(order.customer, items);
+  await require('../salesSettings/salesSettings.service').ensureTemplatesFromItems(payload.items || [], items);
   const loaded = await salesOrderRepo.findById(order._id);
   return present(loaded, user);
 }
