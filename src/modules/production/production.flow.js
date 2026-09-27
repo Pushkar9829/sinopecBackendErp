@@ -47,7 +47,7 @@ function lastMakeStage(route) {
 }
 
 function canReadStage(user, stage) {
-  if (isSuperAdmin(user) || hasPermission(user, 'production:read')) return true;
+  if (isSuperAdmin(user) || hasPermission(user, 'production:read') || hasPermission(user, 'production:packing:read')) return true;
   const meta = FLOOR_STAGES.find((item) => item.id === stage);
   return meta ? hasPermission(user, meta.read) : false;
 }
@@ -104,18 +104,22 @@ function availableFromPrevious(item, stage) {
   return Math.max(0, stageStats(item, prev).output - stageStats(item, stage).input);
 }
 
+const FLOOR_ORDER_STATUSES = [
+  SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
+  SALES_ORDER_STATUSES.IN_PRODUCTION,
+  SALES_ORDER_STATUSES.READY_FOR_PACKING,
+  SALES_ORDER_STATUSES.PACKED,
+  SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
+  SALES_ORDER_STATUSES.DISPATCHED,
+];
+
 function itemVisibleAtStage(item, stage, orderStatus) {
-  const floor = [
-    SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
-    SALES_ORDER_STATUSES.IN_PRODUCTION,
-    SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
-    SALES_ORDER_STATUSES.DISPATCHED,
-  ];
-  if (!floor.includes(orderStatus)) return false;
+  if (!FLOOR_ORDER_STATUSES.includes(orderStatus)) return false;
   if (!routeStages(item.productionRoute).includes(stage)) return false;
   const stats = stageStats(item, stage);
-  if (stats.done) return false;
-  if (item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0) return true;
+  const holding = item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
+  if (stats.done) return holding;
+  if (holding) return true;
   const prev = previousStage(item.productionRoute, stage);
   if (!prev) return true;
   return availableFromPrevious(item, stage) > 0 || stats.output > 0 || stats.input > 0;
@@ -182,6 +186,38 @@ function previousOutput(item, stage) {
   };
 }
 
+function registerSpecs(order, item, stage) {
+  const roll = item.roll || {};
+  const rollSize = roll.size || [roll.width, roll.length].filter(Boolean).join(' × ') || '';
+  if (stage === 'rolling') {
+    return {
+      rollSize,
+      materialType: item.manufacturing?.materialType || item.material || '',
+      micron: item.thickness || item.manufacturing?.thickness || '',
+      colour: item.color || item.manufacturing?.color || '',
+      width: item.width || item.manufacturing?.width || roll.width || '',
+    };
+  }
+  if (stage === 'printing') {
+    return {
+      rollSize,
+      jobSize: item.size || '',
+      impression: item.printing?.impressions || '',
+      colorUsed: item.printing?.colors || item.color || '',
+    };
+  }
+  if (stage === 'cutting') {
+    const bag = item.bag || {};
+    const holes = item.holes || {};
+    return {
+      rollSize,
+      size: bag.size || [bag.width, bag.length].filter(Boolean).join(' × ') || item.size || '',
+      hole: holes.required ? [holes.count, holes.type, holes.size].filter(Boolean).join(' ') : '',
+    };
+  }
+  return {};
+}
+
 function stageRequirements(order, item, stage) {
   const incoming = previousOutput(item, stage);
   const stats = stageStats(item, stage);
@@ -245,6 +281,7 @@ function stageRequirements(order, item, stage) {
 
 module.exports = {
   FLOOR_STAGES,
+  FLOOR_ORDER_STATUSES,
   isDeliveryStage,
   ROUTE_BY_ID,
   isSuperAdmin,
@@ -265,4 +302,5 @@ module.exports = {
   itemProgress,
   previousOutput,
   stageRequirements,
+  registerSpecs,
 };

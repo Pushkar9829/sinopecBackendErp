@@ -14,6 +14,7 @@ const customerRoutes = require('./modules/customer/customer.routes');
 const salesOrderRoutes = require('./modules/salesOrder/salesOrder.routes');
 const salesSettingsRoutes = require('./modules/salesSettings/salesSettings.routes');
 const productionRoutes = require('./modules/production/production.routes');
+const registerRoutes = require('./modules/register/register.routes');
 const analyticsRoutes = require('./modules/analytics/analytics.routes');
 const mediaRoutes = require('./modules/media/media.routes');
 const ApiError = require('./utils/ApiError');
@@ -66,6 +67,7 @@ app.use('/api/customers', customerRoutes);
 app.use('/api/sales-orders', salesOrderRoutes);
 app.use('/api/sales-settings', salesSettingsRoutes);
 app.use('/api/production', productionRoutes);
+app.use('/api/registers', registerRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/media', mediaRoutes);
 

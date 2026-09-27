@@ -6,6 +6,7 @@ const machineRepo = require('../machine/machine.repo');
 const salesOrderRepo = require('../salesOrder/salesOrder.repo');
 const {
   FLOOR_STAGES,
+  FLOOR_ORDER_STATUSES,
   activeStage,
   availableFromPrevious,
   canReadStage,
@@ -13,6 +14,7 @@ const {
   isDeliveryStage,
   itemVisibleAtStage,
   previousStage,
+  registerSpecs,
   routeStages,
   stageRequirements,
   stageStats,
@@ -24,9 +26,6 @@ const SHIFT_IDS = PRODUCTION_SHIFTS.map((item) => item.id);
 
 function applyOrderStatus(order) {
   order.status = syncOrderStatus(order);
-  if (order.status === SALES_ORDER_STATUSES.DELIVERED && !order.completedAt) {
-    order.completedAt = new Date();
-  }
   if (order.status === SALES_ORDER_STATUSES.COMPLETED && !order.completedAt) {
     order.completedAt = new Date();
   }
@@ -36,6 +35,62 @@ function num(value, fallback = 0) {
   if (value === undefined || value === null || value === '') return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const TYPED_DETAIL_KEYS = [
+  'beam',
+  'tb',
+  'rollType',
+  'tubeMedium',
+  'tubeCore',
+  'tubeParticular',
+  'sheet8',
+  'tube8',
+  'recycled',
+  'exStock',
+  'weight',
+  'gross',
+  'tare',
+  'net',
+  'cylinderSize',
+  'gauge',
+  'uv',
+  'printDescription',
+  'wastage',
+  'tubeUsed',
+  'cuts',
+  'disc',
+  'knife',
+];
+
+function publicDetails(raw) {
+  const source = raw && typeof raw.toObject === 'function' ? raw.toObject() : raw;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!key || key.startsWith('_') || key.startsWith('$')) continue;
+    if (value == null || value === '') continue;
+    if (typeof value === 'object') continue;
+    out[key] = String(value);
+  }
+  return out;
+}
+
+function buildDetails(order, item, stage, raw) {
+  const specs = registerSpecs(order, item, stage);
+  const typed = {};
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const key of TYPED_DETAIL_KEYS) {
+      if (raw[key] == null || raw[key] === '') continue;
+      typed[key] = String(raw[key]).trim().slice(0, 200);
+    }
+  }
+  const details = {};
+  for (const [key, value] of Object.entries({ ...specs, ...typed })) {
+    if (value == null || String(value).trim() === '') continue;
+    details[key] = String(value).trim().slice(0, 200);
+  }
+  return details;
 }
 
 function toPublicWork(row) {
@@ -55,6 +110,7 @@ function toPublicWork(row) {
     vehicleNumber: row.vehicleNumber || '',
     handoverPerson: row.handoverPerson || '',
     deliveryPartner: row.deliveryPartner || '',
+    details: publicDetails(row.details),
     completedAt: row.completedAt,
   };
 }
@@ -185,14 +241,7 @@ async function listQueue(user, stage) {
   }
 
   const orders = await salesOrderRepo.findAll({
-    status: {
-      $in: [
-        SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
-        SALES_ORDER_STATUSES.IN_PRODUCTION,
-        SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
-        SALES_ORDER_STATUSES.DISPATCHED,
-      ],
-    },
+    status: { $in: FLOOR_ORDER_STATUSES },
   });
 
   const jobs = [];
@@ -200,7 +249,8 @@ async function listQueue(user, stage) {
   for (const order of orders) {
     for (const item of order.items || []) {
       if (itemVisibleAtStage(item, requested, order.status)) {
-        jobs.push(await toJob(order, item, requested));
+        const job = await toJob(order, item, requested);
+        if ((job.readyQty > 0) || job.pickup) jobs.push(job);
       }
       for (const floor of FLOOR_STAGES) {
         if (canReadStage(user, floor.id) && itemVisibleAtStage(item, floor.id, order.status)) {
@@ -209,6 +259,7 @@ async function listQueue(user, stage) {
       }
     }
   }
+  counts[requested] = jobs.length;
 
   return {
     stage: requested,
@@ -233,14 +284,7 @@ async function loadFloorItem(user, payload, { mustWork }) {
 
   const order = await salesOrderRepo.findById(payload.orderId);
   if (!order) throw new ApiError(404, 'Sales order not found');
-  if (
-    ![
-      SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
-      SALES_ORDER_STATUSES.IN_PRODUCTION,
-      SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
-      SALES_ORDER_STATUSES.DISPATCHED,
-    ].includes(order.status)
-  ) {
+  if (!FLOOR_ORDER_STATUSES.includes(order.status)) {
     throw new ApiError(400, 'This sales order is not on the production floor');
   }
 
@@ -255,7 +299,6 @@ async function loadFloorItem(user, payload, { mustWork }) {
 async function createShiftLot({ order, item, stage, category, qty, unit, shift, workDate }) {
   if (!stage || isDeliveryStage(stage) || qty <= 0) return null;
   const stageDoc = await stageRepo.findBySlug(stage);
-  if (!stageDoc) return null;
 
   const suffix = category === INVENTORY_CATEGORIES.WASTE ? 'waste' : 'output';
   const when = workDate ? new Date(workDate) : new Date();
@@ -270,7 +313,7 @@ async function createShiftLot({ order, item, stage, category, qty, unit, shift, 
     unit: unit || item.unit || 'pcs',
     quantity: qty,
     unitPrice: category === INVENTORY_CATEGORIES.WASTE ? null : 0,
-    stage: stageDoc._id,
+    stage: stageDoc?._id || null,
     notes: `From sales order ${order.number}`,
     isActive: true,
     kind: 'wip',
@@ -374,8 +417,7 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
   }
 
   await takeFromLot(lot, qty);
-  item.stageWork = item.stageWork || [];
-  item.stageWork.push({
+  const workRow = {
     stage,
     machine: null,
     machineName: '',
@@ -392,11 +434,15 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     vehicleNumber,
     handoverPerson,
     deliveryPartner,
+    details: buildDetails(order, item, stage, payload.details),
     completedAt: new Date(),
-  });
+  };
+  item.stageWork = item.stageWork || [];
+  item.stageWork.push(workRow);
   item.currentStage = activeStage(item);
   applyOrderStatus(order);
   await salesOrderRepo.save(order);
+  await require('../register/register.service').recordMark(order, item, workRow);
   return toJob(order, item, stage);
 }
 
@@ -406,7 +452,23 @@ async function releasePickup(user, payload) {
   if (!pickup || pickup.stage !== stage || !(Number(pickup.qty) > 0)) {
     throw new ApiError(400, 'Nothing is marked for working');
   }
-  await returnToLot(pickup.lot, Number(pickup.qty), pickup.unit);
+  await returnToLot(pickup.lot, Number(pickup.qty), pickup.unit, async (qty, unit) => {
+    const fromStage = pickup.fromStage || '';
+    await itemRepo.create({
+      category: fromStage ? INVENTORY_CATEGORIES.OUTPUT : INVENTORY_CATEGORIES.RAW,
+      name: pickup.lotName || `${order.number} returned`,
+      materialType: item.material || item.manufacturing?.materialType || 'WIP',
+      unit: unit || item.unit || 'pcs',
+      quantity: qty,
+      unitPrice: fromStage ? 0 : null,
+      notes: `Returned to store from ${order.number}`,
+      isActive: true,
+      kind: fromStage ? 'wip' : 'catalog',
+      wipStage: fromStage,
+      salesOrder: fromStage ? order._id : null,
+      lineItem: fromStage ? item._id : null,
+    });
+  });
   clearPickup(item);
   await salesOrderRepo.save(order);
   return toJob(order, item, stage);
@@ -428,6 +490,12 @@ async function completeStage(user, payload) {
   }
   if (produced <= 0) {
     throw new ApiError(400, 'Enter how much this shift produced');
+  }
+  if (!isDeliveryStage(stage) && outputQty + wasteQty - inputQty > 1e-6) {
+    throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+  }
+  if (!isDeliveryStage(stage) && inputQty - (outputQty + wasteQty) > 1e-6) {
+    throw new ApiError(400, 'Used cannot be more than made plus waste');
   }
   if (produced - stats.remaining > 1e-6) {
     throw new ApiError(400, `Only ${stats.remaining} left on this stage`);
@@ -499,8 +567,7 @@ async function completeStage(user, payload) {
     workDate,
   });
 
-  item.stageWork = item.stageWork || [];
-  item.stageWork.push({
+  const workRow = {
     stage,
     machine: machine?._id || null,
     machineName: machine ? `${machine.name}${machine.code ? ` (${machine.code})` : ''}` : '',
@@ -517,13 +584,131 @@ async function completeStage(user, payload) {
     vehicleNumber,
     handoverPerson,
     deliveryPartner,
+    details: buildDetails(order, item, stage, payload.details),
     completedAt: new Date(),
-  });
+  };
+  if (stage === 'printing' && wasteQty && !workRow.details.wastage) {
+    workRow.details.wastage = String(wasteQty);
+  }
+  item.stageWork = item.stageWork || [];
+  item.stageWork.push(workRow);
   item.currentStage = activeStage(item);
 
   applyOrderStatus(order);
   await salesOrderRepo.save(order);
+  await require('../register/register.service').recordMark(order, item, workRow);
   return require('../salesOrder/salesOrder.service').getOrder(user, order._id);
+}
+
+function chooseLot(lots, payload, needed) {
+  const wanted = String(payload.lotId || '');
+  const match = wanted
+    ? lots.find((lot) => lot.id === wanted)
+    : lots.find((lot) => Number(lot.quantity) + 1e-9 >= needed);
+  if (wanted && !match) {
+    throw new ApiError(400, 'That material is not available for this entry');
+  }
+  if (!match) {
+    const onHand = lots.reduce((sum, lot) => sum + (Number(lot.quantity) || 0), 0);
+    throw new ApiError(
+      400,
+      onHand > 0 ? `Only ${onHand} is in store. Enter that much or less.` : 'Nothing is in store for this entry'
+    );
+  }
+  if (Number(match.quantity) + 1e-9 < needed) {
+    throw new ApiError(400, `Only ${match.quantity} is left on ${match.name}`);
+  }
+  return match;
+}
+
+async function enterFromRegister(user, payload) {
+  const loaded = await loadFloorItem(user, payload, { mustWork: true });
+  const { order, item, stage } = loaded;
+  const outputQty = num(payload.outputQty);
+  const bookWaste = payload.details && payload.details.wastage;
+  const wasteQty = isDeliveryStage(stage)
+    ? 0
+    : payload.wasteQty === undefined || payload.wasteQty === null || payload.wasteQty === ''
+      ? stage === 'printing'
+        ? num(bookWaste)
+        : 0
+      : num(payload.wasteQty);
+  const inputQty =
+    payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === ''
+      ? outputQty + wasteQty
+      : num(payload.inputQty);
+  if (stage === 'printing') {
+    const wastageText = bookWaste == null ? '' : String(bookWaste).trim();
+    if (wastageText !== '' && !Number.isFinite(Number(wastageText))) {
+      throw new ApiError(400, 'Enter wastage as a number');
+    }
+  }
+  if (outputQty <= 0) throw new ApiError(400, 'Enter the production quantity');
+  if (!isDeliveryStage(stage) && outputQty + wasteQty - inputQty > 1e-6) {
+    throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+  }
+  if (!isDeliveryStage(stage) && inputQty - (outputQty + wasteQty) > 1e-6) {
+    throw new ApiError(400, 'Used cannot be more than made plus waste');
+  }
+
+  const stats = stageStats(item, stage);
+  if (outputQty - stats.remaining > 1e-6) {
+    throw new ApiError(400, `Only ${stats.remaining} left on this stage`);
+  }
+
+  const taken = isDeliveryStage(stage) ? outputQty : inputQty;
+  if (isDeliveryStage(stage)) {
+    const lots = await listSourceLots(order, item, stage);
+    const match = chooseLot(lots, payload, taken);
+    const lot = await itemRepo.findById(match.id);
+    const prev = previousStage(item.productionRoute, stage);
+    return sendDelivery(user, { order, item, stage, lot, qty: taken, prev, payload });
+  }
+
+  const pickup = toPublicPickup(item, stage);
+  let createdPickup = false;
+  if (!pickup) {
+    const lots = await listSourceLots(order, item, stage);
+    const match = chooseLot(lots, payload, taken);
+    await pickupLot(user, {
+      orderId: String(order._id),
+      itemId: String(item._id),
+      stage,
+      lotId: match.id,
+      qty: taken,
+    });
+    createdPickup = true;
+  } else if (taken - pickup.qty > 1e-6) {
+    throw new ApiError(400, `Only ${pickup.qty} is in hand. Enter that much or less.`);
+  }
+
+  try {
+    return await completeStage(user, {
+    orderId: String(order._id),
+    itemId: String(item._id),
+    stage,
+    machineId: payload.machineId,
+    inputQty,
+    outputQty,
+    wasteQty,
+    shift: payload.shift,
+    workDate: payload.workDate,
+    notes: payload.notes,
+    vehicleNumber: payload.vehicleNumber,
+    handoverPerson: payload.handoverPerson,
+    deliveryPartner: payload.deliveryPartner,
+    details: payload.details,
+  });
+  } catch (error) {
+    if (createdPickup) {
+      await releasePickup(user, {
+        orderId: String(order._id),
+        itemId: String(item._id),
+        stage,
+      }).catch(() => {});
+    }
+    throw error;
+  }
 }
 
 async function stageMachines(user, stage) {
@@ -543,8 +728,10 @@ async function stageMachines(user, stage) {
 
 module.exports = {
   listQueue,
+  sourceLots: listSourceLots,
   pickupLot,
   releasePickup,
   completeStage,
+  enterFromRegister,
   stageMachines,
 };

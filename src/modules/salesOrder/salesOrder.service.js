@@ -23,9 +23,6 @@ const salesOrderRepo = require('./salesOrder.repo');
 
 const ROUTE_IDS = Object.values(PRODUCTION_ROUTES);
 const ROUTE_BY_ID = new Map(PRODUCTION_ROUTE_LIST.map((route) => [route.id, route]));
-const NEXT_STATUS = Object.fromEntries(
-  SALES_ORDER_STATUS_FLOW.slice(0, -1).map((status, index) => [status, SALES_ORDER_STATUS_FLOW[index + 1]])
-);
 
 function str(value) {
   return value == null ? '' : String(value).trim();
@@ -114,6 +111,7 @@ function toPublicWork(row) {
     vehicleNumber: row.vehicleNumber || '',
     handoverPerson: row.handoverPerson || '',
     deliveryPartner: row.deliveryPartner || '',
+    details: row.details && typeof row.details === 'object' ? { ...row.details } : {},
     completedAt: row.completedAt,
   };
 }
@@ -265,7 +263,13 @@ function toPublicOrder(order) {
     cancelledAt: order.cancelledAt,
     cancelledBy: toPublicUser(order.cancelledBy),
     cancellationReason: order.cancellationReason || '',
-    nextStatus: NEXT_STATUS[order.status] || null,
+    nextStatus:
+      {
+        [SALES_ORDER_STATUSES.DRAFT]: SALES_ORDER_STATUSES.SUBMITTED,
+        [SALES_ORDER_STATUSES.SUBMITTED]: SALES_ORDER_STATUSES.APPROVED,
+        [SALES_ORDER_STATUSES.APPROVED]: SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
+        [SALES_ORDER_STATUSES.DELIVERED]: SALES_ORDER_STATUSES.COMPLETED,
+      }[order.status] || null,
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
   };
@@ -447,8 +451,8 @@ function normalizeItem(raw = {}) {
     holes,
     tape,
     image,
-    currentStage: str(raw.currentStage),
-    stageWork: Array.isArray(raw.stageWork) ? raw.stageWork : [],
+    currentStage: '',
+    stageWork: [],
   };
   item.amount = calcLine(item).amount;
   if (raw._id || raw.id) item._id = raw._id || raw.id;
@@ -693,11 +697,23 @@ async function planProduction(user, id) {
   }
   for (const item of order.items || []) {
     item.currentStage = firstStage(item.productionRoute);
-    item.stageWork = item.stageWork || [];
+    item.stageWork = [];
+    item.stagePickup = {
+      stage: '',
+      fromStage: '',
+      lot: null,
+      lotName: '',
+      qty: 0,
+      unit: '',
+      pickedBy: null,
+      pickedByName: '',
+      pickedAt: null,
+    };
   }
   order.status = SALES_ORDER_STATUSES.PRODUCTION_PLANNED;
   order.productionPlannedAt = new Date();
   await salesOrderRepo.save(order);
+  await require('../register/register.service').openForOrder(order);
   return present(await salesOrderRepo.findById(order._id), user);
 }
 
@@ -849,7 +865,8 @@ async function getSummary(user) {
     inProductionGroup:
       byStatus[SALES_ORDER_STATUSES.PRODUCTION_PLANNED] +
       byStatus[SALES_ORDER_STATUSES.IN_PRODUCTION] +
-      byStatus[SALES_ORDER_STATUSES.READY_FOR_PACKING],
+      byStatus[SALES_ORDER_STATUSES.READY_FOR_PACKING] +
+      byStatus[SALES_ORDER_STATUSES.PACKED],
     dispatchGroup:
       byStatus[SALES_ORDER_STATUSES.READY_FOR_DISPATCH] + byStatus[SALES_ORDER_STATUSES.DISPATCHED],
   };

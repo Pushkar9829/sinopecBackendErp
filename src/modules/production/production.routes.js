@@ -15,6 +15,7 @@ const VIEW_KEYS = [
   'production:rolling:read',
   'production:printing:read',
   'production:cutting:read',
+  'production:packing:read',
   'dispatch:read',
 ];
 
@@ -72,6 +73,30 @@ router.post(
     body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
   ]),
   productionController.releasePickup
+);
+
+router.post(
+  '/enter',
+  authenticate,
+  authorize.any(...WORK_KEYS),
+  validate([
+    body('orderId').isMongoId().withMessage('Invalid sales order'),
+    body('itemId').isMongoId().withMessage('Invalid line item'),
+    body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
+    body('outputQty').isFloat({ gt: 0 }).withMessage('Enter the production quantity'),
+    body('inputQty').optional().isFloat({ min: 0 }),
+    body('wasteQty').optional().isFloat({ min: 0 }),
+    body('lotId').optional({ nullable: true, checkFalsy: true }).isMongoId(),
+    body('machineId').optional({ nullable: true, checkFalsy: true }).isMongoId(),
+    body('shift').optional().isIn(['morning', 'afternoon', 'night']),
+    body('workDate').optional().isISO8601().withMessage('Invalid work date'),
+    body('notes').optional().isString(),
+    body('vehicleNumber').optional().isString(),
+    body('handoverPerson').optional().isString(),
+    body('deliveryPartner').optional().isString(),
+    body('details').optional().isObject().withMessage('Stage details must be an object'),
+  ]),
+  productionController.enterFromRegister
 );
 
 router.post(

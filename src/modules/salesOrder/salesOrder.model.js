@@ -116,6 +116,7 @@ const lineItemSchema = new mongoose.Schema(
           vehicleNumber: { type: String, default: '', trim: true },
           handoverPerson: { type: String, default: '', trim: true },
           deliveryPartner: { type: String, default: '', trim: true },
+          details: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
           completedAt: { type: Date, default: Date.now },
         },
       ],

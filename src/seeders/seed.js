@@ -24,7 +24,8 @@ const salesOrderRepo = require('../modules/salesOrder/salesOrder.repo');
 const salesSettingsRepo = require('../modules/salesSettings/salesSettings.repo');
 const { snapshotFromCustomer } = require('../modules/customer/customer.service');
 const { calcTotals, normalizeItem } = require('../modules/salesOrder/salesOrder.service');
-const { activeStage, nextStage, routeStages, stageStats } = require('../modules/production/production.flow');
+const { activeStage, nextStage, registerSpecs, routeStages, stageStats } = require('../modules/production/production.flow');
+const Register = require('../modules/register/register.model');
 const { nextCustomerCode, nextSalesOrderNumber } = require('../utils/counter');
 const SalesOrder = require('../modules/salesOrder/salesOrder.model');
 const Customer = require('../modules/customer/customer.model');
@@ -607,8 +608,58 @@ function withDeliveryHandover(stageWork, item, { finishDelivery = false } = {}) 
   return rows;
 }
 
+function bookDetails(item, row, index) {
+  const specs = registerSpecs(null, item, row.stage);
+  const n = index + 1;
+  let extra = {};
+  if (row.stage === 'rolling') {
+    extra = {
+      beam: `B-${n}`,
+      tb: '18×25',
+      rollType: n % 2 ? 'Centre fold' : 'Side seal',
+      tubeMedium: 'Paper',
+      tubeCore: '3 inch',
+      tubeParticular: 'Plain',
+      sheet8: n % 2 ? 'Yes' : '',
+      tube8: n % 2 ? '' : 'Yes',
+      recycled: '5',
+      exStock: n % 2 ? '' : 'D.S.',
+      weight: String(row.outputQty || ''),
+      gross: String((Number(row.outputQty) || 0) + 2),
+      tare: '2',
+      net: String(row.outputQty || ''),
+    };
+  } else if (row.stage === 'printing') {
+    extra = {
+      cylinderSize: '400 mm',
+      gauge: item.thickness || item.manufacturing?.thickness || '50 micron',
+      uv: n % 2 ? 'Yes' : 'No',
+      printDescription: item.printing?.design || item.printing?.requirement || 'Customer logo',
+      wastage: String(row.wasteQty || ''),
+    };
+  } else if (row.stage === 'cutting') {
+    extra = {
+      tubeUsed: '3 inch',
+      rollType: 'Centre fold',
+      cuts: String(Math.max(1, Math.round((Number(row.outputQty) || 1) / 100))),
+      disc: '80 mm',
+      knife: 'Slitter',
+    };
+  }
+  const details = {};
+  for (const [key, value] of Object.entries({ ...specs, ...extra })) {
+    if (value == null || String(value).trim() === '') continue;
+    details[key] = String(value).trim();
+  }
+  return details;
+}
+
 function withFloorProgress(item, stageWork, options) {
-  const next = { ...item, stageWork: withDeliveryHandover(stageWork, item, options) };
+  const rows = withDeliveryHandover(stageWork, item, options).map((row, index) => ({
+    ...row,
+    details: bookDetails(item, row, index),
+  }));
+  const next = { ...item, stageWork: rows };
   next.currentStage = activeStage(next);
   return next;
 }
@@ -1959,9 +2010,10 @@ async function resetDemoCollections() {
     InventoryItem.deleteMany({}),
     SalesOption.deleteMany({}),
     ProductTemplate.deleteMany({}),
+    Register.deleteMany({}),
   ]);
   await mongoose.connection.collection('counters').deleteMany({});
-  console.log('Reset demo customers, sales orders, inventory, and sales settings');
+  console.log('Reset demo customers, sales orders, inventory, registers, and sales settings');
 }
 
 async function dropStaleUserEmailIndex() {

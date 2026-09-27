@@ -21,6 +21,11 @@ const releasePickup = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
+const enterFromRegister = asyncHandler(async (req, res) => {
+  const data = await productionService.enterFromRegister(req.user, req.body);
+  res.json({ success: true, data });
+});
+
 const stageMachines = asyncHandler(async (req, res) => {
   const data = await productionService.stageMachines(req.user, req.params.stage);
   res.json({ success: true, data });
@@ -31,5 +36,6 @@ module.exports = {
   completeStage,
   pickupLot,
   releasePickup,
+  enterFromRegister,
   stageMachines,
 };
