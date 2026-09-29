@@ -10,6 +10,7 @@ const {
   registerSpecs,
   routeStages,
   stageStats,
+  stageUnit,
   visibleStages,
 } = require('../production/production.flow');
 const repo = require('./register.repo');
@@ -30,8 +31,7 @@ function canViewBooks(user) {
     visibleStages(user).length > 0 ||
     hasPermission(user, 'sales:read') ||
     hasPermission(user, 'accounts:read') ||
-    hasPermission(user, 'inventory:read') ||
-    hasPermission(user, 'production:packing:read')
+    hasPermission(user, 'inventory:read')
   );
 }
 
@@ -45,8 +45,7 @@ function canReadBook(user, stage) {
   return (
     hasPermission(user, 'sales:read') ||
     hasPermission(user, 'accounts:read') ||
-    hasPermission(user, 'inventory:read') ||
-    hasPermission(user, 'production:packing:read')
+    hasPermission(user, 'inventory:read')
   );
 }
 
@@ -83,7 +82,7 @@ function entryFromWork(item, row) {
     itemId: item._id,
     product: item.product || '',
     productCode: item.productCode || '',
-    unit: item.unit || 'pcs',
+    unit: stageUnit(item, row.stage),
     inputQty: Number(row.inputQty) || 0,
     outputQty: Number(row.outputQty) || 0,
     wasteQty: Number(row.wasteQty) || 0,
@@ -158,18 +157,24 @@ function entriesFromWork(order) {
   return entries;
 }
 
-async function ensureRegister(order) {
+async function ensureRegister(order, preloaded) {
   const stages = stagesForOrder(order);
   const customerName = customerNameOf(order);
-  let doc = await repo.findByOrderId(order._id);
+  let doc = preloaded === undefined ? await repo.findByOrderId(order._id) : preloaded;
   if (!doc) {
-    return repo.create({
-      salesOrder: order._id,
-      orderNumber: order.number,
-      customerName,
-      stages: stages.map((stage) => ({ stage })),
-      entries: entriesFromWork(order),
-    });
+    try {
+      return await repo.create({
+        salesOrder: order._id,
+        orderNumber: order.number,
+        customerName,
+        stages: stages.map((stage) => ({ stage })),
+        entries: entriesFromWork(order),
+      });
+    } catch (error) {
+      if (error?.code !== 11000) throw error;
+      doc = await repo.findByOrderId(order._id);
+      if (!doc) throw error;
+    }
   }
 
   let dirty = false;
@@ -198,6 +203,11 @@ async function ensureRegister(order) {
   }
   if (dirty) await repo.save(doc);
   return doc;
+}
+
+async function preloadRegisters(orders) {
+  const docs = await repo.findByOrderIds(orders.map((order) => order._id));
+  return new Map(docs.map((doc) => [String(doc.salesOrder), doc]));
 }
 
 async function openForOrder(order) {
@@ -232,8 +242,8 @@ function lineView(user, order, item, stage, doc) {
     itemId: String(item._id),
     product: item.product || '',
     productCode: item.productCode || '',
-    quantity: item.quantity || 0,
-    unit: item.unit || 'pcs',
+    quantity: stats.target,
+    unit: stats.unit,
     output: stats.output,
     remaining: stats.remaining,
     done: stats.done,
@@ -275,11 +285,12 @@ function presentOrder(user, order, doc) {
 async function list(user) {
   assertCanView(user);
   const orders = await salesOrderRepo.findAll({ status: { $in: REGISTER_STATUSES } });
+  const docs = await preloadRegisters(orders);
   const rows = [];
   for (const order of orders) {
     const stages = readableStages(user, order);
     if (!stages.length) continue;
-    const doc = await ensureRegister(order);
+    const doc = await ensureRegister(order, docs.get(String(order._id)) || null);
     const summary = presentOrder(user, order, doc);
     rows.push({
       id: summary.id,
@@ -338,11 +349,12 @@ async function getStage(user, stage) {
   }
 
   const orders = await salesOrderRepo.findAll({ status: { $in: REGISTER_STATUSES } });
+  const docs = await preloadRegisters(orders);
   const open = [];
   const entries = [];
   for (const order of orders) {
     if (!stagesForOrder(order).includes(stage)) continue;
-    const doc = await ensureRegister(order);
+    const doc = await ensureRegister(order, docs.get(String(order._id)) || null);
     for (const item of order.items || []) {
       if (!routeStages(item.productionRoute).includes(stage)) continue;
       const line = lineView(user, order, item, stage, doc);

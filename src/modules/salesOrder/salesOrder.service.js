@@ -1,5 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
+const mongoose = require('mongoose');
 const {
   ATTACHMENT_KINDS,
   ORDER_PRIORITIES,
@@ -17,7 +18,15 @@ const { nextSalesOrderNumber } = require('../../utils/counter');
 const { hasPermission } = require('../../utils/permissions');
 const customerRepo = require('../customer/customer.repo');
 const { snapshotFromCustomer, attachProductsFromOrder } = require('../customer/customer.service');
-const { firstStage, itemProgress, nextStage, operatorStations, routeStages, stageRequirements } = require('../production/production.flow');
+const {
+  firstStage,
+  itemProgress,
+  nextStage,
+  operatorStations,
+  routeStages,
+  stageRequirements,
+  stageStats,
+} = require('../production/production.flow');
 const { uploadBuffer, deleteStoredObject } = require('../../utils/storage');
 const salesOrderRepo = require('./salesOrder.repo');
 
@@ -125,6 +134,51 @@ function toPublicUser(user) {
   };
 }
 
+const EMPTY_IMAGE = {
+  originalName: '',
+  mimeType: '',
+  dataUrl: '',
+  url: '',
+  key: '',
+  storage: '',
+};
+
+function normalizeImage(source, { strict = false } = {}) {
+  const imageSource = source || {};
+  const image = {
+    originalName: str(imageSource.originalName),
+    mimeType: str(imageSource.mimeType),
+    dataUrl: typeof imageSource.dataUrl === 'string' ? imageSource.dataUrl : '',
+    url: str(imageSource.url),
+    key: str(imageSource.key),
+    storage: str(imageSource.storage),
+  };
+  if (!image.url && !image.dataUrl && !image.key && !image.originalName) return null;
+  if (!['', 'local', 's3'].includes(image.storage)) image.storage = '';
+  if (image.url) {
+    image.dataUrl = '';
+  } else if (image.dataUrl.length > 2_500_000) {
+    if (strict) {
+      throw new ApiError(400, 'Product image is too large (max about 2 MB). Configure S3 and upload via /api/media.');
+    }
+    return null;
+  }
+  return image;
+}
+
+function normalizeImages(raw, { strict = false } = {}) {
+  const incoming = Array.isArray(raw?.images) ? raw.images : [];
+  const images = incoming.map((item) => normalizeImage(item, { strict })).filter(Boolean);
+  if (!images.length) {
+    const single = normalizeImage(raw?.image, { strict });
+    if (single) images.push(single);
+  }
+  if (strict && images.length > 20) {
+    throw new ApiError(400, 'A product can have at most 20 images.');
+  }
+  return images.slice(0, 20);
+}
+
 function toPublicItem(item) {
   return {
     id: String(item._id),
@@ -191,14 +245,8 @@ function toPublicItem(item) {
       required: Boolean(item.tape?.required),
       type: item.tape?.type || '',
     },
-    image: {
-      originalName: item.image?.originalName || '',
-      mimeType: item.image?.mimeType || '',
-      dataUrl: item.image?.dataUrl || '',
-      url: item.image?.url || '',
-      key: item.image?.key || '',
-      storage: item.image?.storage || '',
-    },
+    image: normalizeImages(item)[0] || { ...EMPTY_IMAGE },
+    images: normalizeImages(item),
     currentStage: item.currentStage || '',
     nextStage: item.currentStage && item.currentStage !== 'completed' ? nextStage(item.productionRoute, item.currentStage) : '',
     stageWork: (item.stageWork || []).map(toPublicWork),
@@ -224,6 +272,7 @@ function toPublicOrder(order) {
   const items = (order.items || []).map((item) => ({
     ...toPublicItem(item),
     progress: itemProgress(item, order.status),
+    stageStats: Object.fromEntries(routeStages(item.productionRoute).map((stage) => [stage, stageStats(item, stage)])),
   }));
 
   return {
@@ -319,6 +368,7 @@ function abstractForStations(publicOrder, rawOrder, stations) {
         productionRoute: published.productionRoute,
         currentStage: published.currentStage,
         progress: published.progress || [],
+        stageStats: published.stageStats || {},
         stageWork: (published.stageWork || []).filter((row) => stations.includes(row.stage)),
         requirements: views,
       };
@@ -412,21 +462,8 @@ function normalizeItem(raw = {}) {
     type: str(tapeSource.type),
   };
 
-  const imageSource = raw.image || {};
-  const image = {
-    originalName: str(imageSource.originalName),
-    mimeType: str(imageSource.mimeType),
-    dataUrl: typeof imageSource.dataUrl === 'string' ? imageSource.dataUrl : '',
-    url: str(imageSource.url),
-    key: str(imageSource.key),
-    storage: str(imageSource.storage),
-  };
-  // Prefer S3/local URL; keep tiny legacy data URLs only when no url is present
-  if (image.url) {
-    image.dataUrl = '';
-  } else if (image.dataUrl.length > 2_500_000) {
-    throw new ApiError(400, 'Product image is too large (max about 2 MB). Configure S3 and upload via /api/media.');
-  }
+  const images = normalizeImages(raw, { strict: true });
+  const image = images[0] || { ...EMPTY_IMAGE };
 
   const item = {
     product: str(raw.product),
@@ -451,12 +488,43 @@ function normalizeItem(raw = {}) {
     holes,
     tape,
     image,
+    images,
     currentStage: '',
     stageWork: [],
   };
+  if (item.quantity < 0) throw new ApiError(400, 'Quantity cannot be negative');
+  if (item.rate < 0) throw new ApiError(400, 'Rate cannot be negative');
+  if (item.taxPercent < 0 || item.taxPercent > 100) throw new ApiError(400, 'Tax must be between 0 and 100 percent');
+  if (item.discount < 0) throw new ApiError(400, 'Line discount cannot be negative');
+  if (item.discount > item.quantity * item.rate + 1e-6) {
+    throw new ApiError(400, `Line discount on ${item.product || 'a product'} is more than its value`);
+  }
   item.amount = calcLine(item).amount;
-  if (raw._id || raw.id) item._id = raw._id || raw.id;
+  const rawId = raw._id || raw.id;
+  if (rawId && mongoose.isValidObjectId(rawId)) item._id = rawId;
   return item;
+}
+
+function normalizeItems(rawItems) {
+  if (!Array.isArray(rawItems)) throw new ApiError(400, 'Items must be a list of products');
+  const seen = new Set();
+  return rawItems.map((raw) => {
+    const item = normalizeItem(raw);
+    const key = item._id ? String(item._id) : '';
+    if (key && seen.has(key)) delete item._id;
+    if (key) seen.add(key);
+    return item;
+  });
+}
+
+function assertOrderNumbers(doc) {
+  if (doc.orderDate && doc.deliveryDate && new Date(doc.deliveryDate) < new Date(new Date(doc.orderDate).toDateString())) {
+    throw new ApiError(400, 'Delivery date cannot be before the order date');
+  }
+  const subtotal = (doc.items || []).reduce((sum, item) => sum + calcLine(item).taxable, 0);
+  if (num(doc.discount) > subtotal + 1e-6) {
+    throw new ApiError(400, 'Order discount cannot be more than the subtotal');
+  }
 }
 
 function parseDate(value, label, { required = false } = {}) {
@@ -589,20 +657,31 @@ async function listOrders(user) {
   return orders.map((order) => present(order, user));
 }
 
+const HIDDEN_FROM_OPERATORS = [
+  SALES_ORDER_STATUSES.DRAFT,
+  SALES_ORDER_STATUSES.SUBMITTED,
+  SALES_ORDER_STATUSES.APPROVED,
+  SALES_ORDER_STATUSES.CANCELLED,
+];
+
 async function getOrder(user, id) {
   const order = await getOrderOrThrow(id);
+  if (operatorStations(user).length) {
+    const view = HIDDEN_FROM_OPERATORS.includes(order.status) ? null : present(order, user);
+    if (!view || !view.items.length) throw new ApiError(404, 'Sales order not found');
+    return view;
+  }
   return present(order, user);
 }
 
 async function createOrder(user, payload) {
   const customer = await loadCustomer(payload.customerId);
   const snapshot = snapshotFromCustomer(customer);
-  const items = (payload.items || []).map(normalizeItem);
+  const items = normalizeItems(payload.items || []);
   assertDraftComplete(items);
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
   const doc = {
-    number: await nextSalesOrderNumber(orderDate),
     orderDate,
     customer: customer._id,
     customerSnapshot: snapshot,
@@ -623,10 +702,16 @@ async function createOrder(user, payload) {
     createdBy: user._id,
   };
 
+  doc.items = items;
+  doc.discount = Math.max(0, num(payload.discount));
+  assertOrderNumbers(doc);
   applyTotals(doc, items, payload.discount, doc.advanceAmount);
+  assertIn(doc.priority, ORDER_PRIORITIES, 'Priority must be normal, high, or urgent');
+  assertIn(doc.paymentTerms, PAYMENT_TERMS, 'Invalid payment terms');
+  assertIn(doc.paymentMethod, PAYMENT_METHODS, 'Invalid payment method');
+  doc.number = await nextSalesOrderNumber(orderDate);
   const created = await salesOrderRepo.create(doc);
-  await attachProductsFromOrder(customer._id, items);
-  await require('../salesSettings/salesSettings.service').ensureTemplatesFromItems(payload.items, items);
+  await rememberProducts(customer._id, payload.items, items);
   const loaded = await salesOrderRepo.findById(created._id);
   return present(loaded, user);
 }
@@ -644,21 +729,34 @@ async function updateOrder(user, id, payload) {
   }
 
   applyHeader(order, payload, snapshot);
-  const items = payload.items ? payload.items.map(normalizeItem) : order.items.map((item) => normalizeItem(item));
+  const items =
+    payload.items !== undefined ? normalizeItems(payload.items) : normalizeItems(order.items.map((item) => item.toObject()));
   assertDraftComplete(items);
+  assertOrderNumbers({ orderDate: order.orderDate, deliveryDate: order.deliveryDate, items, discount: order.discount });
   applyTotals(order, items, payload.discount !== undefined ? payload.discount : order.discount, order.advanceAmount);
 
   await salesOrderRepo.save(order);
-  await attachProductsFromOrder(order.customer, items);
-  await require('../salesSettings/salesSettings.service').ensureTemplatesFromItems(payload.items || [], items);
+  await rememberProducts(order.customer, payload.items || [], items);
   const loaded = await salesOrderRepo.findById(order._id);
   return present(loaded, user);
+}
+
+async function rememberProducts(customerId, rawItems, items) {
+  try {
+    await attachProductsFromOrder(customerId, items);
+    await require('../salesSettings/salesSettings.service').ensureTemplatesFromItems(rawItems, items);
+  } catch (error) {
+    console.error('Saving products and list options after the order failed', error.message);
+  }
 }
 
 async function deleteOrder(id) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft sales orders can be deleted');
+  }
+  for (const attachment of order.attachments || []) {
+    await deleteStoredObject(attachment.key || attachment.storedName, attachment.storage || 'local').catch(() => {});
   }
   await salesOrderRepo.deleteById(id);
   await fs.rm(path.join(env.uploadsDir, 'sales-orders', String(id)), { recursive: true, force: true }).catch(() => {});
@@ -686,6 +784,26 @@ async function approveOrder(user, id) {
   }
   order.status = SALES_ORDER_STATUSES.APPROVED;
   order.approvedAt = new Date();
+  await salesOrderRepo.save(order);
+  return present(await salesOrderRepo.findById(order._id), user);
+}
+
+async function returnToDraft(user, id, reason) {
+  const order = await getOrderOrThrow(id);
+  if (order.status !== SALES_ORDER_STATUSES.SUBMITTED && order.status !== SALES_ORDER_STATUSES.APPROVED) {
+    throw new ApiError(400, 'Only submitted or approved sales orders can go back to draft');
+  }
+  if (order.status === SALES_ORDER_STATUSES.APPROVED && !isSuperAdmin(user)) {
+    throw new ApiError(403, 'Only Super Admin can send an approved sales order back to draft');
+  }
+  if (!isSuperAdmin(user) && !hasPermission(user, 'sales:update')) {
+    throw new ApiError(403, 'You cannot send this sales order back to draft');
+  }
+  order.status = SALES_ORDER_STATUSES.DRAFT;
+  order.submittedAt = null;
+  order.approvedAt = null;
+  const note = str(reason);
+  if (note) order.remarks = [order.remarks, `Sent back: ${note}`].filter(Boolean).join('\n');
   await salesOrderRepo.save(order);
   return present(await salesOrderRepo.findById(order._id), user);
 }
@@ -733,11 +851,16 @@ async function cancelOrder(user, id, reason) {
   if (order.status === SALES_ORDER_STATUSES.CANCELLED) {
     throw new ApiError(400, 'Sales order is already cancelled');
   }
-  if (order.status === SALES_ORDER_STATUSES.COMPLETED || order.status === SALES_ORDER_STATUSES.DELIVERED) {
-    throw new ApiError(400, 'Delivered or completed sales orders cannot be cancelled');
+  const shipped = [SALES_ORDER_STATUSES.DISPATCHED, SALES_ORDER_STATUSES.DELIVERED, SALES_ORDER_STATUSES.COMPLETED];
+  if (shipped.includes(order.status)) {
+    throw new ApiError(400, 'Goods have already gone out on this sales order, so it cannot be cancelled');
+  }
+  const anyDelivery = (order.items || []).some((item) => (item.stageWork || []).some((row) => row.stage === 'delivery'));
+  if (anyDelivery) {
+    throw new ApiError(400, 'Part of this sales order is already delivered, so it cannot be cancelled');
   }
 
-  const early = order.status === SALES_ORDER_STATUSES.DRAFT || order.status === SALES_ORDER_STATUSES.SUBMITTED;
+  const early = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.SUBMITTED, SALES_ORDER_STATUSES.APPROVED].includes(order.status);
   const salesCan = hasPermission(user, 'sales:update');
   const productionCan = hasPermission(user, 'production:update');
 
@@ -745,9 +868,12 @@ async function cancelOrder(user, id, reason) {
     throw new ApiError(403, 'You cannot cancel this sales order');
   }
   if (!early && !productionCan && !isSuperAdmin(user)) {
-    throw new ApiError(403, 'After production starts, only Production Manager or Super Admin can cancel');
+    throw new ApiError(403, 'Once production is planned, only Production Manager or Super Admin can cancel');
   }
 
+  if (!early) {
+    await require('../production/production.service').releaseOrderStock(order);
+  }
   order.status = SALES_ORDER_STATUSES.CANCELLED;
   order.cancelledAt = new Date();
   order.cancelledBy = user._id;
@@ -895,6 +1021,7 @@ module.exports = {
   deleteOrder,
   submitOrder,
   approveOrder,
+  returnToDraft,
   planProduction,
   advanceOrder,
   cancelOrder,

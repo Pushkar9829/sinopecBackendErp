@@ -36,7 +36,28 @@ function countAll() {
   return InventoryItem.countDocuments();
 }
 
+function takeQuantity(id, qty) {
+  return InventoryItem.findOneAndUpdate(
+    { _id: id, quantity: { $gte: qty - 1e-9 } },
+    { $inc: { quantity: -qty } },
+    { new: true }
+  );
+}
+
+function addQuantity(id, qty) {
+  return InventoryItem.findByIdAndUpdate(id, { $inc: { quantity: qty } }, { new: true });
+}
+
+function retireOrderLots(orderId, note) {
+  return InventoryItem.updateMany({ salesOrder: orderId, kind: 'wip', category: 'output', isActive: true }, [
+    { $set: { isActive: false, notes: { $trim: { input: { $concat: ['$notes', ' · ', note] } } } } },
+  ]);
+}
+
 module.exports = {
+  takeQuantity,
+  addQuantity,
+  retireOrderLots,
   findAll,
   findOne,
   findById,

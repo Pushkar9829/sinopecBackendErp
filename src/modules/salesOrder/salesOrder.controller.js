@@ -45,6 +45,11 @@ const approve = asyncHandler(async (req, res) => {
   res.json({ success: true, data: order });
 });
 
+const returnToDraft = asyncHandler(async (req, res) => {
+  const order = await salesOrderService.returnToDraft(req.user, req.params.id, req.body?.reason);
+  res.json({ success: true, data: order });
+});
+
 const planProduction = asyncHandler(async (req, res) => {
   const order = await salesOrderService.planProduction(req.user, req.params.id);
   res.json({ success: true, data: order });
@@ -88,6 +93,7 @@ module.exports = {
   remove,
   submit,
   approve,
+  returnToDraft,
   planProduction,
   advance,
   cancel,

@@ -24,7 +24,16 @@ const salesOrderRepo = require('../modules/salesOrder/salesOrder.repo');
 const salesSettingsRepo = require('../modules/salesSettings/salesSettings.repo');
 const { snapshotFromCustomer } = require('../modules/customer/customer.service');
 const { calcTotals, normalizeItem } = require('../modules/salesOrder/salesOrder.service');
-const { activeStage, nextStage, registerSpecs, routeStages, stageStats } = require('../modules/production/production.flow');
+const {
+  activeStage,
+  nextStage,
+  previousStage,
+  registerSpecs,
+  routeStages,
+  stageStats,
+  stageTarget,
+  stageUnit,
+} = require('../modules/production/production.flow');
 const Register = require('../modules/register/register.model');
 const { nextCustomerCode, nextSalesOrderNumber } = require('../utils/counter');
 const SalesOrder = require('../modules/salesOrder/salesOrder.model');
@@ -54,12 +63,7 @@ async function seedRoles(permissions) {
 
   for (const role of ROLES) {
     const existing = await roleRepo.findBySlug(role.slug);
-    if (existing) {
-      existing.name = role.name;
-      existing.description = role.description;
-      await existing.save();
-      continue;
-    }
+    if (existing) continue;
 
     const keys = ROLE_PERMISSION_KEYS[role.slug] || [];
     const permissionIds = keys.map((key) => byKey.get(key)).filter(Boolean);
@@ -119,9 +123,6 @@ async function seedStages() {
     const stage = DEFAULT_STAGES[index];
     const existing = await stageRepo.findBySlug(stage.slug);
     if (existing) {
-      existing.name = stage.name;
-      existing.sortOrder = index + 1;
-      await existing.save();
       bySlug[stage.slug] = existing;
       continue;
     }
@@ -620,9 +621,8 @@ function bookDetails(item, row, index) {
       tubeMedium: 'Paper',
       tubeCore: '3 inch',
       tubeParticular: 'Plain',
-      sheet8: n % 2 ? 'Yes' : '',
-      tube8: n % 2 ? '' : 'Yes',
-      recycled: '5',
+      sheetTube: n % 2 ? 'Sheet (8 mm)' : 'Tube (8 mm)',
+      recycled: String(5 + (n % 6)),
       exStock: n % 2 ? '' : 'D.S.',
       weight: String(row.outputQty || ''),
       gross: String((Number(row.outputQty) || 0) + 2),
@@ -640,10 +640,9 @@ function bookDetails(item, row, index) {
   } else if (row.stage === 'cutting') {
     extra = {
       tubeUsed: '3 inch',
-      rollType: 'Centre fold',
+      rollType: n % 2 ? 'Centre fold' : 'Side seal',
       cuts: String(Math.max(1, Math.round((Number(row.outputQty) || 1) / 100))),
-      disc: '80 mm',
-      knife: 'Slitter',
+      discKnife: n % 2 ? 'disc' : 'knife',
     };
   }
   const details = {};
@@ -654,8 +653,38 @@ function bookDetails(item, row, index) {
   return details;
 }
 
+function inRollingUnits(item, stageWork) {
+  const quantity = Number(item.quantity) || 0;
+  const weight = stageTarget(item, 'rolling');
+  if (!quantity || !weight || String(item.unit || '').toLowerCase() === 'kg') return stageWork;
+  const ratio = weight / quantity;
+  const scale = (value) => Math.round((Number(value) || 0) * ratio * 1000) / 1000;
+  const route = item.productionRoute;
+  const rollingRows = (stageWork || []).filter((row) => row.stage === 'rolling');
+  const rollingOut = rollingRows.reduce((sum, row) => sum + scale(row.outputQty), 0);
+  const rollingDone = rollingRows.reduce((sum, row) => sum + (Number(row.outputQty) || 0), 0) >= quantity;
+  return (stageWork || []).map((row) => {
+    if (row.stage === 'rolling') {
+      const outputQty = scale(row.outputQty);
+      const wasteQty = scale(row.wasteQty);
+      return { ...row, outputQty, wasteQty, inputQty: Math.round((outputQty + wasteQty) * 1000) / 1000 };
+    }
+    if (previousStage(route, row.stage) === 'rolling') {
+      return { ...row, inputQty: scale(row.inputQty) };
+    }
+    return row;
+  }).map((row, index, rows) => {
+    if (row.stage !== 'rolling' || !rollingDone) return row;
+    const last = rows.map((item) => item.stage).lastIndexOf('rolling');
+    if (index !== last) return row;
+    const fix = Math.round((weight - rollingOut) * 1000) / 1000;
+    const outputQty = Math.round((row.outputQty + fix) * 1000) / 1000;
+    return { ...row, outputQty, inputQty: Math.round((outputQty + row.wasteQty) * 1000) / 1000 };
+  });
+}
+
 function withFloorProgress(item, stageWork, options) {
-  const rows = withDeliveryHandover(stageWork, item, options).map((row, index) => ({
+  const rows = withDeliveryHandover(inRollingUnits(item, stageWork), item, options).map((row, index) => ({
     ...row,
     details: bookDetails(item, row, index),
   }));
@@ -680,7 +709,7 @@ async function seedWipFromOrder(order) {
           category: INVENTORY_CATEGORIES.OUTPUT,
           name: `${order.number} · ${item.productCode || item.product || 'item'} · ${stage} output`,
           materialType: item.material || item.manufacturing?.materialType || 'WIP',
-          unit: item.unit || 'pcs',
+          unit: stageUnit(item, stage),
           quantity: remaining,
           unitPrice: 0,
           stage: stageDoc._id,
@@ -698,7 +727,7 @@ async function seedWipFromOrder(order) {
           category: INVENTORY_CATEGORIES.WASTE,
           name: `${order.number} · ${item.productCode || item.product || 'item'} · ${stage} waste`,
           materialType: 'Process scrap',
-          unit: item.unit || 'pcs',
+          unit: stageUnit(item, stage),
           quantity: stats.waste,
           unitPrice: null,
           stage: stageDoc._id,
@@ -1839,30 +1868,13 @@ async function seedDemoSalesOrders() {
   await seedWipFromOrder(dispatchedOrder);
 }
 
-async function seedProductionFloor() {
-  const onFloor = await salesOrderRepo.countByStatus();
-  const already = onFloor.some((row) =>
-    [
-      SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
-      SALES_ORDER_STATUSES.IN_PRODUCTION,
-      SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
-    ].includes(row._id)
-  );
-  if (already) return;
-
-  const orders = await salesOrderRepo.findAll({
-    status: { $in: [SALES_ORDER_STATUSES.APPROVED, SALES_ORDER_STATUSES.SUBMITTED] },
-  });
-  const order = orders[0];
-  if (!order) return;
-  for (const item of order.items || []) {
-    item.currentStage = 'rolling';
-    item.stageWork = item.stageWork || [];
+async function seedDefaultOptions() {
+  if ((await SalesOption.countDocuments({})) > 0) return;
+  for (const [group, values] of Object.entries(DEFAULT_SALES_OPTIONS)) {
+    for (const value of values) {
+      await salesSettingsRepo.createOption({ group, value, isActive: true });
+    }
   }
-  order.status = SALES_ORDER_STATUSES.PRODUCTION_PLANNED;
-  order.approvedAt = order.approvedAt || new Date();
-  order.productionPlannedAt = new Date();
-  await salesOrderRepo.save(order);
 }
 
 async function seedSalesSettings() {
@@ -2029,18 +2041,23 @@ async function dropStaleUserEmailIndex() {
   }
 }
 
-async function seed() {
+async function seedSystem() {
   await dropStaleUserEmailIndex();
   const permissions = await seedPermissions();
   await seedRoles(permissions);
   await seedSuperAdmin();
-  await seedDemoUsers();
   const stages = await seedStages();
+  await seedDefaultOptions();
+  return stages;
+}
+
+async function seed() {
+  const stages = await seedSystem();
+  await seedDemoUsers();
   await seedDemoInventory(stages);
   await seedDemoMachines(stages);
   await seedDemoCustomers();
   await seedDemoSalesOrders();
-  await seedProductionFloor();
   await seedSalesSettings();
 }
 
@@ -2058,4 +2075,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { seed };
+module.exports = { seed, seedSystem };

@@ -85,6 +85,19 @@ const lineItemSchema = new mongoose.Schema(
       key: { type: String, default: '', trim: true },
       storage: { type: String, enum: ['', 'local', 's3'], default: '' },
     },
+    images: {
+      type: [
+        {
+          originalName: { type: String, default: '', trim: true },
+          mimeType: { type: String, default: '', trim: true },
+          dataUrl: { type: String, default: '' },
+          url: { type: String, default: '', trim: true },
+          key: { type: String, default: '', trim: true },
+          storage: { type: String, enum: ['', 'local', 's3'], default: '' },
+        },
+      ],
+      default: [],
+    },
     currentStage: { type: String, default: '', trim: true },
     stagePickup: {
       stage: { type: String, default: '', trim: true },

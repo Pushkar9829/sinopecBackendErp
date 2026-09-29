@@ -18,9 +18,14 @@ const {
   routeStages,
   stageRequirements,
   stageStats,
+  stageUnit,
   syncOrderStatus,
   visibleStages,
 } = require('./production.flow');
+
+function sameUnit(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
 
 const SHIFT_IDS = PRODUCTION_SHIFTS.map((item) => item.id);
 
@@ -44,6 +49,7 @@ const TYPED_DETAIL_KEYS = [
   'tubeMedium',
   'tubeCore',
   'tubeParticular',
+  'sheetTube',
   'sheet8',
   'tube8',
   'recycled',
@@ -59,6 +65,7 @@ const TYPED_DETAIL_KEYS = [
   'wastage',
   'tubeUsed',
   'cuts',
+  'discKnife',
   'disc',
   'knife',
 ];
@@ -172,11 +179,14 @@ async function listSourceLots(order, item, stage) {
       isActive: true,
       kind: { $ne: 'wip' },
     });
-    const matched = rawItems.filter((row) => Number(row.quantity) > 0);
-    const preferred = rawName
-      ? matched.filter((row) => String(row.name || '').toLowerCase().includes(rawName))
-      : matched;
-    return (preferred.length ? preferred : matched).map((lot) => toPublicLot(lot, ''));
+    const inStock = rawItems.filter((row) => Number(row.quantity) > 0);
+    const words = rawName.split(/[^a-z0-9]+/).filter((word) => word.length > 1 && word !== 'granules');
+    const matches = (row) => {
+      const hay = `${row.name || ''} ${row.materialType || ''}`.toLowerCase();
+      if (hay.includes(rawName)) return true;
+      return words.length > 0 && words.every((word) => hay.includes(word));
+    };
+    return (rawName ? inStock.filter(matches) : inStock).map((lot) => toPublicLot(lot, ''));
   }
 
   const lots = await itemRepo.findAll({
@@ -207,8 +217,8 @@ async function toJob(order, item, stage) {
     customer: order.customerSnapshot?.name || order.customer?.name || '',
     product: item.product || '',
     productCode: item.productCode || '',
-    quantity: item.quantity || 0,
-    unit: item.unit || 'pcs',
+    quantity: stats.target,
+    unit: stats.unit,
     productionRoute: item.productionRoute,
     routeStages: routeStages(item.productionRoute),
     currentStage: activeStage(item),
@@ -324,23 +334,31 @@ async function createShiftLot({ order, item, stage, category, qty, unit, shift, 
 }
 
 async function takeFromLot(lot, qty) {
-  const onHand = Number(lot?.quantity || 0);
-  if (!lot || onHand + 1e-9 < qty) {
-    throw new ApiError(400, `Only ${onHand} is left on ${lot?.name || 'that lot'}.`);
+  if (!lot) throw new ApiError(400, 'That inventory lot was not found');
+  const updated = await itemRepo.takeQuantity(lot._id, qty);
+  if (!updated) {
+    const fresh = await itemRepo.findById(lot._id);
+    throw new ApiError(400, `Only ${Number(fresh?.quantity || 0)} is left on ${lot.name || 'that lot'}.`);
   }
-  lot.quantity = Math.max(0, onHand - qty);
-  await lot.save();
+  lot.quantity = updated.quantity;
 }
 
 async function returnToLot(lotId, qty, unit, fallback) {
   if (!lotId || qty <= 0) return;
-  const lot = await itemRepo.findById(lotId);
-  if (lot) {
-    lot.quantity = Number(lot.quantity || 0) + qty;
-    await lot.save();
-    return;
-  }
+  const lot = await itemRepo.addQuantity(lotId, qty);
+  if (lot) return;
   if (fallback) await fallback(qty, unit);
+}
+
+async function releaseOrderStock(order) {
+  for (const item of order.items || []) {
+    const pickup = item.stagePickup;
+    if (pickup && Number(pickup.qty) > 0) {
+      await returnToLot(pickup.lot, Number(pickup.qty), pickup.unit, null);
+      clearPickup(item);
+    }
+  }
+  await itemRepo.retireOrderLots(order._id, `order ${order.number} cancelled`);
 }
 
 async function pickupLot(user, payload) {
@@ -392,7 +410,12 @@ async function pickupLot(user, payload) {
   };
   item.currentStage = stage;
   applyOrderStatus(order);
-  await salesOrderRepo.save(order);
+  try {
+    await salesOrderRepo.save(order);
+  } catch (error) {
+    await itemRepo.addQuantity(lot._id, qty).catch(() => {});
+    throw error;
+  }
   return toJob(order, item, stage);
 }
 
@@ -417,6 +440,7 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
   }
 
   await takeFromLot(lot, qty);
+  const undo = () => itemRepo.addQuantity(lot._id, qty).catch(() => {});
   const workRow = {
     stage,
     machine: null,
@@ -441,9 +465,22 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
   item.stageWork.push(workRow);
   item.currentStage = activeStage(item);
   applyOrderStatus(order);
-  await salesOrderRepo.save(order);
-  await require('../register/register.service').recordMark(order, item, workRow);
+  try {
+    await salesOrderRepo.save(order);
+  } catch (error) {
+    await undo();
+    throw error;
+  }
+  await markRegister(order, item, workRow);
   return toJob(order, item, stage);
+}
+
+async function markRegister(order, item, workRow) {
+  try {
+    await require('../register/register.service').recordMark(order, item, workRow);
+  } catch (error) {
+    console.error('Register mark failed; it is rebuilt from the order on next open', error.message);
+  }
 }
 
 async function releasePickup(user, payload) {
@@ -452,11 +489,20 @@ async function releasePickup(user, payload) {
   if (!pickup || pickup.stage !== stage || !(Number(pickup.qty) > 0)) {
     throw new ApiError(400, 'Nothing is marked for working');
   }
-  await returnToLot(pickup.lot, Number(pickup.qty), pickup.unit, async (qty, unit) => {
-    const fromStage = pickup.fromStage || '';
+  const held = {
+    lot: pickup.lot,
+    qty: Number(pickup.qty),
+    unit: pickup.unit,
+    fromStage: pickup.fromStage || '',
+    lotName: pickup.lotName || '',
+  };
+  clearPickup(item);
+  await salesOrderRepo.save(order);
+  await returnToLot(held.lot, held.qty, held.unit, async (qty, unit) => {
+    const fromStage = held.fromStage;
     await itemRepo.create({
       category: fromStage ? INVENTORY_CATEGORIES.OUTPUT : INVENTORY_CATEGORIES.RAW,
-      name: pickup.lotName || `${order.number} returned`,
+      name: held.lotName || `${order.number} returned`,
       materialType: item.material || item.manufacturing?.materialType || 'WIP',
       unit: unit || item.unit || 'pcs',
       quantity: qty,
@@ -469,13 +515,14 @@ async function releasePickup(user, payload) {
       lineItem: fromStage ? item._id : null,
     });
   });
-  clearPickup(item);
-  await salesOrderRepo.save(order);
   return toJob(order, item, stage);
 }
 
 async function completeStage(user, payload) {
   const { order, item, stage } = await loadFloorItem(user, payload, { mustWork: true });
+  if (isDeliveryStage(stage)) {
+    throw new ApiError(400, 'Record deliveries with Enter on the Delivery register');
+  }
   if (!itemVisibleAtStage(item, stage, order.status) && !stageStats(item, stage).output && !(Number(item.stagePickup?.qty) > 0)) {
     throw new ApiError(400, `Nothing is ready for ${stage} yet`);
   }
@@ -491,14 +538,8 @@ async function completeStage(user, payload) {
   if (produced <= 0) {
     throw new ApiError(400, 'Enter how much this shift produced');
   }
-  if (!isDeliveryStage(stage) && outputQty + wasteQty - inputQty > 1e-6) {
-    throw new ApiError(400, 'Made plus waste cannot be more than what was used');
-  }
-  if (!isDeliveryStage(stage) && inputQty - (outputQty + wasteQty) > 1e-6) {
-    throw new ApiError(400, 'Used cannot be more than made plus waste');
-  }
-  if (produced - stats.remaining > 1e-6) {
-    throw new ApiError(400, `Only ${stats.remaining} left on this stage`);
+  if (stats.capped && produced - stats.remaining > 1e-6) {
+    throw new ApiError(400, `Only ${stats.remaining} ${stats.unit} left on this stage`);
   }
 
   const pickup = toPublicPickup(item, stage);
@@ -508,6 +549,14 @@ async function completeStage(user, payload) {
       400,
       prev ? `Pick ${stageTitle(prev)} output and mark it for working first` : 'Pick raw material and mark it for working first'
     );
+  }
+  if (!isDeliveryStage(stage) && sameUnit(pickup.unit, stats.unit)) {
+    if (outputQty + wasteQty - inputQty > 1e-6) {
+      throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+    }
+    if (inputQty - (outputQty + wasteQty) > 1e-6) {
+      throw new ApiError(400, 'Used cannot be more than made plus waste');
+    }
   }
   if (inputQty <= 0) {
     throw new ApiError(400, 'Enter how much of the picked lot this shift used');
@@ -535,8 +584,10 @@ async function completeStage(user, payload) {
 
   let machine = null;
   if (payload.machineId) {
-    machine = await machineRepo.findById(payload.machineId);
-    if (!machine) throw new ApiError(400, 'Machine not found');
+    const stageDoc = await stageRepo.findBySlug(stage);
+    machine = (stageDoc?.machines || []).find((row) => String(row._id) === String(payload.machineId)) || null;
+    if (!machine) throw new ApiError(400, 'That machine is not assigned to this stage');
+    if (machine.isActive === false) throw new ApiError(400, 'That machine is inactive');
   }
 
   const leftover = Math.max(0, Number(item.stagePickup.qty) - inputQty);
@@ -546,26 +597,29 @@ async function completeStage(user, payload) {
     clearPickup(item);
   }
 
-  await createShiftLot({
+  const createdLots = [];
+  const outputLot = await createShiftLot({
     order,
     item,
     stage,
     category: INVENTORY_CATEGORIES.OUTPUT,
-    qty: isDeliveryStage(stage) ? 0 : produced,
-    unit: item.unit,
+    qty: produced,
+    unit: stats.unit,
     shift,
     workDate,
   });
-  await createShiftLot({
+  if (outputLot) createdLots.push(outputLot);
+  const wasteLot = await createShiftLot({
     order,
     item,
     stage,
     category: INVENTORY_CATEGORIES.WASTE,
     qty: wasteQty,
-    unit: item.unit,
+    unit: sameUnit(pickup.unit, stats.unit) ? stats.unit : pickup.unit || stats.unit,
     shift,
     workDate,
   });
+  if (wasteLot) createdLots.push(wasteLot);
 
   const workRow = {
     stage,
@@ -595,8 +649,13 @@ async function completeStage(user, payload) {
   item.currentStage = activeStage(item);
 
   applyOrderStatus(order);
-  await salesOrderRepo.save(order);
-  await require('../register/register.service').recordMark(order, item, workRow);
+  try {
+    await salesOrderRepo.save(order);
+  } catch (error) {
+    for (const lot of createdLots) await itemRepo.deleteById(lot._id).catch(() => {});
+    throw error;
+  }
+  await markRegister(order, item, workRow);
   return require('../salesOrder/salesOrder.service').getOrder(user, order._id);
 }
 
@@ -633,10 +692,7 @@ async function enterFromRegister(user, payload) {
         ? num(bookWaste)
         : 0
       : num(payload.wasteQty);
-  const inputQty =
-    payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === ''
-      ? outputQty + wasteQty
-      : num(payload.inputQty);
+  const givenInput = !(payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === '');
   if (stage === 'printing') {
     const wastageText = bookWaste == null ? '' : String(bookWaste).trim();
     if (wastageText !== '' && !Number.isFinite(Number(wastageText))) {
@@ -644,31 +700,40 @@ async function enterFromRegister(user, payload) {
     }
   }
   if (outputQty <= 0) throw new ApiError(400, 'Enter the production quantity');
-  if (!isDeliveryStage(stage) && outputQty + wasteQty - inputQty > 1e-6) {
-    throw new ApiError(400, 'Made plus waste cannot be more than what was used');
-  }
-  if (!isDeliveryStage(stage) && inputQty - (outputQty + wasteQty) > 1e-6) {
-    throw new ApiError(400, 'Used cannot be more than made plus waste');
-  }
 
   const stats = stageStats(item, stage);
-  if (outputQty - stats.remaining > 1e-6) {
-    throw new ApiError(400, `Only ${stats.remaining} left on this stage`);
+  if (stats.capped && outputQty - stats.remaining > 1e-6) {
+    throw new ApiError(400, `Only ${stats.remaining} ${stats.unit} left on this stage`);
   }
 
-  const taken = isDeliveryStage(stage) ? outputQty : inputQty;
   if (isDeliveryStage(stage)) {
     const lots = await listSourceLots(order, item, stage);
-    const match = chooseLot(lots, payload, taken);
+    const match = chooseLot(lots, payload, outputQty);
     const lot = await itemRepo.findById(match.id);
     const prev = previousStage(item.productionRoute, stage);
-    return sendDelivery(user, { order, item, stage, lot, qty: taken, prev, payload });
+    return sendDelivery(user, { order, item, stage, lot, qty: outputQty, prev, payload });
   }
 
   const pickup = toPublicPickup(item, stage);
+  const lots = pickup ? [] : await listSourceLots(order, item, stage);
+  const wantedLot = pickup ? null : lots.find((lot) => lot.id === String(payload.lotId || '')) || lots[0] || null;
+  const sourceUnit = pickup ? pickup.unit : wantedLot?.unit || stats.unit;
+  const matching = sameUnit(sourceUnit, stats.unit);
+  if (!givenInput && !matching) {
+    throw new ApiError(400, `Enter how much ${sourceUnit} was used`);
+  }
+  const inputQty = givenInput ? num(payload.inputQty) : outputQty + wasteQty;
+  if (inputQty <= 0) throw new ApiError(400, 'Enter how much was used');
+  if (matching && outputQty + wasteQty - inputQty > 1e-6) {
+    throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+  }
+  if (matching && inputQty - (outputQty + wasteQty) > 1e-6) {
+    throw new ApiError(400, 'Used cannot be more than made plus waste');
+  }
+
+  const taken = inputQty;
   let createdPickup = false;
   if (!pickup) {
-    const lots = await listSourceLots(order, item, stage);
     const match = chooseLot(lots, payload, taken);
     await pickupLot(user, {
       orderId: String(order._id),
@@ -679,7 +744,7 @@ async function enterFromRegister(user, payload) {
     });
     createdPickup = true;
   } else if (taken - pickup.qty > 1e-6) {
-    throw new ApiError(400, `Only ${pickup.qty} is in hand. Enter that much or less.`);
+    throw new ApiError(400, `Only ${pickup.qty} ${pickup.unit} is taken for this line. Enter that much or less.`);
   }
 
   try {
@@ -734,4 +799,5 @@ module.exports = {
   completeStage,
   enterFromRegister,
   stageMachines,
+  releaseOrderStock,
 };

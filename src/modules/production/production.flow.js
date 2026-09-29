@@ -47,7 +47,7 @@ function lastMakeStage(route) {
 }
 
 function canReadStage(user, stage) {
-  if (isSuperAdmin(user) || hasPermission(user, 'production:read') || hasPermission(user, 'production:packing:read')) return true;
+  if (isSuperAdmin(user) || hasPermission(user, 'production:read')) return true;
   const meta = FLOOR_STAGES.find((item) => item.id === stage);
   return meta ? hasPermission(user, meta.read) : false;
 }
@@ -81,20 +81,58 @@ function sumWork(item, stage, field) {
     .reduce((total, row) => total + (Number(row[field]) || 0), 0);
 }
 
+const EPS = 1e-6;
+
+function leadingNumber(text) {
+  const match = String(text ?? '').replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : 0;
+}
+
+function stageUnit(item, stage) {
+  if (stage === 'rolling') return 'kg';
+  return item.unit || 'pcs';
+}
+
+function stageTarget(item, stage) {
+  if (stage === 'rolling') {
+    const weight = leadingNumber(item.manufacturing?.requiredWeight);
+    if (weight > 0) return weight;
+    return String(item.unit || '').toLowerCase() === 'kg' ? Number(item.quantity) || 0 : 0;
+  }
+  return Number(item.quantity) || 0;
+}
+
+function holdingAt(item, stage) {
+  return item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
+}
+
 function stageStats(item, stage) {
-  const target = Number(item.quantity) || 0;
+  const target = stageTarget(item, stage);
   const input = sumWork(item, stage, 'inputQty');
   const output = sumWork(item, stage, 'outputQty');
   const waste = sumWork(item, stage, 'wasteQty');
-  const remaining = Math.max(0, target - output);
+  const holding = holdingAt(item, stage);
+  const prev = previousStage(item.productionRoute, stage);
+
+  let done = target > 0 && output + EPS >= target;
+  if (!done && prev) {
+    const before = stageStats(item, prev);
+    done = before.done && before.output > 0 && input + EPS >= before.output && !holding;
+  }
+  if (!done && !prev && target <= 0) {
+    done = output > 0 && !holding;
+  }
+
   return {
     stage,
+    unit: stageUnit(item, stage),
     target,
+    capped: target > 0,
     input,
     output,
     waste,
-    remaining,
-    done: target > 0 ? output >= target : output > 0,
+    remaining: done ? 0 : Math.max(0, target - output),
+    done,
   };
 }
 
@@ -225,8 +263,8 @@ function stageRequirements(order, item, stage) {
     product: item.product || '',
     productCode: item.productCode || '',
     size: item.size || '',
-    quantity: item.quantity || 0,
-    unit: item.unit || 'pcs',
+    quantity: stats.target,
+    unit: stats.unit,
     color: item.color || item.manufacturing?.color || '',
     produced: stats.output,
     remaining: stats.remaining,
@@ -295,6 +333,8 @@ module.exports = {
   visibleStages,
   operatorStations,
   stageStats,
+  stageUnit,
+  stageTarget,
   availableFromPrevious,
   itemVisibleAtStage,
   activeStage,

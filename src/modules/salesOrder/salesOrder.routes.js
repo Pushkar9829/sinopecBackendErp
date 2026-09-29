@@ -15,7 +15,15 @@ const canView = authorize.any(...SALES_ORDER_VIEW_KEYS);
 router.get('/', authenticate, canView, salesOrderController.list);
 router.get('/summary', authenticate, canView, salesOrderController.summary);
 router.get('/meta', authenticate, canView, salesOrderController.meta);
-router.get('/:id', authenticate, canView, validate([idParam]), salesOrderController.getOne);
+const canViewOne = authorize.any(
+  ...SALES_ORDER_VIEW_KEYS,
+  'production:rolling:read',
+  'production:printing:read',
+  'production:cutting:read',
+  'dispatch:read'
+);
+
+router.get('/:id', authenticate, canViewOne, validate([idParam]), salesOrderController.getOne);
 router.post(
   '/',
   authenticate,
@@ -42,6 +50,7 @@ router.delete(
 );
 router.post('/:id/submit', authenticate, authorize('sales:update'), validate([idParam]), salesOrderController.submit);
 router.post('/:id/approve', authenticate, validate([idParam]), salesOrderController.approve);
+router.post('/:id/return', authenticate, authorize('sales:update'), validate([idParam]), salesOrderController.returnToDraft);
 router.post(
   '/:id/plan-production',
   authenticate,

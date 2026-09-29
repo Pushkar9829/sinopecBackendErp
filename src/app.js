@@ -1,3 +1,4 @@
+const path = require('path');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const express = require('express');
@@ -18,6 +19,7 @@ const registerRoutes = require('./modules/register/register.routes');
 const analyticsRoutes = require('./modules/analytics/analytics.routes');
 const mediaRoutes = require('./modules/media/media.routes');
 const ApiError = require('./utils/ApiError');
+const upload = require('./middlewares/upload');
 const env = require('./config/env');
 
 const app = express();
@@ -49,9 +51,22 @@ app.use(
   })
 );
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '8mb' }));
 app.use(cookieParser());
-app.use('/uploads', express.static(env.uploadsDir));
+app.use(
+  '/uploads',
+  express.static(env.uploadsDir, {
+    dotfiles: 'deny',
+    index: false,
+    setHeaders(res, filePath) {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; sandbox");
+      if (!upload.IMAGE_EXT.has(path.extname(filePath).toLowerCase())) {
+        res.setHeader('Content-Disposition', 'attachment');
+      }
+    },
+  })
+);
 
 app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'Sinopec API is running' });

@@ -42,6 +42,7 @@ function toPublicProduct(product) {
     holes: spec.holes,
     tape: spec.tape,
     image: spec.image,
+    images: spec.images || [],
   };
 }
 
@@ -56,7 +57,6 @@ function normalizeCustomerProducts(list) {
     delete spec.currentStage;
     delete spec.stageWork;
     delete spec.amount;
-    if (raw._id || raw.id) spec._id = raw._id || raw.id;
     products.push(spec);
   }
   return products;
@@ -150,8 +150,11 @@ async function updateCustomer(id, payload) {
   if (!data.name) {
     throw new ApiError(400, 'Customer name is required');
   }
-  if (payload.isActive !== undefined) data.isActive = payload.isActive;
-  if (payload.products !== undefined) {
+  if (payload.isActive !== undefined) data.isActive = Boolean(payload.isActive);
+  if (payload.products !== undefined && payload.products !== null) {
+    if (!Array.isArray(payload.products)) {
+      throw new ApiError(400, 'Products must be a list');
+    }
     data.products = normalizeCustomerProducts(payload.products);
   }
 

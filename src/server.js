@@ -1,11 +1,11 @@
 const env = require('./config/env');
 const { connectDb } = require('./config/db');
 const app = require('./app');
-const { seed } = require('./seeders/seed');
+const { seedSystem } = require('./seeders/seed');
 
 async function start() {
   await connectDb();
-  await seed();
+  await seedSystem();
 
   app.listen(env.port, () => {
     console.log(`Sinopec API listening on http://localhost:${env.port}`);

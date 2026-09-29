@@ -16,6 +16,22 @@ function errorHandler(err, req, res, next) {
     return res.status(400).json({ success: false, message: err.message });
   }
 
+  if (err.name === 'CastError') {
+    return res.status(400).json({ success: false, message: `Invalid ${err.path || 'value'}` });
+  }
+
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ success: false, message: 'This request is too large. Upload images as files instead.' });
+  }
+
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, message: 'The request body is not valid JSON' });
+  }
+
+  if (err.code === 11000) {
+    return res.status(409).json({ success: false, message: 'That record already exists' });
+  }
+
   const statusCode = err.statusCode || 500;
   const message = statusCode === 500 && env.isProd ? 'Internal server error' : err.message;
   res.status(statusCode).json({

@@ -15,7 +15,6 @@ const VIEW_KEYS = [
   'production:rolling:read',
   'production:printing:read',
   'production:cutting:read',
-  'production:packing:read',
   'dispatch:read',
 ];
 

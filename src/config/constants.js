@@ -362,11 +362,6 @@ const DEMO_USERS = [
     roleSlug: ROLE_SLUGS.CUTTING_OPERATOR,
   },
   {
-    username: 'packing',
-    fullName: 'Pooja Desai',
-    roleSlug: ROLE_SLUGS.PACKING_OPERATOR,
-  },
-  {
     username: 'dispatch',
     fullName: 'Karan Shah',
     roleSlug: ROLE_SLUGS.DISPATCH_MANAGER,

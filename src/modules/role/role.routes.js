@@ -7,7 +7,7 @@ const roleController = require('./role.controller');
 
 const router = express.Router();
 
-router.get('/', authenticate, authorize('roles:read'), roleController.list);
+router.get('/', authenticate, authorize.any('roles:read', 'users:create', 'users:update'), roleController.list);
 
 router.patch(
   '/:id/permissions',

@@ -49,6 +49,7 @@ async function uploadBuffer({ buffer, originalName, mimeType, folder = 'misc' })
         Key: key,
         Body: buffer,
         ContentType: mimeType || 'application/octet-stream',
+        ...(String(mimeType || '').startsWith('image/') && !/svg/i.test(mimeType) ? {} : { ContentDisposition: 'attachment' }),
       })
     );
     return {

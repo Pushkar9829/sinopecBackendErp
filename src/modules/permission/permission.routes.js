@@ -5,6 +5,6 @@ const permissionController = require('./permission.controller');
 
 const router = express.Router();
 
-router.get('/', authenticate, authorize('permissions:read'), permissionController.list);
+router.get('/', authenticate, authorize.any('permissions:read', 'roles:update'), permissionController.list);
 
 module.exports = router;

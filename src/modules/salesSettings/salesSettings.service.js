@@ -169,7 +169,9 @@ async function rememberNewOptions(items) {
       const key = `${group}::${value.toLowerCase()}`;
       if (known.has(key)) continue;
       known.add(key);
-      await repo.createOption({ group, value, isActive: true });
+      await repo.createOption({ group, value, isActive: true }).catch((error) => {
+        if (error?.code !== 11000) throw error;
+      });
     }
   }
 }

@@ -16,7 +16,6 @@ const VIEW_KEYS = [
   'production:printing:read',
   'production:cutting:read',
   'dispatch:read',
-  'production:packing:read',
 ];
 
 router.get('/', authenticate, authorize.any(...VIEW_KEYS), registerController.list);

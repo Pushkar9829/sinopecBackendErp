@@ -1,4 +1,5 @@
 const ApiError = require('../../utils/ApiError');
+const { DEFAULT_STAGES } = require('../../config/constants');
 const stageRepo = require('./stage.repo');
 const itemRepo = require('./item.repo');
 const machineRepo = require('../machine/machine.repo');
@@ -110,13 +111,14 @@ async function updateStage(id, payload) {
 
   const updates = {};
   if (payload.name !== undefined) {
-    updates.name = payload.name.trim();
-    updates.slug = slugify(updates.name);
-    if (!updates.slug) {
+    updates.name = String(payload.name || '').trim();
+    if (!slugify(updates.name)) {
       throw new ApiError(400, 'Enter a valid stage name');
     }
-    const existing = await stageRepo.findBySlug(updates.slug);
-    if (existing && String(existing._id) !== String(id)) {
+    const clash = (await stageRepo.findAll()).find(
+      (row) => String(row._id) !== String(id) && String(row.name || '').trim().toLowerCase() === updates.name.toLowerCase()
+    );
+    if (clash) {
       throw new ApiError(409, 'A stage with this name already exists');
     }
   }
@@ -137,6 +139,10 @@ async function deleteStage(id) {
   const stage = await stageRepo.findById(id);
   if (!stage) {
     throw new ApiError(404, 'Stage not found');
+  }
+
+  if (DEFAULT_STAGES.some((row) => row.slug === stage.slug)) {
+    throw new ApiError(400, 'Production stages cannot be deleted. Mark it inactive instead.');
   }
 
   const inUse = await itemRepo.countByStage(id);
