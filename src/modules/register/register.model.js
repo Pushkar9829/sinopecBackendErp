@@ -11,6 +11,7 @@ const entrySchema = new mongoose.Schema(
   {
     stage: { type: String, required: true, trim: true },
     itemId: { type: mongoose.Schema.Types.ObjectId, required: true },
+    workId: { type: mongoose.Schema.Types.ObjectId, default: null },
     product: { type: String, default: '', trim: true },
     productCode: { type: String, default: '', trim: true },
     unit: { type: String, default: 'pcs', trim: true },

@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const {
   ATTACHMENT_KINDS,
   ORDER_PRIORITIES,
+  ORDER_TYPES,
   PAYMENT_METHODS,
   PAYMENT_TERMS,
   PRODUCTION_ROUTES,
@@ -130,6 +131,9 @@ const lineItemSchema = new mongoose.Schema(
           handoverPerson: { type: String, default: '', trim: true },
           deliveryPartner: { type: String, default: '', trim: true },
           details: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+          sourceLot: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+          outputLot: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+          wasteLot: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
           completedAt: { type: Date, default: Date.now },
         },
       ],
@@ -177,6 +181,12 @@ const customerSnapshotSchema = new mongoose.Schema(
 const salesOrderSchema = new mongoose.Schema(
   {
     number: { type: String, required: true, unique: true, trim: true },
+    orderType: {
+      type: String,
+      enum: Object.values(ORDER_TYPES),
+      default: ORDER_TYPES.SALES_ORDER,
+      index: true,
+    },
     orderDate: { type: Date, required: true },
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
     customerSnapshot: { type: customerSnapshotSchema, default: () => ({}) },

@@ -609,20 +609,26 @@ function withDeliveryHandover(stageWork, item, { finishDelivery = false } = {}) 
   return rows;
 }
 
+const ROLLING_ROLL_TYPES = [
+  'Tube (Maticore)',
+  'Tube (Medium)',
+  'Cake',
+  'Tube (Patli Cap)',
+  'Sheet (Sana)',
+  'Recycled (5/60?)',
+  'Frosted',
+  'B Tube',
+  'Barni',
+  'Milk',
+];
+
 function bookDetails(item, row, index) {
   const specs = registerSpecs(null, item, row.stage);
   const n = index + 1;
   let extra = {};
   if (row.stage === 'rolling') {
     extra = {
-      beam: `B-${n}`,
-      tb: '18×25',
-      rollType: n % 2 ? 'Centre fold' : 'Side seal',
-      tubeMedium: 'Paper',
-      tubeCore: '3 inch',
-      tubeParticular: 'Plain',
-      sheetTube: n % 2 ? 'Sheet (8 mm)' : 'Tube (8 mm)',
-      recycled: String(5 + (n % 6)),
+      rollType: ROLLING_ROLL_TYPES[index % ROLLING_ROLL_TYPES.length],
       exStock: n % 2 ? '' : 'D.S.',
       weight: String(row.outputQty || ''),
       gross: String((Number(row.outputQty) || 0) + 2),
@@ -632,15 +638,11 @@ function bookDetails(item, row, index) {
   } else if (row.stage === 'printing') {
     extra = {
       cylinderSize: '400 mm',
-      gauge: item.thickness || item.manufacturing?.thickness || '50 micron',
-      uv: n % 2 ? 'Yes' : 'No',
       printDescription: item.printing?.design || item.printing?.requirement || 'Customer logo',
       wastage: String(row.wasteQty || ''),
     };
   } else if (row.stage === 'cutting') {
     extra = {
-      tubeUsed: '3 inch',
-      rollType: n % 2 ? 'Centre fold' : 'Side seal',
       cuts: String(Math.max(1, Math.round((Number(row.outputQty) || 1) / 100))),
       discKnife: n % 2 ? 'disc' : 'knife',
     };
@@ -929,7 +931,8 @@ async function seedDemoSalesOrders() {
   }));
   const plannedTotals = calcTotals(plannedItems, 0, 0);
   await salesOrderRepo.create({
-    number: await nextSalesOrderNumber(orderDate),
+    number: await nextSalesOrderNumber(orderDate, 'job_work'),
+    orderType: 'job_work',
     orderDate,
     customer: delta._id,
     customerSnapshot: deltaSnap,
@@ -1702,7 +1705,8 @@ async function seedDemoSalesOrders() {
   );
   const completedCourierTotals = calcTotals([completedCourier], 0, 0);
   const completedCourierOrder = await salesOrderRepo.create({
-    number: await nextSalesOrderNumber(new Date('2026-09-03')),
+    number: await nextSalesOrderNumber(new Date('2026-09-03'), 'job_work'),
+    orderType: 'job_work',
     orderDate: new Date('2026-09-03'),
     customer: delta._id,
     customerSnapshot: deltaSnap,
@@ -2025,7 +2029,7 @@ async function resetDemoCollections() {
     Register.deleteMany({}),
   ]);
   await mongoose.connection.collection('counters').deleteMany({});
-  console.log('Reset demo customers, sales orders, inventory, registers, and sales settings');
+  console.log('Reset demo customers, orders, inventory, registers, and sales settings');
 }
 
 async function dropStaleUserEmailIndex() {

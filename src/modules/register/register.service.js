@@ -1,4 +1,4 @@
-const { SALES_ORDER_STATUSES } = require('../../config/constants');
+const { ROLE_SLUGS, SALES_ORDER_STATUSES } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
 const { hasPermission } = require('../../utils/permissions');
 const salesOrderRepo = require('../salesOrder/salesOrder.repo');
@@ -63,6 +63,18 @@ function customerNameOf(order) {
   return order.customerSnapshot?.name || order.customer?.name || '';
 }
 
+function seesCustomerName(user) {
+  return user?.role?.slug === ROLE_SLUGS.SUPER_ADMIN;
+}
+
+function customerNameFor(user, order) {
+  return seesCustomerName(user) ? customerNameOf(order) : '';
+}
+
+function customerCodeOf(order) {
+  return order.customerSnapshot?.code || order.customer?.code || '';
+}
+
 function publicDetails(raw) {
   const source = raw && typeof raw.toObject === 'function' ? raw.toObject() : raw;
   if (!source || typeof source !== 'object' || Array.isArray(source)) return {};
@@ -80,6 +92,7 @@ function entryFromWork(item, row) {
   return {
     stage: row.stage,
     itemId: item._id,
+    workId: row._id || null,
     product: item.product || '',
     productCode: item.productCode || '',
     unit: stageUnit(item, row.stage),
@@ -193,12 +206,19 @@ async function ensureRegister(order, preloaded) {
       dirty = true;
     }
   }
-  const haveEntries = new Set((doc.entries || []).map((row) => entryKey(row.itemId, row)));
+  const byKey = new Map((doc.entries || []).map((row) => [entryKey(row.itemId, row), row]));
   for (const entry of entriesFromWork(order)) {
     const key = entryKey(entry.itemId, entry);
-    if (haveEntries.has(key)) continue;
+    const existing = byKey.get(key);
+    if (existing) {
+      if (!existing.workId && entry.workId) {
+        existing.workId = entry.workId;
+        dirty = true;
+      }
+      continue;
+    }
     doc.entries.push(entry);
-    haveEntries.add(key);
+    byKey.set(key, entry);
     dirty = true;
   }
   if (dirty) await repo.save(doc);
@@ -274,7 +294,9 @@ function presentOrder(user, order, doc) {
     id: String(doc._id),
     orderId: String(order._id),
     orderNumber: order.number,
-    customerName: customerNameOf(order),
+    orderType: order.orderType || 'sales_order',
+    customerName: customerNameFor(user, order),
+    customerCode: customerCodeOf(order),
     status: order.status,
     priority: order.priority,
     deliveryDate: order.deliveryDate,
@@ -296,7 +318,9 @@ async function list(user) {
       id: summary.id,
       orderId: summary.orderId,
       orderNumber: summary.orderNumber,
+      orderType: summary.orderType,
       customerName: summary.customerName,
+      customerCode: summary.customerCode,
       status: summary.status,
       priority: summary.priority,
       deliveryDate: summary.deliveryDate,
@@ -315,9 +339,9 @@ async function list(user) {
 async function getByOrder(user, orderId) {
   assertCanView(user);
   const order = await salesOrderRepo.findById(orderId);
-  if (!order) throw new ApiError(404, 'Sales order not found');
+  if (!order) throw new ApiError(404, 'Order not found');
   if (!REGISTER_STATUSES.includes(order.status)) {
-    throw new ApiError(400, 'This sales order has no register yet');
+    throw new ApiError(400, 'This order has no register yet');
   }
   if (!readableStages(user, order).length) {
     throw new ApiError(403, 'You cannot view this register');
@@ -367,7 +391,8 @@ async function getStage(user, stage) {
         open.push({
           orderId: String(order._id),
           orderNumber: order.number,
-          customerName: customerNameOf(order),
+          customerName: customerNameFor(user, order),
+          customerCode: customerCodeOf(order),
           priority: order.priority,
           deliveryDate: order.deliveryDate,
           sourceLots,
@@ -386,7 +411,8 @@ async function getStage(user, stage) {
           ...entry,
           orderId: String(order._id),
           orderNumber: order.number,
-          customerName: customerNameOf(order),
+          customerName: customerNameFor(user, order),
+          customerCode: customerCodeOf(order),
         });
       }
     }
@@ -402,7 +428,42 @@ async function getStage(user, stage) {
   };
 }
 
+async function findEntry(order, entryId) {
+  const doc = await ensureRegister(order);
+  const entry = doc.entries.id(entryId);
+  if (!entry) throw new ApiError(404, 'That register entry was not found');
+  return { doc, entry };
+}
+
+function workRowFor(order, entry) {
+  const item = (order.items || []).id(entry.itemId);
+  if (!item) return { item: null, row: null };
+  const rows = item.stageWork || [];
+  let row = entry.workId ? rows.id(entry.workId) : null;
+  if (!row) {
+    const key = entryKey(entry.itemId, entry);
+    row = rows.find((candidate) => entryKey(item._id, candidate) === key) || null;
+  }
+  return { item, row };
+}
+
+async function updateEntry(doc, entry, item, row) {
+  const fresh = entryFromWork(item, row);
+  for (const [key, value] of Object.entries(fresh)) entry[key] = value;
+  doc.markModified('entries');
+  return repo.save(doc);
+}
+
+async function removeEntry(doc, entry) {
+  doc.entries.pull(entry._id);
+  return repo.save(doc);
+}
+
 module.exports = {
+  findEntry,
+  workRowFor,
+  updateEntry,
+  removeEntry,
   openForOrder,
   recordMark,
   list,

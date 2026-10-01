@@ -201,7 +201,7 @@ async function deleteCustomer(id) {
   }
   const used = await SalesOrder.countDocuments({ customer: id });
   if (used > 0) {
-    throw new ApiError(400, 'Customer is used on a sales order and cannot be deleted');
+    throw new ApiError(400, 'Customer is used on an order and cannot be deleted');
   }
   await customerRepo.deleteById(id);
 }

@@ -47,7 +47,7 @@ router.post(
   authenticate,
   authorize.any(...WORK_KEYS),
   validate([
-    body('orderId').isMongoId().withMessage('Invalid sales order'),
+    body('orderId').isMongoId().withMessage('Invalid order'),
     body('itemId').isMongoId().withMessage('Invalid line item'),
     body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
     body('lotId').isMongoId().withMessage('Pick an inventory lot'),
@@ -67,7 +67,7 @@ router.post(
   authenticate,
   authorize.any(...WORK_KEYS),
   validate([
-    body('orderId').isMongoId().withMessage('Invalid sales order'),
+    body('orderId').isMongoId().withMessage('Invalid order'),
     body('itemId').isMongoId().withMessage('Invalid line item'),
     body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
   ]),
@@ -79,7 +79,7 @@ router.post(
   authenticate,
   authorize.any(...WORK_KEYS),
   validate([
-    body('orderId').isMongoId().withMessage('Invalid sales order'),
+    body('orderId').isMongoId().withMessage('Invalid order'),
     body('itemId').isMongoId().withMessage('Invalid line item'),
     body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
     body('outputQty').isFloat({ gt: 0 }).withMessage('Enter the production quantity'),
@@ -99,11 +99,44 @@ router.post(
 );
 
 router.post(
+  '/entry/update',
+  authenticate,
+  authorize.any(...WORK_KEYS),
+  validate([
+    body('orderId').isMongoId().withMessage('Invalid order'),
+    body('entryId').isMongoId().withMessage('Invalid entry'),
+    body('outputQty').optional().isFloat({ gt: 0 }).withMessage('Enter the production quantity'),
+    body('inputQty').optional({ nullable: true, checkFalsy: true }).isFloat({ min: 0 }),
+    body('wasteQty').optional({ nullable: true, checkFalsy: true }).isFloat({ min: 0 }),
+    body('machineId').optional({ nullable: true, checkFalsy: true }).isMongoId(),
+    body('shift').optional().isIn(['morning', 'afternoon', 'night']),
+    body('workDate').optional().isISO8601().withMessage('Invalid work date'),
+    body('notes').optional().isString(),
+    body('vehicleNumber').optional().isString(),
+    body('handoverPerson').optional().isString(),
+    body('deliveryPartner').optional().isString(),
+    body('details').optional().isObject().withMessage('Stage details must be an object'),
+  ]),
+  productionController.updateEntry
+);
+
+router.post(
+  '/entry/delete',
+  authenticate,
+  authorize.any(...WORK_KEYS),
+  validate([
+    body('orderId').isMongoId().withMessage('Invalid order'),
+    body('entryId').isMongoId().withMessage('Invalid entry'),
+  ]),
+  productionController.deleteEntry
+);
+
+router.post(
   '/complete',
   authenticate,
   authorize.any(...WORK_KEYS),
   validate([
-    body('orderId').isMongoId().withMessage('Invalid sales order'),
+    body('orderId').isMongoId().withMessage('Invalid order'),
     body('itemId').isMongoId().withMessage('Invalid line item'),
     body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
     body('machineId').optional({ nullable: true, checkFalsy: true }).isMongoId(),

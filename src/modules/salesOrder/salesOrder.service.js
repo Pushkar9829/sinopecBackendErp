@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const {
   ATTACHMENT_KINDS,
   ORDER_PRIORITIES,
+  ORDER_TYPES,
   PAYMENT_METHODS,
   PAYMENT_TERMS,
   PRODUCTION_ROUTE_LIST,
@@ -278,6 +279,7 @@ function toPublicOrder(order) {
   return {
     id: String(order._id),
     number: order.number,
+    orderType: order.orderType || ORDER_TYPES.SALES_ORDER,
     orderDate: order.orderDate,
     customer: {
       id: order.customer?._id ? String(order.customer._id) : String(order.customer),
@@ -379,6 +381,7 @@ function abstractForStations(publicOrder, rawOrder, stations) {
   return {
     id: publicOrder.id,
     number: publicOrder.number,
+    orderType: publicOrder.orderType,
     status: publicOrder.status,
     priority: publicOrder.priority,
     orderDate: publicOrder.orderDate,
@@ -386,8 +389,8 @@ function abstractForStations(publicOrder, rawOrder, stations) {
     viewMode: 'stage',
     viewStages: stations,
     customer: {
-      name: publicOrder.customer?.name || '',
-      code: showDispatch ? publicOrder.customer?.code || '' : '',
+      name: showDispatch ? publicOrder.customer?.name || '' : '',
+      code: publicOrder.customer?.code || '',
     },
     deliveryLocation: showDispatch ? publicOrder.deliveryLocation || '' : '',
     deliveryInstructions: showDispatch ? publicOrder.deliveryInstructions || '' : '',
@@ -641,14 +644,14 @@ function assertReadyToSubmit(order) {
 async function getOrderOrThrow(id) {
   const order = await salesOrderRepo.findById(id);
   if (!order) {
-    throw new ApiError(404, 'Sales order not found');
+    throw new ApiError(404, 'Order not found');
   }
   return order;
 }
 
 function requireDraft(order) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
-    throw new ApiError(400, 'Only draft sales orders can be edited');
+    throw new ApiError(400, 'Only draft orders can be edited');
   }
 }
 
@@ -668,7 +671,7 @@ async function getOrder(user, id) {
   const order = await getOrderOrThrow(id);
   if (operatorStations(user).length) {
     const view = HIDDEN_FROM_OPERATORS.includes(order.status) ? null : present(order, user);
-    if (!view || !view.items.length) throw new ApiError(404, 'Sales order not found');
+    if (!view || !view.items.length) throw new ApiError(404, 'Order not found');
     return view;
   }
   return present(order, user);
@@ -681,7 +684,10 @@ async function createOrder(user, payload) {
   assertDraftComplete(items);
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
+  const orderType = payload.orderType || ORDER_TYPES.SALES_ORDER;
+  assertIn(orderType, ORDER_TYPES, 'Order type must be Sales order or Job work');
   const doc = {
+    orderType,
     orderDate,
     customer: customer._id,
     customerSnapshot: snapshot,
@@ -709,7 +715,7 @@ async function createOrder(user, payload) {
   assertIn(doc.priority, ORDER_PRIORITIES, 'Priority must be normal, high, or urgent');
   assertIn(doc.paymentTerms, PAYMENT_TERMS, 'Invalid payment terms');
   assertIn(doc.paymentMethod, PAYMENT_METHODS, 'Invalid payment method');
-  doc.number = await nextSalesOrderNumber(orderDate);
+  doc.number = await nextSalesOrderNumber(orderDate, orderType);
   const created = await salesOrderRepo.create(doc);
   await rememberProducts(customer._id, payload.items, items);
   const loaded = await salesOrderRepo.findById(created._id);
@@ -753,7 +759,7 @@ async function rememberProducts(customerId, rawItems, items) {
 async function deleteOrder(id) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
-    throw new ApiError(400, 'Only draft sales orders can be deleted');
+    throw new ApiError(400, 'Only draft orders can be deleted');
   }
   for (const attachment of order.attachments || []) {
     await deleteStoredObject(attachment.key || attachment.storedName, attachment.storage || 'local').catch(() => {});
@@ -765,7 +771,7 @@ async function deleteOrder(id) {
 async function submitOrder(user, id) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
-    throw new ApiError(400, 'Only draft sales orders can be submitted');
+    throw new ApiError(400, 'Only draft orders can be submitted');
   }
   assertReadyToSubmit(order);
   order.status = SALES_ORDER_STATUSES.SUBMITTED;
@@ -776,11 +782,11 @@ async function submitOrder(user, id) {
 
 async function approveOrder(user, id) {
   if (!isSuperAdmin(user)) {
-    throw new ApiError(403, 'Only Super Admin can approve a sales order');
+    throw new ApiError(403, 'Only Super Admin can approve an order');
   }
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.SUBMITTED) {
-    throw new ApiError(400, 'Only submitted sales orders can be approved');
+    throw new ApiError(400, 'Only submitted orders can be approved');
   }
   order.status = SALES_ORDER_STATUSES.APPROVED;
   order.approvedAt = new Date();
@@ -791,13 +797,13 @@ async function approveOrder(user, id) {
 async function returnToDraft(user, id, reason) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.SUBMITTED && order.status !== SALES_ORDER_STATUSES.APPROVED) {
-    throw new ApiError(400, 'Only submitted or approved sales orders can go back to draft');
+    throw new ApiError(400, 'Only submitted or approved orders can go back to draft');
   }
   if (order.status === SALES_ORDER_STATUSES.APPROVED && !isSuperAdmin(user)) {
-    throw new ApiError(403, 'Only Super Admin can send an approved sales order back to draft');
+    throw new ApiError(403, 'Only Super Admin can send an approved order back to draft');
   }
   if (!isSuperAdmin(user) && !hasPermission(user, 'sales:update')) {
-    throw new ApiError(403, 'You cannot send this sales order back to draft');
+    throw new ApiError(403, 'You cannot send this order back to draft');
   }
   order.status = SALES_ORDER_STATUSES.DRAFT;
   order.submittedAt = null;
@@ -811,7 +817,7 @@ async function returnToDraft(user, id, reason) {
 async function planProduction(user, id) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.APPROVED) {
-    throw new ApiError(400, 'Only approved sales orders can be planned for production');
+    throw new ApiError(400, 'Only approved orders can be planned for production');
   }
   for (const item of order.items || []) {
     item.currentStage = firstStage(item.productionRoute);
@@ -849,15 +855,15 @@ async function advanceOrder(user, id) {
 async function cancelOrder(user, id, reason) {
   const order = await getOrderOrThrow(id);
   if (order.status === SALES_ORDER_STATUSES.CANCELLED) {
-    throw new ApiError(400, 'Sales order is already cancelled');
+    throw new ApiError(400, 'Order is already cancelled');
   }
   const shipped = [SALES_ORDER_STATUSES.DISPATCHED, SALES_ORDER_STATUSES.DELIVERED, SALES_ORDER_STATUSES.COMPLETED];
   if (shipped.includes(order.status)) {
-    throw new ApiError(400, 'Goods have already gone out on this sales order, so it cannot be cancelled');
+    throw new ApiError(400, 'Goods have already gone out on this order, so it cannot be cancelled');
   }
   const anyDelivery = (order.items || []).some((item) => (item.stageWork || []).some((row) => row.stage === 'delivery'));
   if (anyDelivery) {
-    throw new ApiError(400, 'Part of this sales order is already delivered, so it cannot be cancelled');
+    throw new ApiError(400, 'Part of this order is already delivered, so it cannot be cancelled');
   }
 
   const early = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.SUBMITTED, SALES_ORDER_STATUSES.APPROVED].includes(order.status);
@@ -865,7 +871,7 @@ async function cancelOrder(user, id, reason) {
   const productionCan = hasPermission(user, 'production:update');
 
   if (early && !salesCan && !isSuperAdmin(user)) {
-    throw new ApiError(403, 'You cannot cancel this sales order');
+    throw new ApiError(403, 'You cannot cancel this order');
   }
   if (!early && !productionCan && !isSuperAdmin(user)) {
     throw new ApiError(403, 'Once production is planned, only Production Manager or Super Admin can cancel');
@@ -900,7 +906,7 @@ async function addAttachment(user, id, file, kind) {
     throw new ApiError(400, 'Attachments cannot be added in this status');
   }
   if (!isSuperAdmin(user) && !hasPermission(user, 'sales:update')) {
-    throw new ApiError(403, 'You cannot attach files to this sales order');
+    throw new ApiError(403, 'You cannot attach files to this order');
   }
 
   const attachmentKind = str(kind) || ATTACHMENT_KINDS.OTHER;

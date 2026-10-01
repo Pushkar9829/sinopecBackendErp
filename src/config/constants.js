@@ -77,6 +77,7 @@ const AUTH_PERMISSIONS = [
   { key: 'roles:read', module: 'roles', action: 'read', description: 'View roles' },
   { key: 'roles:update', module: 'roles', action: 'update', description: 'Update role permissions' },
   { key: 'permissions:read', module: 'permissions', action: 'read', description: 'View permissions' },
+  { key: 'audit:read', module: 'audit', action: 'read', description: 'View the audit log of every change' },
 ];
 
 const MODULE_PERMISSIONS = [
@@ -217,6 +218,11 @@ const SALES_ORDER_STATUS_FLOW = [
   SALES_ORDER_STATUSES.DELIVERED,
   SALES_ORDER_STATUSES.COMPLETED,
 ];
+
+const ORDER_TYPES = {
+  SALES_ORDER: 'sales_order',
+  JOB_WORK: 'job_work',
+};
 
 const ORDER_PRIORITIES = {
   NORMAL: 'normal',
@@ -389,6 +395,7 @@ module.exports = {
   DELIVERY_PARTNERS,
   SALES_ORDER_STATUSES,
   SALES_ORDER_STATUS_FLOW,
+  ORDER_TYPES,
   ORDER_PRIORITIES,
   PAYMENT_TERMS,
   PAYMENT_METHODS,

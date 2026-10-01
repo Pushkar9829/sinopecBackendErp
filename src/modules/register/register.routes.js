@@ -32,7 +32,7 @@ router.get(
   '/order/:orderId',
   authenticate,
   authorize.any(...VIEW_KEYS),
-  validate([param('orderId').isMongoId().withMessage('Invalid sales order')]),
+  validate([param('orderId').isMongoId().withMessage('Invalid order')]),
   registerController.getByOrder
 );
 

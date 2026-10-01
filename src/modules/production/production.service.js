@@ -43,24 +43,14 @@ function num(value, fallback = 0) {
 }
 
 const TYPED_DETAIL_KEYS = [
-  'beam',
-  'tb',
   'rollType',
-  'tubeMedium',
-  'tubeCore',
-  'tubeParticular',
-  'sheetTube',
-  'sheet8',
-  'tube8',
-  'recycled',
   'exStock',
   'weight',
   'gross',
   'tare',
   'net',
+  'description',
   'cylinderSize',
-  'gauge',
-  'uv',
   'printDescription',
   'wastage',
   'tubeUsed',
@@ -83,19 +73,25 @@ function publicDetails(raw) {
   return out;
 }
 
+const LONG_DETAIL_KEYS = new Set(['description', 'printDescription']);
+
+function detailLimit(key) {
+  return LONG_DETAIL_KEYS.has(key) ? 1000 : 200;
+}
+
 function buildDetails(order, item, stage, raw) {
   const specs = registerSpecs(order, item, stage);
   const typed = {};
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     for (const key of TYPED_DETAIL_KEYS) {
       if (raw[key] == null || raw[key] === '') continue;
-      typed[key] = String(raw[key]).trim().slice(0, 200);
+      typed[key] = String(raw[key]).trim().slice(0, detailLimit(key));
     }
   }
   const details = {};
   for (const [key, value] of Object.entries({ ...specs, ...typed })) {
     if (value == null || String(value).trim() === '') continue;
-    details[key] = String(value).trim().slice(0, 200);
+    details[key] = String(value).trim().slice(0, detailLimit(key));
   }
   return details;
 }
@@ -212,9 +208,10 @@ async function toJob(order, item, stage) {
     itemId: String(item._id),
     stage,
     number: order.number,
+    orderType: order.orderType || 'sales_order',
     priority: order.priority,
     deliveryDate: order.deliveryDate,
-    customer: order.customerSnapshot?.name || order.customer?.name || '',
+    customerCode: order.customerSnapshot?.code || order.customer?.code || '',
     product: item.product || '',
     productCode: item.productCode || '',
     quantity: stats.target,
@@ -293,9 +290,9 @@ async function loadFloorItem(user, payload, { mustWork }) {
   }
 
   const order = await salesOrderRepo.findById(payload.orderId);
-  if (!order) throw new ApiError(404, 'Sales order not found');
+  if (!order) throw new ApiError(404, 'Order not found');
   if (!FLOOR_ORDER_STATUSES.includes(order.status)) {
-    throw new ApiError(400, 'This sales order is not on the production floor');
+    throw new ApiError(400, 'This order is not on the production floor');
   }
 
   const item = (order.items || []).id(payload.itemId);
@@ -324,7 +321,7 @@ async function createShiftLot({ order, item, stage, category, qty, unit, shift, 
     quantity: qty,
     unitPrice: category === INVENTORY_CATEGORIES.WASTE ? null : 0,
     stage: stageDoc?._id || null,
-    notes: `From sales order ${order.number}`,
+    notes: `From order ${order.number}`,
     isActive: true,
     kind: 'wip',
     wipStage: stage,
@@ -382,7 +379,7 @@ async function pickupLot(user, payload) {
       String(lot.lineItem) === String(item._id) &&
       lot.wipStage === prev;
     if (!matches) {
-      throw new ApiError(400, `Pick ${stageTitle(prev)} output for this sales order`);
+      throw new ApiError(400, `Pick ${stageTitle(prev)} output for this order`);
     }
   }
 
@@ -459,10 +456,12 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     handoverPerson,
     deliveryPartner,
     details: buildDetails(order, item, stage, payload.details),
+    sourceLot: lot._id,
     completedAt: new Date(),
   };
   item.stageWork = item.stageWork || [];
   item.stageWork.push(workRow);
+  const savedRow = item.stageWork[item.stageWork.length - 1];
   item.currentStage = activeStage(item);
   applyOrderStatus(order);
   try {
@@ -471,7 +470,7 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     await undo();
     throw error;
   }
-  await markRegister(order, item, workRow);
+  await markRegister(order, item, savedRow);
   return toJob(order, item, stage);
 }
 
@@ -590,6 +589,7 @@ async function completeStage(user, payload) {
     if (machine.isActive === false) throw new ApiError(400, 'That machine is inactive');
   }
 
+  const sourceLotId = item.stagePickup.lot || null;
   const leftover = Math.max(0, Number(item.stagePickup.qty) - inputQty);
   if (leftover > 1e-9) {
     item.stagePickup.qty = leftover;
@@ -639,6 +639,9 @@ async function completeStage(user, payload) {
     handoverPerson,
     deliveryPartner,
     details: buildDetails(order, item, stage, payload.details),
+    sourceLot: sourceLotId,
+    outputLot: outputLot?._id || null,
+    wasteLot: wasteLot?._id || null,
     completedAt: new Date(),
   };
   if (stage === 'printing' && wasteQty && !workRow.details.wastage) {
@@ -646,6 +649,7 @@ async function completeStage(user, payload) {
   }
   item.stageWork = item.stageWork || [];
   item.stageWork.push(workRow);
+  const savedRow = item.stageWork[item.stageWork.length - 1];
   item.currentStage = activeStage(item);
 
   applyOrderStatus(order);
@@ -655,7 +659,7 @@ async function completeStage(user, payload) {
     for (const lot of createdLots) await itemRepo.deleteById(lot._id).catch(() => {});
     throw error;
   }
-  await markRegister(order, item, workRow);
+  await markRegister(order, item, savedRow);
   return require('../salesOrder/salesOrder.service').getOrder(user, order._id);
 }
 
@@ -776,6 +780,269 @@ async function enterFromRegister(user, payload) {
   }
 }
 
+const EDITABLE_ORDER_STATUSES = [...FLOOR_ORDER_STATUSES, SALES_ORDER_STATUSES.DELIVERED];
+const EPS = 1e-6;
+
+async function loadEntry(user, payload) {
+  const order = await salesOrderRepo.findById(payload.orderId);
+  if (!order) throw new ApiError(404, 'Order not found');
+  if (!EDITABLE_ORDER_STATUSES.includes(order.status)) {
+    throw new ApiError(400, 'Entries cannot be changed once the order is completed or cancelled');
+  }
+  const registers = require('../register/register.service');
+  const { doc, entry } = await registers.findEntry(order, payload.entryId);
+  if (!canWorkStage(user, entry.stage)) {
+    throw new ApiError(403, 'You cannot change entries on this stage');
+  }
+  const { item, row } = registers.workRowFor(order, entry);
+  if (!item || !row) throw new ApiError(404, 'The production record for this entry was not found');
+  return { order, doc, entry, item, row, stage: entry.stage, registers };
+}
+
+async function findWorkLot(order, item, row, category) {
+  const linked = category === INVENTORY_CATEGORIES.WASTE ? row.wasteLot : row.outputLot;
+  if (linked) return itemRepo.findById(linked);
+  const qty = category === INVENTORY_CATEGORIES.WASTE ? Number(row.wasteQty) || 0 : Number(row.outputQty) || 0;
+  const lots = await itemRepo.findAll({
+    kind: 'wip',
+    category,
+    salesOrder: order._id,
+    lineItem: item._id,
+    wipStage: row.stage,
+  });
+  return lots.find((lot) => Number(lot.quantity) + EPS >= qty) || lots[0] || null;
+}
+
+async function findSourceLot(order, item, row) {
+  if (row.sourceLot) {
+    const linked = await itemRepo.findById(row.sourceLot);
+    if (linked) return linked;
+  }
+  if (!row.pickedLotName) return null;
+  const sameOrder = await itemRepo.findOne({ name: row.pickedLotName, salesOrder: order._id, lineItem: item._id });
+  return sameOrder || itemRepo.findOne({ name: row.pickedLotName });
+}
+
+async function restoreSource(order, item, row, qty, unit) {
+  if (qty <= EPS) return () => {};
+  const lot = await findSourceLot(order, item, row);
+  if (lot) {
+    await itemRepo.addQuantity(lot._id, qty);
+    if (lot.isActive === false) await itemRepo.updateById(lot._id, { isActive: true });
+    return () => itemRepo.takeQuantity(lot._id, qty);
+  }
+  const fromStage = row.fromStage || '';
+  const created = await itemRepo.create({
+    category: fromStage ? INVENTORY_CATEGORIES.OUTPUT : INVENTORY_CATEGORIES.RAW,
+    name: row.pickedLotName || `${order.number} returned`,
+    materialType: item.material || item.manufacturing?.materialType || 'WIP',
+    unit: unit || item.unit || 'pcs',
+    quantity: qty,
+    unitPrice: fromStage ? 0 : null,
+    notes: `Returned from a changed entry on ${order.number}`,
+    isActive: true,
+    kind: fromStage ? 'wip' : 'catalog',
+    wipStage: fromStage,
+    salesOrder: fromStage ? order._id : null,
+    lineItem: fromStage ? item._id : null,
+  });
+  return () => itemRepo.deleteById(created._id);
+}
+
+async function takeBack(lot, qty, message) {
+  if (qty <= EPS) return;
+  if (!lot) throw new ApiError(400, message);
+  const updated = await itemRepo.takeQuantity(lot._id, qty);
+  if (!updated) throw new ApiError(400, message);
+}
+
+async function dropEmptyLot(lotId) {
+  if (!lotId) return;
+  const lot = await itemRepo.findById(lotId);
+  if (lot && lot.kind === 'wip' && Number(lot.quantity) <= EPS) await itemRepo.deleteById(lot._id);
+}
+
+const USED_DOWNSTREAM = 'The next stage has already used this output. Change or delete those entries first.';
+
+async function deleteEntry(user, payload) {
+  const { order, doc, entry, item, row, stage, registers } = await loadEntry(user, payload);
+  const outputQty = Number(row.outputQty) || 0;
+  const wasteQty = Number(row.wasteQty) || 0;
+  const inputQty = Number(row.inputQty) || 0;
+  const undo = [];
+
+  try {
+    if (!isDeliveryStage(stage)) {
+      const outputLot = await findWorkLot(order, item, row, INVENTORY_CATEGORIES.OUTPUT);
+      await takeBack(outputLot, outputQty, USED_DOWNSTREAM);
+      undo.push(() => itemRepo.addQuantity(outputLot._id, outputQty));
+      if (wasteQty > EPS) {
+        const wasteLot = await findWorkLot(order, item, row, INVENTORY_CATEGORIES.WASTE);
+        const available = Math.min(wasteQty, Number(wasteLot?.quantity) || 0);
+        if (wasteLot && available > EPS) {
+          await itemRepo.takeQuantity(wasteLot._id, available);
+          undo.push(() => itemRepo.addQuantity(wasteLot._id, available));
+        }
+      }
+    }
+
+    const prevStage = previousStage(item.productionRoute, stage);
+    const sourceUnit = prevStage ? stageUnit(item, prevStage) : undefined;
+    undo.push(await restoreSource(order, item, row, inputQty, sourceUnit));
+
+    const outputLotId = row.outputLot;
+    const wasteLotId = row.wasteLot;
+    item.stageWork.pull(row._id);
+    item.currentStage = activeStage(item);
+    applyOrderStatus(order);
+    await salesOrderRepo.save(order);
+    await registers.removeEntry(doc, entry);
+    await dropEmptyLot(outputLotId);
+    await dropEmptyLot(wasteLotId);
+  } catch (error) {
+    for (const step of undo.reverse()) await Promise.resolve(step()).catch(() => {});
+    throw error;
+  }
+  return { deleted: true };
+}
+
+async function updateEntry(user, payload) {
+  const { order, doc, entry, item, row, stage, registers } = await loadEntry(user, payload);
+  const delivery = isDeliveryStage(stage);
+  const oldOut = Number(row.outputQty) || 0;
+  const oldWaste = Number(row.wasteQty) || 0;
+  const oldIn = Number(row.inputQty) || 0;
+
+  const outputQty = payload.outputQty === undefined || payload.outputQty === '' ? oldOut : num(payload.outputQty);
+  const wasteQty = delivery ? 0 : payload.wasteQty === undefined || payload.wasteQty === '' ? oldWaste : num(payload.wasteQty);
+  if (outputQty <= 0) throw new ApiError(400, 'Enter the production quantity');
+  if (wasteQty < 0) throw new ApiError(400, 'Waste cannot be negative');
+
+  const stats = stageStats(item, stage);
+  if (stats.capped && outputQty - (stats.remaining + oldOut) > EPS) {
+    throw new ApiError(400, `Only ${stats.remaining + oldOut} ${stats.unit} can be entered on this stage`);
+  }
+
+  const prevStage = previousStage(item.productionRoute, stage);
+  const sourceLot = await findSourceLot(order, item, row);
+  const sourceUnit = sourceLot?.unit || (prevStage ? stageUnit(item, prevStage) : stats.unit);
+  const matching = !delivery && sameUnit(sourceUnit, stats.unit);
+  const givenInput = !(payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === '');
+  let inputQty;
+  if (delivery) inputQty = outputQty;
+  else if (matching) inputQty = outputQty + wasteQty;
+  else inputQty = givenInput ? num(payload.inputQty) : oldIn;
+  if (inputQty <= 0) throw new ApiError(400, 'Enter how much was used');
+
+  let machine = null;
+  if (payload.machineId) {
+    const stageDoc = await stageRepo.findBySlug(stage);
+    machine = (stageDoc?.machines || []).find((m) => String(m._id) === String(payload.machineId)) || null;
+    if (!machine) throw new ApiError(400, 'That machine is not assigned to this stage');
+  }
+
+  let workDate = row.workDate;
+  if (payload.workDate) {
+    workDate = new Date(payload.workDate);
+    if (Number.isNaN(workDate.getTime())) throw new ApiError(400, 'Work date is not valid');
+  }
+
+  if (delivery) {
+    const deliveryPartner = String(payload.deliveryPartner ?? row.deliveryPartner ?? '').trim();
+    if (!DELIVERY_PARTNERS.includes(deliveryPartner)) throw new ApiError(400, 'Select In-house, Delhivery, or Customer');
+    if (!String(payload.handoverPerson ?? row.handoverPerson ?? '').trim()) throw new ApiError(400, 'Enter the person taking this delivery');
+    if (!String(payload.vehicleNumber ?? row.vehicleNumber ?? '').trim()) throw new ApiError(400, 'Enter the vehicle number');
+  }
+
+  const undo = [];
+  const created = [];
+  try {
+    const dIn = inputQty - oldIn;
+    if (dIn > EPS) {
+      await takeBack(sourceLot, dIn, `Not enough left on ${row.pickedLotName || 'the material used'} to use ${dIn} more`);
+      undo.push(() => itemRepo.addQuantity(sourceLot._id, dIn));
+    } else if (dIn < -EPS) {
+      undo.push(await restoreSource(order, item, row, -dIn, sourceUnit));
+    }
+
+    if (!delivery) {
+      const dOut = outputQty - oldOut;
+      if (Math.abs(dOut) > EPS) {
+        let outputLot = await findWorkLot(order, item, row, INVENTORY_CATEGORIES.OUTPUT);
+        if (dOut < 0) {
+          await takeBack(outputLot, -dOut, USED_DOWNSTREAM);
+          undo.push(() => itemRepo.addQuantity(outputLot._id, -dOut));
+        } else if (outputLot) {
+          await itemRepo.addQuantity(outputLot._id, dOut);
+          undo.push(() => itemRepo.takeQuantity(outputLot._id, dOut));
+        } else {
+          outputLot = await createShiftLot({ order, item, stage, category: INVENTORY_CATEGORIES.OUTPUT, qty: dOut, unit: stats.unit, shift: row.shift, workDate });
+          if (outputLot) created.push(outputLot);
+          row.outputLot = outputLot?._id || null;
+        }
+      }
+
+      const dWaste = wasteQty - oldWaste;
+      if (Math.abs(dWaste) > EPS) {
+        let wasteLot = await findWorkLot(order, item, row, INVENTORY_CATEGORIES.WASTE);
+        if (dWaste < 0) {
+          const available = Math.min(-dWaste, Number(wasteLot?.quantity) || 0);
+          if (wasteLot && available > EPS) {
+            await itemRepo.takeQuantity(wasteLot._id, available);
+            undo.push(() => itemRepo.addQuantity(wasteLot._id, available));
+          }
+        } else if (wasteLot) {
+          await itemRepo.addQuantity(wasteLot._id, dWaste);
+          undo.push(() => itemRepo.takeQuantity(wasteLot._id, dWaste));
+        } else {
+          wasteLot = await createShiftLot({
+            order,
+            item,
+            stage,
+            category: INVENTORY_CATEGORIES.WASTE,
+            qty: dWaste,
+            unit: matching ? stats.unit : sourceUnit || stats.unit,
+            shift: row.shift,
+            workDate,
+          });
+          if (wasteLot) created.push(wasteLot);
+          row.wasteLot = wasteLot?._id || null;
+        }
+      }
+    }
+
+    row.inputQty = inputQty;
+    row.outputQty = outputQty;
+    row.wasteQty = wasteQty;
+    row.workDate = workDate;
+    if (SHIFT_IDS.includes(payload.shift)) row.shift = payload.shift;
+    if (machine) {
+      row.machine = machine._id;
+      row.machineName = `${machine.name}${machine.code ? ` (${machine.code})` : ''}`;
+    }
+    if (payload.notes !== undefined) row.notes = String(payload.notes || '').trim();
+    if (delivery) {
+      row.deliveryPartner = String(payload.deliveryPartner ?? row.deliveryPartner ?? '').trim();
+      row.handoverPerson = String(payload.handoverPerson ?? row.handoverPerson ?? '').trim();
+      row.vehicleNumber = String(payload.vehicleNumber ?? row.vehicleNumber ?? '').trim();
+    }
+    if (payload.details && typeof payload.details === 'object') {
+      row.details = buildDetails(order, item, stage, payload.details);
+      if (stage === 'printing' && wasteQty && !row.details.wastage) row.details.wastage = String(wasteQty);
+    }
+    item.markModified('stageWork');
+    item.currentStage = activeStage(item);
+    applyOrderStatus(order);
+    await salesOrderRepo.save(order);
+    await registers.updateEntry(doc, entry, item, row);
+  } catch (error) {
+    for (const step of undo.reverse()) await Promise.resolve(step()).catch(() => {});
+    for (const lot of created) await itemRepo.deleteById(lot._id).catch(() => {});
+    throw error;
+  }
+  return { updated: true };
+}
+
 async function stageMachines(user, stage) {
   if (!canReadStage(user, stage)) {
     throw new ApiError(403, 'You cannot view this stage');
@@ -798,6 +1065,8 @@ module.exports = {
   releasePickup,
   completeStage,
   enterFromRegister,
+  updateEntry,
+  deleteEntry,
   stageMachines,
   releaseOrderStock,
 };

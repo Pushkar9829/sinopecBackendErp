@@ -161,7 +161,7 @@ async function deleteItem(id) {
     throw new ApiError(404, 'Material not found');
   }
   if (item.kind === 'wip' && item.isActive !== false && Number(item.quantity) > 0) {
-    throw new ApiError(400, 'This lot belongs to a sales order on the floor. It is used up by the next stage.');
+    throw new ApiError(400, 'This lot belongs to an order on the floor. It is used up by the next stage.');
   }
   await itemRepo.deleteById(id);
 }

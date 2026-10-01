@@ -21,8 +21,12 @@ async function nextCustomerCode() {
   return `CUST-${pad(seq)}`;
 }
 
-async function nextSalesOrderNumber(date = new Date()) {
+async function nextSalesOrderNumber(date = new Date(), orderType = 'sales_order') {
   const year = date.getFullYear();
+  if (orderType === 'job_work') {
+    const seq = await nextSeq(`jobWork:${year}`);
+    return `JW-${year}-${pad(seq)}`;
+  }
   const seq = await nextSeq(`salesOrder:${year}`);
   return `SO-${year}-${pad(seq)}`;
 }

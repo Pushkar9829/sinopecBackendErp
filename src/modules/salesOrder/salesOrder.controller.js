@@ -32,7 +32,7 @@ const update = asyncHandler(async (req, res) => {
 
 const remove = asyncHandler(async (req, res) => {
   await salesOrderService.deleteOrder(req.params.id);
-  res.json({ success: true, message: 'Sales order deleted' });
+  res.json({ success: true, message: 'Order deleted' });
 });
 
 const submit = asyncHandler(async (req, res) => {

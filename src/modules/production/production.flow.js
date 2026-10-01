@@ -230,10 +230,7 @@ function registerSpecs(order, item, stage) {
   if (stage === 'rolling') {
     return {
       rollSize,
-      materialType: item.manufacturing?.materialType || item.material || '',
-      micron: item.thickness || item.manufacturing?.thickness || '',
       colour: item.color || item.manufacturing?.color || '',
-      width: item.width || item.manufacturing?.width || roll.width || '',
     };
   }
   if (stage === 'printing') {
@@ -310,7 +307,7 @@ function stageRequirements(order, item, stage) {
 
   return {
     ...common,
-    customer: order.customerSnapshot?.name || order.customer?.name || '',
+    customerCode: order.customerSnapshot?.code || order.customer?.code || '',
     deliveryDate: order.deliveryDate || null,
     deliveryLocation: order.deliveryLocation || '',
     deliveryInstructions: order.deliveryInstructions || '',

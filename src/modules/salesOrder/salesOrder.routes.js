@@ -29,6 +29,7 @@ router.post(
   authenticate,
   authorize('sales:create'),
   validate([
+    body('orderType').optional().isIn(['sales_order', 'job_work']).withMessage('Order type must be Sales order or Job work'),
     body('customerId').isMongoId().withMessage('Customer is required'),
     body('items').isArray({ min: 1 }).withMessage('Add at least one product'),
   ]),

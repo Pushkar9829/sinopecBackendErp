@@ -18,6 +18,8 @@ const productionRoutes = require('./modules/production/production.routes');
 const registerRoutes = require('./modules/register/register.routes');
 const analyticsRoutes = require('./modules/analytics/analytics.routes');
 const mediaRoutes = require('./modules/media/media.routes');
+const auditRoutes = require('./modules/audit/audit.routes');
+const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
 const env = require('./config/env');
@@ -72,6 +74,7 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'Sinopec API is running' });
 });
 
+app.use('/api', auditTrail);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/roles', roleRoutes);
@@ -85,6 +88,7 @@ app.use('/api/production', productionRoutes);
 app.use('/api/registers', registerRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/media', mediaRoutes);
+app.use('/api/audit-logs', auditRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));
