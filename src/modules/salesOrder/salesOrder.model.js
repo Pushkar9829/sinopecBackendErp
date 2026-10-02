@@ -14,6 +14,7 @@ const lineItemSchema = new mongoose.Schema(
     product: { type: String, default: '', trim: true },
     productCode: { type: String, default: '', trim: true },
     productType: { type: String, default: '', trim: true },
+    templateId: { type: String, default: '', trim: true },
     size: { type: String, default: '', trim: true },
     material: { type: String, default: '', trim: true },
     thickness: { type: String, default: '', trim: true },
@@ -143,6 +144,19 @@ const lineItemSchema = new mongoose.Schema(
   { _id: true }
 );
 
+const paymentSchema = new mongoose.Schema(
+  {
+    amount: { type: Number, required: true, min: 0 },
+    method: { type: String, enum: Object.values(PAYMENT_METHODS), default: PAYMENT_METHODS.BANK_TRANSFER },
+    reference: { type: String, default: '', trim: true },
+    note: { type: String, default: '', trim: true },
+    receivedAt: { type: Date, default: Date.now },
+    by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    byName: { type: String, default: '' },
+  },
+  { _id: true, timestamps: true }
+);
+
 const attachmentSchema = new mongoose.Schema(
   {
     originalName: { type: String, required: true, trim: true },
@@ -214,6 +228,8 @@ const salesOrderSchema = new mongoose.Schema(
     creditDays: { type: Number, default: 0, min: 0 },
     advanceAmount: { type: Number, default: 0, min: 0 },
     remainingAmount: { type: Number, default: 0, min: 0 },
+    paidAmount: { type: Number, default: 0, min: 0 },
+    payments: { type: [paymentSchema], default: [] },
     paymentRemarks: { type: String, default: '', trim: true },
     billingAddress: { type: String, default: '', trim: true },
     shippingAddress: { type: String, default: '', trim: true },

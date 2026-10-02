@@ -38,12 +38,12 @@ const getItem = asyncHandler(async (req, res) => {
 });
 
 const createItem = asyncHandler(async (req, res) => {
-  const item = await itemService.createItem(req.body);
+  const item = await itemService.createItem(req.body, req.user);
   res.status(201).json({ success: true, data: item });
 });
 
 const updateItem = asyncHandler(async (req, res) => {
-  const item = await itemService.updateItem(req.params.id, req.body);
+  const item = await itemService.updateItem(req.params.id, req.body, req.user);
   res.json({ success: true, data: item });
 });
 

@@ -136,6 +136,7 @@ async function loadWork(fromDate, toDate, stage) {
         shift: { $ifNull: ['$items.stageWork.shift', 'morning'] },
         operator: { $ifNull: ['$items.stageWork.operatorName', 'Unknown'] },
         machine: { $ifNull: ['$items.stageWork.machineName', ''] },
+        machineId: '$items.stageWork.machine',
         output: { $ifNull: ['$items.stageWork.outputQty', 0] },
         input: { $ifNull: ['$items.stageWork.inputQty', 0] },
         waste: { $ifNull: ['$items.stageWork.wasteQty', 0] },
@@ -157,6 +158,7 @@ async function loadWork(fromDate, toDate, stage) {
     shiftLabel: shiftLabel(row.shift),
     operator: row.operator,
     machine: String(row.machine || '').trim(),
+    machineId: row.machineId ? String(row.machineId) : '',
     output: round(row.output),
     input: round(row.input),
     waste: round(row.waste),
@@ -165,17 +167,35 @@ async function loadWork(fromDate, toDate, stage) {
   }));
 }
 
+// Dispatch re-counts goods already made, and rows where input was taken in another unit (kg in, pcs out)
+// cannot be added to yield, so headline totals skip them.
 function totalsFrom(rows) {
   return rows.reduce(
     (acc, row) => {
+      if (row.stage === 'dispatch') return acc;
       acc.output += row.output;
       acc.waste += row.waste;
-      acc.input += row.input;
       acc.shifts += 1;
+      if (Math.abs(row.input - (row.output + row.waste)) < 1e-6) {
+        acc.input += row.input;
+        acc.yieldOutput += row.output;
+      }
       return acc;
     },
-    { output: 0, waste: 0, input: 0, shifts: 0 }
+    { output: 0, waste: 0, input: 0, yieldOutput: 0, shifts: 0 }
   );
+}
+
+function deliveredAt(order) {
+  let last = null;
+  for (const item of order.items || []) {
+    for (const row of item.stageWork || []) {
+      if (row.stage !== 'dispatch') continue;
+      const at = row.workDate || row.completedAt;
+      if (at && (!last || at > last)) last = at;
+    }
+  }
+  return last || order.completedAt || order.updatedAt;
 }
 
 function roundBucket(row) {
@@ -195,13 +215,15 @@ async function getAnalytics(user, query) {
   const prevTo = addDays(from, -1);
   const prevFrom = addDays(from, -span);
 
-  const [details, previousDetails, orders] = await Promise.all([
+  const [details, previousDetails, orders, machines] = await Promise.all([
     loadWork(fromDate, toDate, stage),
     loadWork(startOfDay(prevFrom), endOfDay(prevTo), stage),
     SalesOrder.find({}).select(
-      'number status grandTotal customerSnapshot completedAt orderDate deliveryDate updatedAt'
+      'number status grandTotal customerSnapshot completedAt orderDate deliveryDate updatedAt items.stageWork.stage items.stageWork.workDate items.stageWork.completedAt'
     ),
+    require('../machine/machine.repo').findAll(),
   ]);
+  const machineNames = new Map(machines.map((machine) => [String(machine._id), machine.name]));
 
   const byDateMap = new Map(eachDate(from, to).map((date) => [date, { date, ...emptyBucket() }]));
   const byStageMap = new Map(
@@ -235,11 +257,12 @@ async function getAnalytics(user, query) {
     }
     addTo(byProductMap.get(productKey), row);
 
-    if (row.machine) {
-      if (!byMachineMap.has(row.machine)) {
-        byMachineMap.set(row.machine, { name: row.machine, ...emptyBucket(), stages: new Set() });
+    if (row.machine || row.machineId) {
+      const machineKey = row.machineId || row.machine;
+      if (!byMachineMap.has(machineKey)) {
+        byMachineMap.set(machineKey, { name: machineNames.get(row.machineId) || row.machine, ...emptyBucket(), stages: new Set() });
       }
-      const machine = byMachineMap.get(row.machine);
+      const machine = byMachineMap.get(machineKey);
       addTo(machine, row);
       machine.stages.add(row.stage);
     }
@@ -252,7 +275,12 @@ async function getAnalytics(user, query) {
   const riskUntil = endOfDay(addDays(today, 3));
   const finishedStatuses = new Set([SALES_ORDER_STATUSES.DELIVERED, SALES_ORDER_STATUSES.COMPLETED]);
   const openStatuses = new Set([
+    SALES_ORDER_STATUSES.SUBMITTED,
+    SALES_ORDER_STATUSES.APPROVED,
+    SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
     SALES_ORDER_STATUSES.IN_PRODUCTION,
+    SALES_ORDER_STATUSES.READY_FOR_PACKING,
+    SALES_ORDER_STATUSES.PACKED,
     SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
     SALES_ORDER_STATUSES.DISPATCHED,
   ]);
@@ -278,7 +306,7 @@ async function getAnalytics(user, query) {
     const bucket = byStatusMap[order.status] || (byStatusMap[order.status] = { id: order.status, count: 0, value: 0 });
     bucket.count += 1;
     bucket.value += Number(order.grandTotal) || 0;
-    const doneAt = order.completedAt || (finishedStatuses.has(order.status) ? order.updatedAt : null);
+    const doneAt = finishedStatuses.has(order.status) ? deliveredAt(order) : null;
     const completedInRange =
       finishedStatuses.has(order.status) && doneAt && doneAt >= fromDate && doneAt <= toDate;
     const completedPrev =
@@ -338,7 +366,7 @@ async function getAnalytics(user, query) {
       orders: orderIds.size,
       completed: completedCount,
       wastePct: kpis.output + kpis.waste > 0 ? round((kpis.waste / (kpis.output + kpis.waste)) * 100) : 0,
-      yieldPct: yieldPct(kpis.output, kpis.input),
+      yieldPct: yieldPct(kpis.yieldOutput, kpis.input),
       perShift: perShift(kpis.output, kpis.shifts),
       onTime,
       late,
@@ -348,7 +376,7 @@ async function getAnalytics(user, query) {
         output: round(previousTotals.output),
         waste: round(previousTotals.waste),
         completed: previousCompleted,
-        yieldPct: yieldPct(previousTotals.output, previousTotals.input),
+        yieldPct: yieldPct(previousTotals.yieldOutput, previousTotals.input),
         outputDelta: deltaPct(kpis.output, previousTotals.output),
         wasteDelta: deltaPct(kpis.waste, previousTotals.waste),
         completedDelta: deltaPct(completedCount, previousCompleted),

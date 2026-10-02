@@ -19,6 +19,7 @@ const registerRoutes = require('./modules/register/register.routes');
 const analyticsRoutes = require('./modules/analytics/analytics.routes');
 const mediaRoutes = require('./modules/media/media.routes');
 const auditRoutes = require('./modules/audit/audit.routes');
+const taskRoutes = require('./modules/task/task.routes');
 const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
@@ -89,6 +90,7 @@ app.use('/api/registers', registerRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/audit-logs', auditRoutes);
+app.use('/api/tasks', taskRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));

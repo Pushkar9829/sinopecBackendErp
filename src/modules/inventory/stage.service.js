@@ -52,6 +52,7 @@ function toPublicStage(stage) {
     id: String(stage._id),
     name: stage.name,
     slug: stage.slug,
+    builtIn: DEFAULT_STAGES.some((row) => row.slug === stage.slug),
     sortOrder: stage.sortOrder,
     isActive: stage.isActive,
     machines,

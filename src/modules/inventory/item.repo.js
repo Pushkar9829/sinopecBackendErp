@@ -49,15 +49,27 @@ function addQuantity(id, qty) {
 }
 
 function retireOrderLots(orderId, note) {
-  return InventoryItem.updateMany({ salesOrder: orderId, kind: 'wip', category: 'output', isActive: true }, [
-    { $set: { isActive: false, notes: { $trim: { input: { $concat: ['$notes', ' · ', note] } } } } },
+  return InventoryItem.updateMany({ salesOrder: orderId, kind: 'wip', isActive: true }, [
+    { $set: { isActive: false, notes: { $trim: { input: { $concat: [{ $ifNull: ['$notes', ''] }, ' · ', note] } } } } },
   ]);
+}
+
+function noteOrderMaterial(orderId, note) {
+  return InventoryItem.updateMany({ salesOrder: orderId, kind: { $ne: 'wip' }, isActive: true }, [
+    { $set: { notes: { $trim: { input: { $concat: [{ $ifNull: ['$notes', ''] }, ' · ', note] } } } } },
+  ]);
+}
+
+function countOrderMaterial(orderId) {
+  return InventoryItem.countDocuments({ salesOrder: orderId, kind: { $ne: 'wip' } });
 }
 
 module.exports = {
   takeQuantity,
   addQuantity,
   retireOrderLots,
+  noteOrderMaterial,
+  countOrderMaterial,
   findAll,
   findOne,
   findById,

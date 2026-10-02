@@ -30,6 +30,7 @@ const {
 } = require('../production/production.flow');
 const { uploadBuffer, deleteStoredObject } = require('../../utils/storage');
 const salesOrderRepo = require('./salesOrder.repo');
+const taskHooks = require('../task/task.hooks');
 
 const ROUTE_IDS = Object.values(PRODUCTION_ROUTES);
 const ROUTE_BY_ID = new Map(PRODUCTION_ROUTE_LIST.map((route) => [route.id, route]));
@@ -85,7 +86,7 @@ function roundMoney(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function calcTotals(items, orderDiscount, advanceAmount) {
+function calcTotals(items, orderDiscount, advanceAmount, paidAmount = 0) {
   let subtotal = 0;
   let tax = 0;
   for (const item of items) {
@@ -95,7 +96,7 @@ function calcTotals(items, orderDiscount, advanceAmount) {
   }
   const discount = Math.max(0, num(orderDiscount));
   const grandTotal = Math.max(0, subtotal - discount + tax);
-  const remainingAmount = Math.max(0, grandTotal - Math.max(0, num(advanceAmount)));
+  const remainingAmount = Math.max(0, grandTotal - Math.max(0, num(advanceAmount)) - Math.max(0, num(paidAmount)));
   return {
     subtotal: roundMoney(subtotal),
     discount: roundMoney(discount),
@@ -186,6 +187,7 @@ function toPublicItem(item) {
     product: item.product || '',
     productCode: item.productCode || '',
     productType: item.productType || '',
+    templateId: item.templateId || '',
     size: item.size || '',
     material: item.material || '',
     thickness: item.thickness || '',
@@ -293,6 +295,16 @@ function toPublicOrder(order) {
     creditDays: order.creditDays || 0,
     advanceAmount: order.advanceAmount || 0,
     remainingAmount: order.remainingAmount || 0,
+    paidAmount: order.paidAmount || 0,
+    payments: (order.payments || []).map((payment) => ({
+      id: String(payment._id),
+      amount: payment.amount,
+      method: payment.method,
+      reference: payment.reference || '',
+      note: payment.note || '',
+      receivedAt: payment.receivedAt,
+      byName: payment.byName || '',
+    })),
     paymentRemarks: order.paymentRemarks || '',
     billingAddress: order.billingAddress || '',
     shippingAddress: order.shippingAddress || '',
@@ -334,6 +346,8 @@ function stripCommercial(order) {
   delete next.grandTotal;
   delete next.advanceAmount;
   delete next.remainingAmount;
+  delete next.paidAmount;
+  delete next.payments;
   delete next.paymentTerms;
   delete next.paymentMethod;
   delete next.creditDays;
@@ -472,6 +486,7 @@ function normalizeItem(raw = {}) {
     product: str(raw.product),
     productCode: str(raw.productCode),
     productType: str(raw.productType),
+    templateId: str(raw.templateId),
     size: str(raw.size),
     material: str(raw.material),
     thickness: str(raw.thickness),
@@ -508,11 +523,19 @@ function normalizeItem(raw = {}) {
   return item;
 }
 
-function normalizeItems(rawItems) {
+function normalizeItems(rawItems, orderType = ORDER_TYPES.SALES_ORDER) {
   if (!Array.isArray(rawItems)) throw new ApiError(400, 'Items must be a list of products');
   const seen = new Set();
   return rawItems.map((raw) => {
     const item = normalizeItem(raw);
+    if (ROUTE_BY_ID.get(item.productionRoute)?.orderType !== orderType) {
+      throw new ApiError(
+        400,
+        orderType === ORDER_TYPES.JOB_WORK
+          ? `${item.product || 'A product'} needs a job work route: Printing → Dispatch, Printing → Cutting → Dispatch, or Cutting → Dispatch`
+          : `${item.product || 'A product'} needs a sales order route that starts at Rolling`
+      );
+    }
     const key = item._id ? String(item._id) : '';
     if (key && seen.has(key)) delete item._id;
     if (key) seen.add(key);
@@ -563,7 +586,7 @@ async function loadCustomer(customerId) {
 }
 
 function applyTotals(doc, items, discount, advanceAmount) {
-  const totals = calcTotals(items, discount, advanceAmount);
+  const totals = calcTotals(items, discount, advanceAmount, doc.paidAmount);
   doc.items = items;
   doc.subtotal = totals.subtotal;
   doc.discount = totals.discount;
@@ -635,6 +658,13 @@ function assertReadyToSubmit(order) {
     if (!item.manufacturing?.rawMaterial) {
       throw new ApiError(400, `Raw material is required on line ${n}`);
     }
+    if (
+      routeStages(item.productionRoute)[0] === 'rolling' &&
+      String(item.unit || '').toLowerCase() !== 'kg' &&
+      !(Number(String(item.manufacturing?.requiredWeight || '').replace(/,/g, '').match(/\d+(\.\d+)?/)?.[0]) > 0)
+    ) {
+      throw new ApiError(400, `Required weight (kg) is needed on line ${n} so rolling knows when it is finished`);
+    }
     if (routeHasPrint(item.productionRoute) && !item.printing?.colorCount && !item.printing?.colors) {
       throw new ApiError(400, `Printing colors are required on line ${n}`);
     }
@@ -649,6 +679,12 @@ async function getOrderOrThrow(id) {
   return order;
 }
 
+async function presentAfterSync(order, user, taskOptions) {
+  const loaded = await salesOrderRepo.findById(order._id);
+  await taskHooks.syncOrder(loaded, user, taskOptions);
+  return present(loaded, user);
+}
+
 function requireDraft(order) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft orders can be edited');
@@ -657,7 +693,23 @@ function requireDraft(order) {
 
 async function listOrders(user) {
   const orders = await salesOrderRepo.findAll();
+  if (operatorStations(user).length) {
+    return orders
+      .filter((order) => !HIDDEN_FROM_OPERATORS.includes(order.status))
+      .map((order) => present(order, user))
+      .filter((view) => view.items.length);
+  }
   return orders.map((order) => present(order, user));
+}
+
+function assertNotOverpaid(order) {
+  const received = (Number(order.advanceAmount) || 0) + (Number(order.paidAmount) || 0);
+  if (received > (Number(order.grandTotal) || 0) + 0.001) {
+    throw new ApiError(
+      400,
+      `Advance and payments received (${roundMoney(received)}) cannot be more than the order total (${roundMoney(order.grandTotal)})`
+    );
+  }
 }
 
 const HIDDEN_FROM_OPERATORS = [
@@ -680,12 +732,12 @@ async function getOrder(user, id) {
 async function createOrder(user, payload) {
   const customer = await loadCustomer(payload.customerId);
   const snapshot = snapshotFromCustomer(customer);
-  const items = normalizeItems(payload.items || []);
+  const orderType = payload.orderType || ORDER_TYPES.SALES_ORDER;
+  assertIn(orderType, ORDER_TYPES, 'Order type must be Sales order or Job work');
+  const items = normalizeItems(payload.items || [], orderType);
   assertDraftComplete(items);
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
-  const orderType = payload.orderType || ORDER_TYPES.SALES_ORDER;
-  assertIn(orderType, ORDER_TYPES, 'Order type must be Sales order or Job work');
   const doc = {
     orderType,
     orderDate,
@@ -712,6 +764,7 @@ async function createOrder(user, payload) {
   doc.discount = Math.max(0, num(payload.discount));
   assertOrderNumbers(doc);
   applyTotals(doc, items, payload.discount, doc.advanceAmount);
+  assertNotOverpaid(doc);
   assertIn(doc.priority, ORDER_PRIORITIES, 'Priority must be normal, high, or urgent');
   assertIn(doc.paymentTerms, PAYMENT_TERMS, 'Invalid payment terms');
   assertIn(doc.paymentMethod, PAYMENT_METHODS, 'Invalid payment method');
@@ -719,6 +772,7 @@ async function createOrder(user, payload) {
   const created = await salesOrderRepo.create(doc);
   await rememberProducts(customer._id, payload.items, items);
   const loaded = await salesOrderRepo.findById(created._id);
+  await taskHooks.syncOrder(loaded, user);
   return present(loaded, user);
 }
 
@@ -727,7 +781,7 @@ async function updateOrder(user, id, payload) {
   requireDraft(order);
 
   let snapshot = order.customerSnapshot;
-  if (payload.customerId) {
+  if (payload.customerId && String(payload.customerId) !== String(order.customer?._id || order.customer)) {
     const customer = await loadCustomer(payload.customerId);
     snapshot = snapshotFromCustomer(customer);
     order.customer = customer._id;
@@ -735,16 +789,19 @@ async function updateOrder(user, id, payload) {
   }
 
   applyHeader(order, payload, snapshot);
+  const orderType = order.orderType || ORDER_TYPES.SALES_ORDER;
   const items =
-    payload.items !== undefined ? normalizeItems(payload.items) : normalizeItems(order.items.map((item) => item.toObject()));
+    payload.items !== undefined
+      ? normalizeItems(payload.items, orderType)
+      : normalizeItems(order.items.map((item) => item.toObject()), orderType);
   assertDraftComplete(items);
   assertOrderNumbers({ orderDate: order.orderDate, deliveryDate: order.deliveryDate, items, discount: order.discount });
   applyTotals(order, items, payload.discount !== undefined ? payload.discount : order.discount, order.advanceAmount);
+  assertNotOverpaid(order);
 
   await salesOrderRepo.save(order);
   await rememberProducts(order.customer, payload.items || [], items);
-  const loaded = await salesOrderRepo.findById(order._id);
-  return present(loaded, user);
+  return presentAfterSync(order, user);
 }
 
 async function rememberProducts(customerId, rawItems, items) {
@@ -761,10 +818,17 @@ async function deleteOrder(id) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft orders can be deleted');
   }
+  if ((order.payments || []).length) {
+    throw new ApiError(400, 'This order has payments recorded. Remove them or cancel the order instead of deleting it');
+  }
+  if (await require('../inventory/item.repo').countOrderMaterial(order._id)) {
+    throw new ApiError(400, 'Customer material in inventory is linked to this order. Unlink it or cancel the order instead');
+  }
   for (const attachment of order.attachments || []) {
     await deleteStoredObject(attachment.key || attachment.storedName, attachment.storage || 'local').catch(() => {});
   }
   await salesOrderRepo.deleteById(id);
+  await taskHooks.removeForOrder(id);
   await fs.rm(path.join(env.uploadsDir, 'sales-orders', String(id)), { recursive: true, force: true }).catch(() => {});
 }
 
@@ -777,7 +841,7 @@ async function submitOrder(user, id) {
   order.status = SALES_ORDER_STATUSES.SUBMITTED;
   order.submittedAt = new Date();
   await salesOrderRepo.save(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  return presentAfterSync(order, user);
 }
 
 async function approveOrder(user, id) {
@@ -791,7 +855,7 @@ async function approveOrder(user, id) {
   order.status = SALES_ORDER_STATUSES.APPROVED;
   order.approvedAt = new Date();
   await salesOrderRepo.save(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  return presentAfterSync(order, user);
 }
 
 async function returnToDraft(user, id, reason) {
@@ -811,7 +875,7 @@ async function returnToDraft(user, id, reason) {
   const note = str(reason);
   if (note) order.remarks = [order.remarks, `Sent back: ${note}`].filter(Boolean).join('\n');
   await salesOrderRepo.save(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  return presentAfterSync(order, user, { returned: true, reason: note });
 }
 
 async function planProduction(user, id) {
@@ -838,18 +902,21 @@ async function planProduction(user, id) {
   order.productionPlannedAt = new Date();
   await salesOrderRepo.save(order);
   await require('../register/register.service').openForOrder(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  return presentAfterSync(order, user);
 }
 
 async function advanceOrder(user, id) {
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.DELIVERED) {
-    throw new ApiError(400, 'Operators send goods from the Delivery stage. Only a delivered order can be marked completed here.');
+    throw new ApiError(400, 'Operators send goods from the Dispatch stage. Only a fully dispatched order can be marked completed here.');
   }
   order.status = SALES_ORDER_STATUSES.COMPLETED;
   order.completedAt = order.completedAt || new Date();
   await salesOrderRepo.save(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  await require('../inventory/item.repo')
+    .retireOrderLots(order._id, `order ${order.number} completed`)
+    .catch((error) => console.error('Retiring floor lots after completion failed', error.message));
+  return presentAfterSync(order, user);
 }
 
 async function cancelOrder(user, id, reason) {
@@ -861,9 +928,9 @@ async function cancelOrder(user, id, reason) {
   if (shipped.includes(order.status)) {
     throw new ApiError(400, 'Goods have already gone out on this order, so it cannot be cancelled');
   }
-  const anyDelivery = (order.items || []).some((item) => (item.stageWork || []).some((row) => row.stage === 'delivery'));
-  if (anyDelivery) {
-    throw new ApiError(400, 'Part of this order is already delivered, so it cannot be cancelled');
+  const anyDispatch = (order.items || []).some((item) => (item.stageWork || []).some((row) => row.stage === 'dispatch'));
+  if (anyDispatch) {
+    throw new ApiError(400, 'Part of this order is already dispatched, so it cannot be cancelled');
   }
 
   const early = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.SUBMITTED, SALES_ORDER_STATUSES.APPROVED].includes(order.status);
@@ -880,12 +947,15 @@ async function cancelOrder(user, id, reason) {
   if (!early) {
     await require('../production/production.service').releaseOrderStock(order);
   }
+  await require('../inventory/item.repo')
+    .noteOrderMaterial(order._id, `order ${order.number} cancelled - return to customer`)
+    .catch((error) => console.error('Marking customer material after cancel failed', error.message));
   order.status = SALES_ORDER_STATUSES.CANCELLED;
   order.cancelledAt = new Date();
   order.cancelledBy = user._id;
   order.cancellationReason = str(reason);
   await salesOrderRepo.save(order);
-  return present(await salesOrderRepo.findById(order._id), user);
+  return presentAfterSync(order, user, { reason: order.cancellationReason });
 }
 
 function attachmentDir(orderId) {
@@ -983,6 +1053,69 @@ async function getAttachmentFile(id, attachmentId) {
   return { filePath, originalName: attachment.originalName, mimeType: attachment.mimeType };
 }
 
+const NO_PAYMENT_STATUSES = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.CANCELLED];
+
+function canRecordPayment(user) {
+  return (
+    isSuperAdmin(user) ||
+    hasPermission(user, 'accounts:create') ||
+    hasPermission(user, 'accounts:update') ||
+    hasPermission(user, 'sales:update')
+  );
+}
+
+function refreshBalance(order) {
+  order.paidAmount = roundMoney((order.payments || []).reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0));
+  order.remainingAmount = roundMoney(
+    Math.max(0, (Number(order.grandTotal) || 0) - (Number(order.advanceAmount) || 0) - order.paidAmount)
+  );
+}
+
+async function recordPayment(user, id, payload = {}) {
+  if (!canRecordPayment(user)) throw new ApiError(403, 'You cannot record payments');
+  const order = await getOrderOrThrow(id);
+  if (NO_PAYMENT_STATUSES.includes(order.status)) {
+    throw new ApiError(400, 'Payments can be recorded once the order is submitted, and not on a cancelled order');
+  }
+  const amount = roundMoney(num(payload.amount));
+  if (!(amount > 0)) throw new ApiError(400, 'Amount must be more than 0');
+  if (amount > roundMoney(order.remainingAmount) + 0.001) {
+    throw new ApiError(400, `Amount cannot be more than the ${roundMoney(order.remainingAmount)} still due`);
+  }
+  const method = str(payload.method) || order.paymentMethod || PAYMENT_METHODS.BANK_TRANSFER;
+  assertIn(method, PAYMENT_METHODS, 'Invalid payment method');
+  const receivedAt = payload.receivedAt ? parseDate(payload.receivedAt, 'Received date') : new Date();
+  if (receivedAt && receivedAt.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
+    throw new ApiError(400, 'Received date cannot be in the future');
+  }
+  order.payments.push({
+    amount,
+    method,
+    reference: str(payload.reference),
+    note: str(payload.note),
+    receivedAt: receivedAt || new Date(),
+    by: user._id,
+    byName: user.fullName || user.username || '',
+  });
+  refreshBalance(order);
+  await salesOrderRepo.save(order);
+  return presentAfterSync(order, user);
+}
+
+async function removePayment(user, id, paymentId) {
+  if (!canRecordPayment(user)) throw new ApiError(403, 'You cannot change payments');
+  const order = await getOrderOrThrow(id);
+  if (order.status === SALES_ORDER_STATUSES.CANCELLED) {
+    throw new ApiError(400, 'Payments on a cancelled order cannot be changed');
+  }
+  const payment = order.payments.id(paymentId);
+  if (!payment) throw new ApiError(404, 'Payment not found');
+  payment.deleteOne();
+  refreshBalance(order);
+  await salesOrderRepo.save(order);
+  return presentAfterSync(order, user);
+}
+
 async function getSummary(user) {
   const counts = await salesOrderRepo.countByStatus();
   const byStatus = Object.fromEntries(Object.values(SALES_ORDER_STATUSES).map((status) => [status, 0]));
@@ -1034,6 +1167,8 @@ module.exports = {
   addAttachment,
   removeAttachment,
   getAttachmentFile,
+  recordPayment,
+  removePayment,
   getSummary,
   getMeta,
   calcTotals,

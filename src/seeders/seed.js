@@ -48,6 +48,7 @@ const {
   PAYMENT_TERMS,
   PRODUCTION_ROUTES,
   SALES_ORDER_STATUSES,
+  TASK_CATEGORIES,
 } = require('../config/constants');
 
 async function seedPermissions() {
@@ -72,6 +73,36 @@ async function seedRoles(permissions) {
       permissions: permissionIds,
     });
   }
+}
+
+async function runOnce(name, step) {
+  const migrations = mongoose.connection.collection('migrations');
+  if (await migrations.findOne({ name })) return;
+  await step();
+  await migrations.insertOne({ name, ranAt: new Date() });
+}
+
+async function grantTaskPermissions(permissions) {
+  await runOnce('task-permissions-v1', async () => {
+    const byKey = new Map(permissions.map((permission) => [permission.key, permission._id]));
+    for (const role of ROLES) {
+      const existing = await roleRepo.findBySlug(role.slug);
+      if (!existing) continue;
+      const owned = new Set((existing.permissions || []).map(String));
+      const taskIds = (ROLE_PERMISSION_KEYS[role.slug] || [])
+        .filter((key) => key.startsWith('tasks:'))
+        .map((key) => byKey.get(key))
+        .filter((id) => id && !owned.has(String(id)));
+      if (!taskIds.length) continue;
+      await roleRepo.updatePermissions(existing._id, [...existing.permissions, ...taskIds]);
+    }
+    console.log('Granted task permissions to existing roles');
+  });
+}
+
+async function backfillTasks() {
+  const count = await require('../modules/task/task.hooks').backfillOpenOrders();
+  if (count) console.log(`Synced tasks for ${count} open orders`);
 }
 
 async function seedSuperAdmin() {
@@ -131,6 +162,8 @@ async function seedStages() {
       sortOrder: index + 1,
     });
   }
+  const retired = await stageRepo.findBySlug('delivery');
+  if (retired) await stageRepo.deleteById(retired._id);
   return bySlug;
 }
 
@@ -156,6 +189,15 @@ async function seedDemoInventory(stagesBySlug) {
       quantity: 1800,
       unitPrice: 92,
       notes: 'Bag-grade granules',
+    },
+    {
+      category: INVENTORY_CATEGORIES.RAW,
+      name: 'Customer film roll',
+      materialType: 'Job work material',
+      unit: 'kg',
+      quantity: 600,
+      unitPrice: 0,
+      notes: 'Film supplied by job work customers',
     },
     {
       category: INVENTORY_CATEGORIES.RAW,
@@ -553,14 +595,6 @@ function at(day, hour = 10) {
   return `2026-09-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:20:00+05:30`;
 }
 
-function offsetHours(value, hours) {
-  if (!value) return value;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  date.setHours(date.getHours() + hours);
-  return date;
-}
-
 function seedPartner(value) {
   const raw = String(value || '').trim();
   if (DELIVERY_PARTNERS.includes(raw)) return raw;
@@ -572,41 +606,24 @@ function seedPartner(value) {
   return 'In-house';
 }
 
-function withDeliveryHandover(stageWork, item, { finishDelivery = false } = {}) {
-  const target = Number(item?.quantity) || 0;
-  const dispatchOutput = (stageWork || [])
-    .filter((row) => row.stage === 'dispatch')
-    .reduce((sum, row) => sum + (Number(row.outputQty) || 0), 0);
-  const dispatchDone = target > 0 && dispatchOutput >= target - 1e-6;
-  const dispatchRows = (stageWork || []).filter((row) => row.stage === 'dispatch');
-  const lastDispatch = dispatchRows[dispatchRows.length - 1];
-
-  const rows = [];
-  for (const row of stageWork || []) {
-    if (row.stage !== 'dispatch') {
-      rows.push(row);
-      continue;
-    }
-    rows.push({
+function withDispatchHandover(stageWork) {
+  return (stageWork || []).map((row, index) => {
+    if (row.stage !== 'dispatch') return row;
+    const qty = Number(row.outputQty) || 0;
+    const partner = seedPartner(row.deliveryPartner);
+    return {
       ...row,
-      vehicleNumber: '',
-      handoverPerson: '',
-      deliveryPartner: '',
-    });
-    if ((finishDelivery && dispatchDone) || row !== lastDispatch) {
-      rows.push({
-        ...row,
-        stage: 'delivery',
-        machine: null,
-        machineName: '',
-        workDate: offsetHours(row.workDate, 2),
-        completedAt: offsetHours(row.completedAt || row.workDate, 2),
-        notes: `Delivery via ${seedPartner(row.deliveryPartner)}`,
-        deliveryPartner: seedPartner(row.deliveryPartner),
-      });
-    }
-  }
-  return rows;
+      machine: null,
+      machineName: '',
+      inputQty: qty,
+      outputQty: qty,
+      wasteQty: 0,
+      notes: row.notes || `Dispatched via ${partner}`,
+      deliveryPartner: partner,
+      handoverPerson: row.handoverPerson || 'Store helper',
+      vehicleNumber: row.vehicleNumber || `MH-12-DS-${String(1001 + index)}`,
+    };
+  });
 }
 
 const ROLLING_ROLL_TYPES = [
@@ -624,13 +641,10 @@ const ROLLING_ROLL_TYPES = [
 
 function bookDetails(item, row, index) {
   const specs = registerSpecs(null, item, row.stage);
-  const n = index + 1;
   let extra = {};
   if (row.stage === 'rolling') {
     extra = {
       rollType: ROLLING_ROLL_TYPES[index % ROLLING_ROLL_TYPES.length],
-      exStock: n % 2 ? '' : 'D.S.',
-      weight: String(row.outputQty || ''),
       gross: String((Number(row.outputQty) || 0) + 2),
       tare: '2',
       net: String(row.outputQty || ''),
@@ -643,8 +657,7 @@ function bookDetails(item, row, index) {
     };
   } else if (row.stage === 'cutting') {
     extra = {
-      cuts: String(Math.max(1, Math.round((Number(row.outputQty) || 1) / 100))),
-      discKnife: n % 2 ? 'disc' : 'knife',
+      packets: String(Math.max(1, Math.round((Number(row.outputQty) || 1) / 100))),
     };
   }
   const details = {};
@@ -685,8 +698,8 @@ function inRollingUnits(item, stageWork) {
   });
 }
 
-function withFloorProgress(item, stageWork, options) {
-  const rows = withDeliveryHandover(inRollingUnits(item, stageWork), item, options).map((row, index) => ({
+function withFloorProgress(item, stageWork) {
+  const rows = withDispatchHandover(inRollingUnits(item, stageWork)).map((row, index) => ({
     ...row,
     details: bookDetails(item, row, index),
   }));
@@ -697,7 +710,7 @@ function withFloorProgress(item, stageWork, options) {
 
 async function seedWipFromOrder(order) {
   for (const item of order.items || []) {
-    const stages = routeStages(item.productionRoute).filter((stage) => stage !== 'delivery');
+    const stages = routeStages(item.productionRoute).filter((stage) => stage !== 'dispatch');
     for (const stage of stages) {
       const stats = stageStats(item, stage);
       const following = nextStage(item.productionRoute, stage);
@@ -924,11 +937,20 @@ async function seedDemoSalesOrders() {
     submittedAt: new Date(),
   });
 
-  const plannedItems = submittedItems.map((item) => ({
-    ...item,
-    currentStage: 'rolling',
-    stageWork: [],
-  }));
+  const jobWorkRoute = {
+    [PRODUCTION_ROUTES.ROLL_PRINT_DISPATCH]: PRODUCTION_ROUTES.PRINT_DISPATCH,
+    [PRODUCTION_ROUTES.ROLL_CUT_DISPATCH]: PRODUCTION_ROUTES.CUT_DISPATCH,
+  };
+  const plannedItems = submittedItems.map((item) => {
+    const productionRoute = jobWorkRoute[item.productionRoute] || PRODUCTION_ROUTES.PRINT_CUT_DISPATCH;
+    return {
+      ...item,
+      productionRoute,
+      manufacturing: { ...item.manufacturing, rawMaterial: 'Customer film roll', materialType: 'Job work material' },
+      currentStage: routeStages(productionRoute)[0],
+      stageWork: [],
+    };
+  });
   const plannedTotals = calcTotals(plannedItems, 0, 0);
   await salesOrderRepo.create({
     number: await nextSalesOrderNumber(orderDate, 'job_work'),
@@ -949,7 +971,7 @@ async function seedDemoSalesOrders() {
     deliveryLocation: deltaSnap.shippingAddress,
     deliveryInstructions: 'Hold at dispatch until QC call',
     remarks: 'Demo order already on the production floor',
-    productionInstructions: 'Start rolling first. Follow each product flow.',
+    productionInstructions: 'Job work on customer film. Printed rolls go Printing → Dispatch; plain bags go Cutting → Dispatch.',
     items: plannedItems,
     subtotal: plannedTotals.subtotal,
     discount: plannedTotals.discount,
@@ -1556,8 +1578,7 @@ async function seedDemoSalesOrders() {
         handoverPerson: 'Raj Kumar',
         vehicleNumber: 'MH-14-CUST-12',
       }),
-    ],
-    { finishDelivery: true }
+    ]
   );
   const completedBagTotals = calcTotals([completedBags], 0, 0);
   const completedBagOrder = await salesOrderRepo.create({
@@ -1600,10 +1621,10 @@ async function seedDemoSalesOrders() {
       length: '16 inch',
       quantity: 5000,
       rate: 7,
-      productionRoute: PRODUCTION_ROUTES.ROLL_PRINT_DISPATCH,
+      productionRoute: PRODUCTION_ROUTES.PRINT_DISPATCH,
       manufacturing: {
-        rawMaterial: 'LDPE granules',
-        materialType: 'Polymer',
+        rawMaterial: 'Customer film roll',
+        materialType: 'Job work material',
         materialGrade: 'Bag grade',
         requiredWeight: '180 kg',
         requiredQuantity: '5000 pcs',
@@ -1612,7 +1633,7 @@ async function seedDemoSalesOrders() {
         thickness: '50 micron',
         color: 'White',
         additives: '',
-        specialRequirements: 'Dispatch as printed rolls',
+        specialRequirements: 'Customer supplies the film; print and dispatch',
       },
       bag: { width: '', length: '', gusset: '' },
       printing: {
@@ -1629,32 +1650,10 @@ async function seedDemoSalesOrders() {
     }),
     [
       shiftWork({
-        stage: 'rolling',
-        machine: mill2,
-        user: rollingUser,
-        inputQty: 95,
-        outputQty: 2600,
-        wasteQty: 16,
-        shift: 'morning',
-        at: at(4, 10),
-        notes: 'Courier rolling lot 1',
-      }),
-      shiftWork({
-        stage: 'rolling',
-        machine: mill2,
-        user: rollingUser,
-        inputQty: 90,
-        outputQty: 2400,
-        wasteQty: 14,
-        shift: 'night',
-        at: at(5, 22),
-        notes: 'Courier rolling finished',
-      }),
-      shiftWork({
         stage: 'printing',
         machine: printer,
         user: printingUser,
-        inputQty: 2500,
+        inputQty: 92,
         outputQty: 2350,
         wasteQty: 22,
         shift: 'morning',
@@ -1665,7 +1664,7 @@ async function seedDemoSalesOrders() {
         stage: 'printing',
         machine: printer,
         user: printingUser,
-        inputQty: 2500,
+        inputQty: 88,
         outputQty: 2650,
         wasteQty: 20,
         shift: 'afternoon',
@@ -1700,8 +1699,7 @@ async function seedDemoSalesOrders() {
         handoverPerson: 'Karan Shah',
         vehicleNumber: 'MH-04-DL-3301',
       }),
-    ],
-    { finishDelivery: true }
+    ]
   );
   const completedCourierTotals = calcTotals([completedCourier], 0, 0);
   const completedCourierOrder = await salesOrderRepo.create({
@@ -1722,7 +1720,7 @@ async function seedDemoSalesOrders() {
     deliveryLocation: deltaSnap.shippingAddress,
     deliveryInstructions: 'Completed courier-bag demo',
     remarks: 'Analytics delivered order 2',
-    productionInstructions: 'Rolling, printing, dispatch. No cutting.',
+    productionInstructions: 'Job work: print on customer film, then dispatch.',
     items: [completedCourier],
     subtotal: completedCourierTotals.subtotal,
     discount: completedCourierTotals.discount,
@@ -1824,20 +1822,6 @@ async function seedDemoSalesOrders() {
         handoverPerson: 'Sanjay More',
         vehicleNumber: 'MH-04-CD-1188',
       }),
-      shiftWork({
-        stage: 'dispatch',
-        machine: null,
-        user: dispatchUser,
-        inputQty: 2250,
-        outputQty: 2250,
-        wasteQty: 0,
-        shift: 'afternoon',
-        at: at(15, 15),
-        notes: 'Order handed to delivery partner',
-        deliveryPartner: 'Delhivery',
-        handoverPerson: 'Karan Shah',
-        vehicleNumber: 'MH-04-CD-9090',
-      }),
     ]
   );
   const dispatchedTotals = calcTotals([dispatchedCut], 0, 0);
@@ -1870,6 +1854,362 @@ async function seedDemoSalesOrders() {
     productionPlannedAt: new Date('2026-09-07T12:00:00+05:30'),
   });
   await seedWipFromOrder(dispatchedOrder);
+}
+
+function daysFromToday(days, hour = 18) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  date.setHours(hour, 0, 0, 0);
+  return date;
+}
+
+async function seedTaskScenarios() {
+  const orderService = require('../modules/salesOrder/salesOrder.service');
+  const taskService = require('../modules/task/task.service');
+  const itemService = require('../modules/inventory/item.service');
+  const Task = require('../modules/task/task.model');
+
+  const admin = await userRepo.findByUsername(env.superAdminUsername);
+  const sales = await userRepo.findByUsername('sales');
+  const production = await userRepo.findByUsername('production');
+  const inventory = await userRepo.findByUsername('inventory');
+  const printing = await userRepo.findByUsername('printing');
+  const dispatch = await userRepo.findByUsername('dispatch');
+  const accounts = await userRepo.findByUsername('accounts');
+  const customers = await customerRepo.findAll();
+  const abc = customers.find((customer) => customer.name === 'ABC Industries');
+  const delta = customers.find((customer) => customer.name === 'Delta Plastics');
+  if (!admin || !sales || !abc || !delta) return;
+
+  const header = (customer, extra = {}) => ({
+    customerId: String(customer._id),
+    orderDate: daysFromToday(-3, 10),
+    deliveryDate: daysFromToday(10, 10),
+    paymentTerms: PAYMENT_TERMS.CREDIT,
+    paymentMethod: PAYMENT_METHODS.BANK_TRANSFER,
+    creditDays: 15,
+    ...extra,
+  });
+  const jobItem = (overrides) =>
+    demoItem({
+      product: 'Printed courier bag',
+      productCode: 'BAG-220',
+      size: '12 × 16 inch',
+      width: '12 inch',
+      length: '16 inch',
+      quantity: 3000,
+      rate: 2.5,
+      productionRoute: PRODUCTION_ROUTES.PRINT_DISPATCH,
+      manufacturing: {
+        rawMaterial: 'Customer film roll',
+        materialType: 'Job work material',
+        materialGrade: 'Bag grade',
+        requiredWeight: '110 kg',
+        requiredQuantity: '3000 pcs',
+        width: '12 inch',
+        length: '16 inch',
+        thickness: '50 micron',
+        color: 'White',
+        additives: '',
+        specialRequirements: 'Customer supplies printed-grade film',
+      },
+      bag: { width: '', length: '', gusset: '' },
+      printing: {
+        required: true,
+        artwork: 'Delta_Logo.ai',
+        impressions: '1',
+        colorCount: '1',
+        colors: 'Black',
+        design: 'Company logo',
+        requirement: 'Single colour',
+      },
+      holes: { required: false, count: '', type: '', size: '', position: '' },
+      tape: { required: false, type: '' },
+      ...overrides,
+    });
+  const step = async (label, action) => {
+    try {
+      return await action();
+    } catch (error) {
+      console.error(`Task scenario "${label}" skipped: ${error.message}`);
+      return null;
+    }
+  };
+
+  // Sales order sent back to draft: the creator gets a "revise" task with the reason.
+  await step('returned to draft', async () => {
+    const order = await orderService.createOrder(
+      sales,
+      header(abc, { remarks: 'Task demo: sent back to draft', items: [demoItem({ quantity: 4000 })] })
+    );
+    await orderService.submitOrder(sales, order.id);
+    await orderService.returnToDraft(admin, order.id, 'Rate is below the price list. Check with the customer and resubmit.');
+  });
+
+  // Job work approved, customer material not received yet: material + planning tasks open.
+  const waitingJob = await step('job work waiting for material', async () => {
+    const order = await orderService.createOrder(
+      sales,
+      header(delta, { orderType: 'job_work', priority: ORDER_PRIORITIES.HIGH, remarks: 'Task demo: waiting for customer material', items: [jobItem({})] })
+    );
+    await orderService.submitOrder(sales, order.id);
+    return orderService.approveOrder(admin, order.id);
+  });
+
+  // Job work approved, customer material already recorded in inventory: material task closed by itself.
+  await step('job work material received', async () => {
+    const order = await orderService.createOrder(
+      sales,
+      header(delta, {
+        orderType: 'job_work',
+        remarks: 'Task demo: customer material received',
+        items: [jobItem({ quantity: 2000, productionRoute: PRODUCTION_ROUTES.PRINT_CUT_DISPATCH })],
+      })
+    );
+    await orderService.submitOrder(sales, order.id);
+    await orderService.approveOrder(admin, order.id);
+    await itemService.createItem(
+      {
+        category: INVENTORY_CATEGORIES.RAW,
+        name: `${order.number} · customer film`,
+        materialType: 'Job work material',
+        unit: 'kg',
+        quantity: 75,
+        unitPrice: 0,
+        notes: 'Received from Delta Plastics at gate 1',
+        salesOrderId: order.id,
+      },
+      inventory || admin
+    );
+  });
+
+  // Cancelled order: its open tasks are cancelled with the order.
+  await step('cancelled order', async () => {
+    const order = await orderService.createOrder(
+      sales,
+      header(abc, { remarks: 'Task demo: cancelled by customer', items: [demoItem({ quantity: 2500 })] })
+    );
+    await orderService.submitOrder(sales, order.id);
+    await orderService.approveOrder(admin, order.id);
+    await orderService.cancelOrder(admin, order.id, 'Customer cancelled the order');
+  });
+
+  // Production finished, nothing dispatched yet: dispatch task waiting.
+  await step('ready for dispatch', async () => {
+    const rollingUser = await userRepo.findByUsername('rolling');
+    const mill = await machineRepo.findByCode('RM-01');
+    const film = withFloorProgress(
+      demoItem({
+        product: 'Plain film roll',
+        productCode: 'FILM-010',
+        productType: 'Semi-finished',
+        size: '500 mm',
+        material: 'HDPE',
+        thickness: '40 micron',
+        width: '500 mm',
+        length: '1000 m',
+        color: 'Natural',
+        quantity: 10,
+        unit: 'roll',
+        rate: 1200,
+        productionRoute: PRODUCTION_ROUTES.ROLL_DISPATCH,
+        manufacturing: {
+          rawMaterial: 'HDPE granules',
+          materialType: 'Polymer',
+          materialGrade: 'Film grade',
+          requiredWeight: '200 kg',
+          requiredQuantity: '10 rolls',
+          width: '500 mm',
+          length: '1000 m',
+          thickness: '40 micron',
+          color: 'Natural',
+          additives: '',
+          specialRequirements: 'No print, dispatch as rolls',
+        },
+        roll: { width: '500 mm', length: '1000 m', weight: '20 kg' },
+        bag: { width: '', length: '', gusset: '' },
+        printing: { required: false, artwork: '', impressions: '', colorCount: '', colors: '', design: '', requirement: '' },
+        holes: { required: false, count: '', type: '', size: '', position: '' },
+        tape: { required: false, type: '' },
+      }),
+      [
+        shiftWork({
+          stage: 'rolling',
+          machine: mill,
+          user: rollingUser,
+          inputQty: 205,
+          outputQty: 10,
+          wasteQty: 1,
+          shift: 'morning',
+          at: at(29, 10),
+          notes: 'All 10 rolls done. Waiting for the truck',
+        }),
+      ]
+    );
+    const totals = calcTotals([film], 0, 0);
+    const snap = snapshotFromCustomer(abc);
+    const order = await salesOrderRepo.create({
+      number: await nextSalesOrderNumber(new Date('2026-09-26')),
+      orderDate: new Date('2026-09-26'),
+      customer: abc._id,
+      customerSnapshot: snap,
+      deliveryDate: daysFromToday(2, 10),
+      priority: ORDER_PRIORITIES.URGENT,
+      status: SALES_ORDER_STATUSES.READY_FOR_DISPATCH,
+      paymentTerms: PAYMENT_TERMS.CREDIT,
+      paymentMethod: PAYMENT_METHODS.BANK_TRANSFER,
+      creditDays: 7,
+      remainingAmount: totals.remainingAmount,
+      billingAddress: snap.billingAddress,
+      shippingAddress: snap.shippingAddress,
+      deliveryLocation: snap.shippingAddress,
+      deliveryInstructions: 'Truck to be booked',
+      remarks: 'Task demo: ready for dispatch',
+      productionInstructions: 'Rolling only, then dispatch.',
+      items: [film],
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      tax: totals.tax,
+      grandTotal: totals.grandTotal,
+      createdBy: sales._id,
+      submittedAt: new Date('2026-09-26T09:00:00+05:30'),
+      approvedAt: new Date('2026-09-26T11:00:00+05:30'),
+      productionPlannedAt: new Date('2026-09-26T12:00:00+05:30'),
+    });
+    await seedWipFromOrder(order);
+    await require('../modules/task/task.hooks').syncOrder(order, admin);
+  });
+
+  // Payments on delivered orders: one part paid (task stays open), one fully paid and completed.
+  const delivered = await SalesOrder.find({ status: SALES_ORDER_STATUSES.DELIVERED }).sort({ orderDate: 1 });
+  const partPaid = delivered.find((order) => order.orderType !== 'job_work');
+  const fullPaid = delivered.find((order) => order.orderType === 'job_work');
+  if (partPaid) {
+    await step('part payment', () =>
+      orderService.recordPayment(accounts || admin, String(partPaid._id), {
+        amount: Math.round(partPaid.remainingAmount * 0.4),
+        method: PAYMENT_METHODS.BANK_TRANSFER,
+        reference: 'NEFT UTR 220931',
+        receivedAt: '2026-09-28',
+      })
+    );
+  }
+  if (fullPaid) {
+    await step('full payment', async () => {
+      const half = Math.round(fullPaid.remainingAmount / 2);
+      await orderService.recordPayment(accounts || admin, String(fullPaid._id), {
+        amount: half,
+        method: PAYMENT_METHODS.UPI,
+        reference: 'UPI 8812',
+        receivedAt: '2026-09-20',
+      });
+      const fresh = await orderService.recordPayment(accounts || admin, String(fullPaid._id), {
+        amount: fullPaid.remainingAmount - half,
+        method: PAYMENT_METHODS.CHEQUE,
+        reference: 'Cheque 004512',
+        receivedAt: '2026-09-27',
+      });
+      await orderService.advanceOrder(production || admin, fresh.id);
+    });
+  }
+
+  // Operators take station and dispatch work from their queues.
+  const claim = async (label, user, filter) =>
+    step(label, async () => {
+      const task = await Task.findOne({ status: 'open', ...filter }).sort({ createdAt: 1 });
+      if (task && user) await taskService.claimTask(user, String(task._id));
+      return task;
+    });
+  await claim('printing claims', printing, { category: TASK_CATEGORIES.STAGE_WORK, stage: 'printing' });
+  await claim('dispatch claims', dispatch, { category: TASK_CATEGORIES.DISPATCH });
+
+  // Manual tasks covering every scope, status, link and due-date case.
+  const floorOrder = await SalesOrder.findOne({ status: SALES_ORDER_STATUSES.IN_PRODUCTION });
+  const plannedJob = await SalesOrder.findOne({ orderType: 'job_work', status: SALES_ORDER_STATUSES.PRODUCTION_PLANNED });
+  const printItem = floorOrder?.items.find((item) => routeStages(item.productionRoute).includes('printing'));
+  const manual = async (label, user, payload, after) =>
+    step(label, async () => {
+      const task = await taskService.createTask(user, payload);
+      if (after) await after(task);
+      return task;
+    });
+
+  if (floorOrder && printItem) {
+    await manual('colour check', production || admin, {
+      title: 'Check print colour shade before next lot',
+      description: 'Customer complained the blue was light on the last lot. Match against the approved sample.',
+      orderId: String(floorOrder._id),
+      itemId: String(printItem._id),
+      quantity: Math.min(2000, Number(printItem.quantity)),
+      assigneeId: printing ? String(printing._id) : undefined,
+      priority: ORDER_PRIORITIES.HIGH,
+      dueDate: daysFromToday(1),
+    });
+    await manual('qc sample', production || admin, {
+      title: 'Keep 50 pcs aside as QC sample',
+      orderId: String(floorOrder._id),
+      itemId: String(printItem._id),
+      quantity: 50,
+      assigneeRole: ROLE_SLUGS.CUTTING_OPERATOR,
+      dueDate: daysFromToday(-1),
+    });
+  }
+  if (plannedJob) {
+    const item = plannedJob.items[0];
+    await manual('film check', production || admin, {
+      title: 'Inspect customer film for wrinkles',
+      description: 'Reject and inform sales if more than 5% is wrinkled.',
+      orderId: String(plannedJob._id),
+      itemId: String(item._id),
+      quantity: Number(item.quantity),
+      assigneeRole: ROLE_SLUGS.INVENTORY_MANAGER,
+      priority: ORDER_PRIORITIES.URGENT,
+      dueDate: daysFromToday(-2),
+    });
+  }
+  if (waitingJob) {
+    await manual('call customer', sales, {
+      title: 'Call Delta Plastics for the film delivery date',
+      orderId: waitingJob.id,
+      assigneeId: String(sales._id),
+      dueDate: daysFromToday(0),
+    });
+  }
+  if (partPaid) {
+    await manual('payment follow-up', accounts || admin, {
+      title: 'Send payment reminder with statement',
+      orderId: String(partPaid._id),
+      assigneeId: accounts ? String(accounts._id) : undefined,
+      priority: ORDER_PRIORITIES.HIGH,
+      dueDate: daysFromToday(-3),
+    }, (task) => taskService.addComment(accounts || admin, task.id, 'Called once on 28 Sept. Promised the balance this week.'));
+  }
+  await manual('machine service', production || admin, {
+    title: 'Book service for Rolling mill 2',
+    description: 'Bearing noise on RM-02. Book the vendor before the next big order.',
+    assigneeId: production ? String(production._id) : undefined,
+    dueDate: daysFromToday(5),
+  }, (task) => taskService.updateTask(production || admin, task.id, { status: 'blocked', note: 'Vendor quote awaited' }));
+  await manual('cartons', sales, {
+    title: 'Confirm carton size with ABC Industries',
+    assigneeRole: ROLE_SLUGS.PRODUCTION_MANAGER,
+    dueDate: daysFromToday(3),
+  });
+  await manual('ink stock', inventory || admin, {
+    title: 'Reorder black printing ink',
+    assigneeId: inventory ? String(inventory._id) : undefined,
+    dueDate: daysFromToday(-4),
+  }, async (task) => {
+    await taskService.addComment(inventory || admin, task.id, 'PO raised with the ink supplier, 20 litres.');
+    await taskService.updateTask(inventory || admin, task.id, { status: 'done', note: 'Ink received' });
+  });
+  await manual('duplicate', sales, {
+    title: 'Send revised quotation (duplicate)',
+    assigneeId: String(sales._id),
+  }, (task) => taskService.updateTask(sales, task.id, { status: 'cancelled', note: 'Duplicate of another task' }));
+
+  const counts = await Task.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]);
+  console.log(`Task scenarios seeded: ${counts.map((row) => `${row._id} ${row.count}`).join(', ')}`);
 }
 
 async function seedDefaultOptions() {
@@ -2027,6 +2367,7 @@ async function resetDemoCollections() {
     SalesOption.deleteMany({}),
     ProductTemplate.deleteMany({}),
     Register.deleteMany({}),
+    mongoose.connection.collection('tasks').deleteMany({}),
   ]);
   await mongoose.connection.collection('counters').deleteMany({});
   console.log('Reset demo customers, orders, inventory, registers, and sales settings');
@@ -2049,9 +2390,11 @@ async function seedSystem() {
   await dropStaleUserEmailIndex();
   const permissions = await seedPermissions();
   await seedRoles(permissions);
+  await grantTaskPermissions(permissions);
   await seedSuperAdmin();
   const stages = await seedStages();
   await seedDefaultOptions();
+  await backfillTasks();
   return stages;
 }
 
@@ -2063,6 +2406,8 @@ async function seed() {
   await seedDemoCustomers();
   await seedDemoSalesOrders();
   await seedSalesSettings();
+  await backfillTasks();
+  await seedTaskScenarios();
 }
 
 if (require.main === module) {

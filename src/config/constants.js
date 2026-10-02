@@ -25,7 +25,7 @@ const ROLES = [
   {
     slug: ROLE_SLUGS.SALES_MANAGER,
     name: 'Sales Manager',
-    description: 'Manages sales orders and customer-facing workflows',
+    description: 'Manages orders (sales orders and job work) and customer-facing workflows',
   },
   {
     slug: ROLE_SLUGS.PRODUCTION_MANAGER,
@@ -120,19 +120,53 @@ const MODULE_PERMISSIONS = [
   { key: 'accounts:delete', module: 'accounts', action: 'delete', description: 'Delete accounts records' },
 ];
 
-const PERMISSIONS = [...AUTH_PERMISSIONS, ...MODULE_PERMISSIONS];
+const TASK_PERMISSIONS = [
+  { key: 'tasks:*', module: 'tasks', action: '*', description: 'See and manage every task' },
+  { key: 'tasks:create', module: 'tasks', action: 'create', description: 'Create manual tasks' },
+  { key: 'tasks:read', module: 'tasks', action: 'read', description: 'View own and role tasks' },
+  { key: 'tasks:update', module: 'tasks', action: 'update', description: 'Work on own and role tasks' },
+];
+
+const PERMISSIONS = [...AUTH_PERMISSIONS, ...MODULE_PERMISSIONS, ...TASK_PERMISSIONS];
+
+const TASK_WORKER_KEYS = ['tasks:read', 'tasks:update'];
+const TASK_MANAGER_KEYS = [...TASK_WORKER_KEYS, 'tasks:create'];
 
 const ROLE_PERMISSION_KEYS = {
   [ROLE_SLUGS.SUPER_ADMIN]: PERMISSIONS.map((permission) => permission.key),
-  [ROLE_SLUGS.SALES_MANAGER]: PERMISSIONS.filter((p) => p.module === 'sales').map((p) => p.key),
-  [ROLE_SLUGS.PRODUCTION_MANAGER]: PERMISSIONS.filter((p) => p.module === 'production').map((p) => p.key),
-  [ROLE_SLUGS.INVENTORY_MANAGER]: PERMISSIONS.filter((p) => p.module === 'inventory').map((p) => p.key),
-  [ROLE_SLUGS.ROLLING_OPERATOR]: PERMISSIONS.filter((p) => p.module === 'production:rolling').map((p) => p.key),
-  [ROLE_SLUGS.PRINTING_OPERATOR]: PERMISSIONS.filter((p) => p.module === 'production:printing').map((p) => p.key),
-  [ROLE_SLUGS.CUTTING_OPERATOR]: PERMISSIONS.filter((p) => p.module === 'production:cutting').map((p) => p.key),
-  [ROLE_SLUGS.PACKING_OPERATOR]: PERMISSIONS.filter((p) => p.module === 'production:packing').map((p) => p.key),
-  [ROLE_SLUGS.DISPATCH_MANAGER]: PERMISSIONS.filter((p) => p.module === 'dispatch').map((p) => p.key),
-  [ROLE_SLUGS.ACCOUNTS]: PERMISSIONS.filter((p) => p.module === 'accounts').map((p) => p.key),
+  [ROLE_SLUGS.SALES_MANAGER]: [...PERMISSIONS.filter((p) => p.module === 'sales').map((p) => p.key), ...TASK_MANAGER_KEYS],
+  [ROLE_SLUGS.PRODUCTION_MANAGER]: [...PERMISSIONS.filter((p) => p.module === 'production').map((p) => p.key), ...TASK_MANAGER_KEYS],
+  [ROLE_SLUGS.INVENTORY_MANAGER]: [...PERMISSIONS.filter((p) => p.module === 'inventory').map((p) => p.key), ...TASK_MANAGER_KEYS],
+  [ROLE_SLUGS.ROLLING_OPERATOR]: [...PERMISSIONS.filter((p) => p.module === 'production:rolling').map((p) => p.key), ...TASK_WORKER_KEYS],
+  [ROLE_SLUGS.PRINTING_OPERATOR]: [...PERMISSIONS.filter((p) => p.module === 'production:printing').map((p) => p.key), ...TASK_WORKER_KEYS],
+  [ROLE_SLUGS.CUTTING_OPERATOR]: [...PERMISSIONS.filter((p) => p.module === 'production:cutting').map((p) => p.key), ...TASK_WORKER_KEYS],
+  [ROLE_SLUGS.PACKING_OPERATOR]: [...PERMISSIONS.filter((p) => p.module === 'production:packing').map((p) => p.key), ...TASK_WORKER_KEYS],
+  [ROLE_SLUGS.DISPATCH_MANAGER]: [...PERMISSIONS.filter((p) => p.module === 'dispatch').map((p) => p.key), ...TASK_MANAGER_KEYS],
+  [ROLE_SLUGS.ACCOUNTS]: [...PERMISSIONS.filter((p) => p.module === 'accounts').map((p) => p.key), ...TASK_MANAGER_KEYS],
+};
+
+const TASK_STATUSES = {
+  OPEN: 'open',
+  IN_PROGRESS: 'in_progress',
+  BLOCKED: 'blocked',
+  DONE: 'done',
+  CANCELLED: 'cancelled',
+};
+
+const TASK_OPEN_STATUSES = [TASK_STATUSES.OPEN, TASK_STATUSES.IN_PROGRESS, TASK_STATUSES.BLOCKED];
+
+const TASK_CATEGORIES = {
+  ORDER_SUBMIT: 'order_submit',
+  ORDER_APPROVE: 'order_approve',
+  ORDER_REVISE: 'order_revise',
+  MATERIAL_RECEIVE: 'material_receive',
+  PRODUCTION_PLAN: 'production_plan',
+  STAGE_WORK: 'stage_work',
+  DISPATCH: 'dispatch',
+  DELIVERY_CONFIRM: 'delivery_confirm',
+  ORDER_COMPLETE: 'order_complete',
+  PAYMENT_COLLECT: 'payment_collect',
+  CUSTOM: 'custom',
 };
 
 const DEMO_PASSWORD = 'Demo@1234';
@@ -157,7 +191,6 @@ const DEFAULT_STAGES = [
   { slug: 'cutting', name: 'Cutting' },
   { slug: 'packing', name: 'Packing' },
   { slug: 'dispatch', name: 'Dispatch' },
-  { slug: 'delivery', name: 'Delivery' },
 ];
 
 const PRODUCTION_ROUTES = {
@@ -165,28 +198,53 @@ const PRODUCTION_ROUTES = {
   ROLL_PRINT_DISPATCH: 'roll_print_dispatch',
   ROLL_PRINT_CUT_DISPATCH: 'roll_print_cut_dispatch',
   ROLL_CUT_DISPATCH: 'roll_cut_dispatch',
+  PRINT_DISPATCH: 'print_dispatch',
+  PRINT_CUT_DISPATCH: 'print_cut_dispatch',
+  CUT_DISPATCH: 'cut_dispatch',
 };
 
 const PRODUCTION_ROUTE_LIST = [
   {
     id: PRODUCTION_ROUTES.ROLL_DISPATCH,
-    label: 'Rolling → Dispatch → Delivery',
-    stages: ['rolling', 'dispatch', 'delivery'],
+    label: 'Rolling → Dispatch',
+    stages: ['rolling', 'dispatch'],
+    orderType: 'sales_order',
   },
   {
     id: PRODUCTION_ROUTES.ROLL_PRINT_DISPATCH,
-    label: 'Rolling → Printing → Dispatch → Delivery',
-    stages: ['rolling', 'printing', 'dispatch', 'delivery'],
+    label: 'Rolling → Printing → Dispatch',
+    stages: ['rolling', 'printing', 'dispatch'],
+    orderType: 'sales_order',
   },
   {
     id: PRODUCTION_ROUTES.ROLL_PRINT_CUT_DISPATCH,
-    label: 'Rolling → Printing → Cutting → Dispatch → Delivery',
-    stages: ['rolling', 'printing', 'cutting', 'dispatch', 'delivery'],
+    label: 'Rolling → Printing → Cutting → Dispatch',
+    stages: ['rolling', 'printing', 'cutting', 'dispatch'],
+    orderType: 'sales_order',
   },
   {
     id: PRODUCTION_ROUTES.ROLL_CUT_DISPATCH,
-    label: 'Rolling → Cutting → Dispatch → Delivery',
-    stages: ['rolling', 'cutting', 'dispatch', 'delivery'],
+    label: 'Rolling → Cutting → Dispatch',
+    stages: ['rolling', 'cutting', 'dispatch'],
+    orderType: 'sales_order',
+  },
+  {
+    id: PRODUCTION_ROUTES.PRINT_DISPATCH,
+    label: 'Printing → Dispatch',
+    stages: ['printing', 'dispatch'],
+    orderType: 'job_work',
+  },
+  {
+    id: PRODUCTION_ROUTES.PRINT_CUT_DISPATCH,
+    label: 'Printing → Cutting → Dispatch',
+    stages: ['printing', 'cutting', 'dispatch'],
+    orderType: 'job_work',
+  },
+  {
+    id: PRODUCTION_ROUTES.CUT_DISPATCH,
+    label: 'Cutting → Dispatch',
+    stages: ['cutting', 'dispatch'],
+    orderType: 'job_work',
   },
 ];
 
@@ -332,6 +390,7 @@ const SALES_ORDER_VIEW_KEYS = [
   'production:read',
   'inventory:read',
   'accounts:read',
+  'dispatch:read',
 ];
 
 const ANALYTICS_VIEW_KEYS = ['production:read'];
@@ -385,6 +444,9 @@ module.exports = {
   ROLES,
   PERMISSIONS,
   ROLE_PERMISSION_KEYS,
+  TASK_STATUSES,
+  TASK_OPEN_STATUSES,
+  TASK_CATEGORIES,
   DEMO_PASSWORD,
   DEMO_USERS,
   INVENTORY_CATEGORIES,

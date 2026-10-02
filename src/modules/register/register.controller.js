@@ -16,7 +16,20 @@ const getStage = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
+const getArtwork = asyncHandler(async (req, res) => {
+  const data = await registerService.getArtwork(req.user, req.params.orderId, req.params.itemId);
+  res.json({ success: true, data });
+});
+
+const downloadArtwork = asyncHandler(async (req, res) => {
+  const file = await registerService.getArtworkFile(req.user, req.params.orderId, req.params.attachmentId);
+  if (file.redirectUrl) return res.redirect(file.redirectUrl);
+  res.download(file.filePath, file.originalName);
+});
+
 module.exports = {
+  getArtwork,
+  downloadArtwork,
   list,
   getByOrder,
   getStage,

@@ -206,24 +206,50 @@ async function ensureRegister(order, preloaded) {
       dirty = true;
     }
   }
+  // The order's stageWork is the source of truth: refresh matching entries, add missing ones, drop orphans.
+  const byWork = new Map((doc.entries || []).filter((row) => row.workId).map((row) => [String(row.workId), row]));
   const byKey = new Map((doc.entries || []).map((row) => [entryKey(row.itemId, row), row]));
+  const kept = new Set();
   for (const entry of entriesFromWork(order)) {
-    const key = entryKey(entry.itemId, entry);
-    const existing = byKey.get(key);
-    if (existing) {
-      if (!existing.workId && entry.workId) {
-        existing.workId = entry.workId;
-        dirty = true;
-      }
+    const existing = (entry.workId && byWork.get(String(entry.workId))) || byKey.get(entryKey(entry.itemId, entry));
+    if (!existing) {
+      doc.entries.push(entry);
+      kept.add(doc.entries[doc.entries.length - 1]);
+      dirty = true;
       continue;
     }
-    doc.entries.push(entry);
-    byKey.set(key, entry);
-    dirty = true;
+    kept.add(existing);
+    for (const field of SYNCED_FIELDS) {
+      const next = entry[field];
+      const same = field === 'details' || field === 'workDate' ? JSON.stringify(existing[field] ?? null) === JSON.stringify(next ?? null) : String(existing[field] ?? '') === String(next ?? '');
+      if (!same) {
+        existing[field] = next;
+        dirty = true;
+      }
+    }
   }
+  const before = doc.entries.length;
+  doc.entries = doc.entries.filter((row) => kept.has(row));
+  if (doc.entries.length !== before) dirty = true;
   if (dirty) await repo.save(doc);
   return doc;
 }
+
+const SYNCED_FIELDS = [
+  'workId',
+  'inputQty',
+  'outputQty',
+  'wasteQty',
+  'shift',
+  'workDate',
+  'notes',
+  'machineName',
+  'pickedLotName',
+  'vehicleNumber',
+  'handoverPerson',
+  'deliveryPartner',
+  'details',
+];
 
 async function preloadRegisters(orders) {
   const docs = await repo.findByOrderIds(orders.map((order) => order._id));
@@ -271,6 +297,8 @@ function lineView(user, order, item, stage, doc) {
     canMark: ready && canWorkStage(user, stage),
     jobId: `${order._id}:${item._id}:${stage}`,
     specs: registerSpecs(order, item, stage),
+    jobFields: stage === 'dispatch' ? [] : require('../task/task.jobsheet').stageJob(order, item, stage).fields,
+    instructions: order.productionInstructions || '',
     entries,
   };
 }
@@ -413,6 +441,7 @@ async function getStage(user, stage) {
           orderNumber: order.number,
           customerName: customerNameFor(user, order),
           customerCode: customerCodeOf(order),
+          editable: order.status !== SALES_ORDER_STATUSES.COMPLETED,
         });
       }
     }
@@ -426,6 +455,58 @@ async function getStage(user, stage) {
     open,
     entries,
   };
+}
+
+function artworkImage(image) {
+  const url = image?.url || '';
+  const dataUrl = url ? '' : image?.dataUrl || '';
+  if (!url && !dataUrl) return null;
+  return { originalName: image.originalName || '', mimeType: image.mimeType || '', url, dataUrl };
+}
+
+async function loadArtworkOrder(user, orderId) {
+  if (!canReadBook(user, 'printing')) {
+    throw new ApiError(403, 'You cannot view printing artwork');
+  }
+  const order = await salesOrderRepo.findById(orderId);
+  if (!order) throw new ApiError(404, 'Order not found');
+  return order;
+}
+
+async function getArtwork(user, orderId, itemId) {
+  const order = await loadArtworkOrder(user, orderId);
+  const item = (order.items || []).id(itemId);
+  if (!item) throw new ApiError(404, 'Line item not found');
+  const images = (item.images?.length ? item.images : [item.image]).map(artworkImage).filter(Boolean);
+  const files = (order.attachments || [])
+    .filter((attachment) => attachment.kind === 'artwork')
+    .map((attachment) => ({
+      id: String(attachment._id),
+      originalName: attachment.originalName || 'Artwork',
+      mimeType: attachment.mimeType || '',
+      size: attachment.size || 0,
+    }));
+  return {
+    orderId: String(order._id),
+    orderNumber: order.number,
+    product: item.product || '',
+    productCode: item.productCode || '',
+    note: item.printing?.artwork || '',
+    design: item.printing?.design || '',
+    colors: item.printing?.colors || '',
+    colorCount: item.printing?.colorCount || '',
+    impressions: item.printing?.impressions || '',
+    requirement: item.printing?.requirement || '',
+    images,
+    files,
+  };
+}
+
+async function getArtworkFile(user, orderId, attachmentId) {
+  const order = await loadArtworkOrder(user, orderId);
+  const attachment = (order.attachments || []).id(attachmentId);
+  if (!attachment || attachment.kind !== 'artwork') throw new ApiError(404, 'Artwork file not found');
+  return require('../salesOrder/salesOrder.service').getAttachmentFile(orderId, attachmentId);
 }
 
 async function findEntry(order, entryId) {
@@ -460,6 +541,8 @@ async function removeEntry(doc, entry) {
 }
 
 module.exports = {
+  getArtwork,
+  getArtworkFile,
   findEntry,
   workRowFor,
   updateEntry,

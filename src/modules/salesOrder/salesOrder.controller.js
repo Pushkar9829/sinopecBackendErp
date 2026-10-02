@@ -75,6 +75,16 @@ const removeAttachment = asyncHandler(async (req, res) => {
   res.json({ success: true, data: order });
 });
 
+const recordPayment = asyncHandler(async (req, res) => {
+  const order = await salesOrderService.recordPayment(req.user, req.params.id, req.body);
+  res.status(201).json({ success: true, data: order });
+});
+
+const removePayment = asyncHandler(async (req, res) => {
+  const order = await salesOrderService.removePayment(req.user, req.params.id, req.params.paymentId);
+  res.json({ success: true, data: order });
+});
+
 const downloadAttachment = asyncHandler(async (req, res) => {
   const file = await salesOrderService.getAttachmentFile(req.params.id, req.params.attachmentId);
   if (file.redirectUrl) {
@@ -84,6 +94,8 @@ const downloadAttachment = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
+  recordPayment,
+  removePayment,
   list,
   summary,
   meta,

@@ -98,15 +98,13 @@ async function list(query = {}) {
   if (query.entityId) filter.entityId = String(query.entityId);
   if (query.outcome === 'success') filter.success = true;
   if (query.outcome === 'failed') filter.success = false;
-  const from = query.from ? new Date(query.from) : null;
-  const to = query.to ? new Date(query.to) : null;
+  const day = (value) => (/^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : '');
+  const from = day(query.from) ? new Date(`${day(query.from)}T00:00:00.000+05:30`) : query.from ? new Date(query.from) : null;
+  const to = day(query.to) ? new Date(`${day(query.to)}T23:59:59.999+05:30`) : query.to ? new Date(query.to) : null;
   if ((from && !Number.isNaN(from.getTime())) || (to && !Number.isNaN(to.getTime()))) {
     filter.at = {};
     if (from && !Number.isNaN(from.getTime())) filter.at.$gte = from;
-    if (to && !Number.isNaN(to.getTime())) {
-      to.setHours(23, 59, 59, 999);
-      filter.at.$lte = to;
-    }
+    if (to && !Number.isNaN(to.getTime())) filter.at.$lte = to;
   }
   if (query.q) {
     const rx = new RegExp(escapeRegex(String(query.q).trim().slice(0, 100)), 'i');

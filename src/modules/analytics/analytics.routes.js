@@ -15,7 +15,7 @@ router.get(
   validate([
     query('from').optional().isISO8601().withMessage('Invalid from date'),
     query('to').optional().isISO8601().withMessage('Invalid to date'),
-    query('stage').optional().isIn(['rolling', 'printing', 'cutting', 'dispatch', 'delivery', 'all', '']),
+    query('stage').optional().isIn(['rolling', 'printing', 'cutting', 'dispatch', 'all', '']),
   ]),
   analyticsController.getAnalytics
 );

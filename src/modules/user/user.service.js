@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const { ROLE_SLUGS } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
 const { toPublicUser } = require('../../utils/permissions');
+const authRepo = require('../auth/auth.repo');
 const roleRepo = require('../role/role.repo');
 const userRepo = require('./user.repo');
 
@@ -23,8 +24,9 @@ async function assertNotLastSuperAdmin(user, nextRoleSlug, nextIsActive) {
   const deactivating = nextIsActive === false;
 
   if (!losingRole && !deactivating) return;
+  if (user.isActive === false) return;
 
-  const remaining = await userRepo.countByRole(user.role._id);
+  const remaining = await userRepo.countActiveByRole(user.role._id);
   if (remaining <= 1) {
     throw new ApiError(400, 'The last Super Admin cannot be removed or deactivated');
   }
@@ -117,6 +119,14 @@ async function updateUser(actor, userId, payload) {
     updates.passwordHash = await bcrypt.hash(payload.password, 10);
   }
 
+  const self = String(actor._id) === String(user._id);
+  if (self && payload.isActive === false) {
+    throw new ApiError(400, 'You cannot deactivate your own account');
+  }
+  if (self && updates.role && String(updates.role) !== String(user.role?._id)) {
+    throw new ApiError(400, 'You cannot change your own role');
+  }
+
   await assertRoleChangeAllowed(actor, user, nextRole);
   await assertNotLastSuperAdmin(
     user,
@@ -125,7 +135,21 @@ async function updateUser(actor, userId, payload) {
   );
 
   const updated = await userRepo.updateById(userId, updates);
+  if (payload.password) {
+    await authRepo.revokeAllForUser(user._id);
+  }
+  if (payload.isActive === false && user.isActive !== false) {
+    await releaseTasks(user);
+  }
   return toPublicUser(updated);
+}
+
+async function releaseTasks(user) {
+  try {
+    await require('../task/task.repo').releaseAssignee(user._id, user.role?.slug);
+  } catch (error) {
+    console.error('Returning tasks to the team queue failed', error.message);
+  }
 }
 
 async function deleteUser(actor, userId) {
@@ -142,6 +166,8 @@ async function deleteUser(actor, userId) {
   await assertNotLastSuperAdmin(user, null, false);
 
   await userRepo.deleteById(userId);
+  await authRepo.revokeAllForUser(user._id).catch(() => {});
+  await releaseTasks(user);
 }
 
 module.exports = {

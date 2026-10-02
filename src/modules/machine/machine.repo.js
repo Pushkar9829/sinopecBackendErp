@@ -14,7 +14,8 @@ function findByIds(ids) {
 
 function findByCode(code) {
   if (!code) return null;
-  return Machine.findOne({ code: String(code).trim() });
+  const escaped = String(code).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return Machine.findOne({ code: new RegExp(`^${escaped}$`, 'i') });
 }
 
 function create(data) {

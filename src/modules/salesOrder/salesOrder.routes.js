@@ -73,6 +73,21 @@ router.post(
   validate([idParam]),
   salesOrderController.cancel
 );
+const canPay = authorize.any('accounts:create', 'accounts:update', 'sales:update');
+router.post(
+  '/:id/payments',
+  authenticate,
+  canPay,
+  validate([idParam, body('amount').isFloat({ gt: 0 }).withMessage('Amount must be more than 0')]),
+  salesOrderController.recordPayment
+);
+router.delete(
+  '/:id/payments/:paymentId',
+  authenticate,
+  canPay,
+  validate([idParam, param('paymentId').isMongoId().withMessage('Invalid payment id')]),
+  salesOrderController.removePayment
+);
 router.post(
   '/:id/attachments',
   authenticate,

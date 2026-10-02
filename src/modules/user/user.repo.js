@@ -37,6 +37,10 @@ function countByRole(roleId) {
   return User.countDocuments({ role: roleId });
 }
 
+function countActiveByRole(roleId) {
+  return User.countDocuments({ role: roleId, isActive: true });
+}
+
 function findByIds(ids) {
   return User.find({ _id: { $in: ids } }).populate(rolePopulate).select('-passwordHash');
 }
@@ -51,4 +55,5 @@ module.exports = {
   updateById,
   deleteById,
   countByRole,
+  countActiveByRole,
 };

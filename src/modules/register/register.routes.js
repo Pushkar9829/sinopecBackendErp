@@ -36,4 +36,26 @@ router.get(
   registerController.getByOrder
 );
 
+router.get(
+  '/artwork/:orderId/file/:attachmentId',
+  authenticate,
+  authorize.any(...VIEW_KEYS),
+  validate([
+    param('orderId').isMongoId().withMessage('Invalid order'),
+    param('attachmentId').isMongoId().withMessage('Invalid file'),
+  ]),
+  registerController.downloadArtwork
+);
+
+router.get(
+  '/artwork/:orderId/:itemId',
+  authenticate,
+  authorize.any(...VIEW_KEYS),
+  validate([
+    param('orderId').isMongoId().withMessage('Invalid order'),
+    param('itemId').isMongoId().withMessage('Invalid product'),
+  ]),
+  registerController.getArtwork
+);
+
 module.exports = router;

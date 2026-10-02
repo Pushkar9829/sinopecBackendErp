@@ -8,11 +8,10 @@ const FLOOR_STAGES = [
   { id: 'printing', label: 'Printing', read: 'production:printing:read', update: 'production:printing:update' },
   { id: 'cutting', label: 'Cutting', read: 'production:cutting:read', update: 'production:cutting:update' },
   { id: 'dispatch', label: 'Dispatch', read: 'dispatch:read', update: 'dispatch:update' },
-  { id: 'delivery', label: 'Delivery', read: 'dispatch:read', update: 'dispatch:update' },
 ];
 
 function isDeliveryStage(stage) {
-  return stage === 'delivery';
+  return stage === 'dispatch';
 }
 
 function isSuperAdmin(user) {
@@ -20,7 +19,7 @@ function isSuperAdmin(user) {
 }
 
 function routeStages(route) {
-  return ROUTE_BY_ID.get(route)?.stages || ['rolling', 'dispatch', 'delivery'];
+  return ROUTE_BY_ID.get(route)?.stages || ['rolling', 'dispatch'];
 }
 
 function firstStage(route) {
@@ -42,7 +41,7 @@ function previousStage(route, current) {
 }
 
 function lastMakeStage(route) {
-  const stages = routeStages(route).filter((stage) => stage !== 'dispatch' && stage !== 'delivery');
+  const stages = routeStages(route).filter((stage) => stage !== 'dispatch');
   return stages[stages.length - 1] || 'rolling';
 }
 
@@ -120,7 +119,13 @@ function stageStats(item, stage) {
     done = before.done && before.output > 0 && input + EPS >= before.output && !holding;
   }
   if (!done && !prev && target <= 0) {
-    done = output > 0 && !holding;
+    // No weight target: rolling stays open until the next stage has made its full quantity.
+    const following = nextStage(item.productionRoute, stage);
+    const followingTarget = following && following !== 'completed' ? stageTarget(item, following) : 0;
+    done =
+      output > 0 &&
+      !holding &&
+      (!following || following === 'completed' || (followingTarget > 0 && sumWork(item, following, 'outputQty') + EPS >= followingTarget));
   }
 
   return {
@@ -177,9 +182,9 @@ function syncOrderStatus(order) {
   if (items.every((item) => activeStage(item) === 'completed')) return SALES_ORDER_STATUSES.DELIVERED;
 
   const open = items.map((item) => activeStage(item)).filter((stage) => stage !== 'completed');
-  if (open.length && open.every((stage) => stage === 'delivery')) return SALES_ORDER_STATUSES.DISPATCHED;
-  if (open.length && open.every((stage) => stage === 'dispatch' || stage === 'delivery')) {
-    return SALES_ORDER_STATUSES.READY_FOR_DISPATCH;
+  if (open.length && open.every((stage) => stage === 'dispatch')) {
+    const sentAny = items.some((item) => sumWork(item, 'dispatch', 'outputQty') > 0);
+    return sentAny ? SALES_ORDER_STATUSES.DISPATCHED : SALES_ORDER_STATUSES.READY_FOR_DISPATCH;
   }
 
   const anyWork = items.some((item) => (item.stageWork || []).length > 0);
@@ -239,6 +244,7 @@ function registerSpecs(order, item, stage) {
       jobSize: item.size || '',
       impression: item.printing?.impressions || '',
       colorUsed: item.printing?.colors || item.color || '',
+      artwork: item.printing?.artwork || item.printing?.design || '',
     };
   }
   if (stage === 'cutting') {

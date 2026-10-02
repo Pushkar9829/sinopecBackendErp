@@ -31,8 +31,15 @@ async function nextSalesOrderNumber(date = new Date(), orderType = 'sales_order'
   return `SO-${year}-${pad(seq)}`;
 }
 
+async function nextTaskNumber(date = new Date()) {
+  const year = date.getFullYear();
+  const seq = await nextSeq(`task:${year}`);
+  return `TSK-${year}-${pad(seq)}`;
+}
+
 module.exports = {
   nextSeq,
   nextCustomerCode,
   nextSalesOrderNumber,
+  nextTaskNumber,
 };

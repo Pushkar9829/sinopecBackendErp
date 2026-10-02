@@ -19,6 +19,7 @@ const MODULE_LABELS = {
   production: 'Production',
   registers: 'Registers',
   media: 'Files',
+  tasks: 'Tasks',
 };
 
 const MODELS = {
@@ -29,6 +30,7 @@ const MODELS = {
   'machines/': ['Machine', 'Machine'],
   'customers/': ['Customer', 'Customer'],
   'sales-orders/': ['SalesOrder', 'Order'],
+  'tasks/': ['Task', 'Task'],
   'sales-settings/options': ['SalesOption', 'List word'],
   'sales-settings/templates': ['ProductTemplate', 'Saved product'],
 };
@@ -72,6 +74,7 @@ function resolveTarget(req) {
   } else if (words.length) {
     const tail = words.join(' ').replace(/-/g, ' ');
     if (tail === 'attachments') action = req.method === 'DELETE' ? 'removed attachment' : 'added attachment';
+    else if (tail === 'payments') action = req.method === 'DELETE' ? 'removed payment' : 'recorded payment';
     else if (tail === 'permissions') action = 'updated permissions';
     else action = tail;
   } else if (req.method === 'POST') action = module === 'media' ? 'uploaded file' : 'created';
