@@ -12,6 +12,8 @@ const intakeSettingsSchema = new mongoose.Schema(
     gmailClientSecret: { type: String, default: '' },
     gmailRefreshToken: { type: String, default: '' },
     gmailEmail: { type: String, default: '', trim: true },
+    gmailPageToken: { type: String, default: '' },
+    orderKeywords: { type: String, default: '' },
     geminiApiKey: { type: String, default: '' },
     geminiModel: { type: String, default: 'gemini-3.5-flash-lite', trim: true },
   },

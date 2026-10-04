@@ -11,7 +11,14 @@ Return JSON only with this shape:
   "certainty":{"customer":"high|medium|low|missing","lines":"high|medium|low|missing"},
   "warnings":[]
 }
-Rules: leave a field as an empty string or null when it is not in the message. Do not invent width, material, GST, rate, quantity, or a delivery date. Their item code is not our product code. A weekday such as Friday is medium certainty and must also be copied into notes. Put disagreements and anything unreadable into warnings.`;
+Rules:
+- Leave a field empty only when the message does not contain it. Do not invent material, GST, rate, or a delivery date.
+- A number written with a product is the quantity, even when the word pcs is missing and the mail only asks for a PI. "Please share the PI against 17000 Polly bag" means product Polly bag and quantity 17000. Leave unit empty when no unit is written.
+- A size written as 10*14*2, 10x14x2, or 10×14×2 means width 10, length 14, and gusset 2. Put "gusset 2" in that line's notes. A two-part size such as 12x18 is width and length. These are not a rate.
+- Their item code is not our product code.
+- A weekday such as Friday is medium certainty and must also be copied into notes.
+- When the message body has no email, copy the sender email given below into customer.email.
+- Put disagreements and anything unreadable into warnings.`;
 
 function emptyProposal(warnings = []) {
   return {
@@ -123,6 +130,97 @@ function normalizeProposal(raw, extraWarnings) {
   return base;
 }
 
+const SIZE_UNIT = '(?:inches|inch|in|cm|mm)?';
+const SIZE_PATTERN = new RegExp(
+  `(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT}\\s*[*x×]\\s*(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT}(?:\\s*[*x×]\\s*(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT})?`,
+  'i'
+);
+const MONTH_WORD = /^(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/i;
+
+function addressIn(value) {
+  const match = String(value || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0] : '';
+}
+
+function blank(value) {
+  return value === null || value === undefined || value === '' || Number.isNaN(value);
+}
+
+function findSize(text) {
+  const match = String(text || '').match(SIZE_PATTERN);
+  if (!match) return null;
+  return { width: match[1], length: match[2], gusset: match[3] || '' };
+}
+
+function findQuantity(text) {
+  const cleaned = String(text || '').replace(new RegExp(SIZE_PATTERN.source, 'gi'), ' ');
+  const withUnit = cleaned.match(/\b(\d{1,7}(?:\.\d+)?)\s*(pcs|pc|pieces|piece|nos|kg|kgs|packets?|pkt|rolls?)\b/i);
+  if (withUnit) return { quantity: Number(withUnit[1]), unit: withUnit[2].toLowerCase() };
+  const loose = cleaned.matchAll(/\b(\d{1,7})\s+([A-Za-z]{3,})/g);
+  for (const match of loose) {
+    if (MONTH_WORD.test(match[2])) continue;
+    const before = cleaned.slice(Math.max(0, match.index - 16), match.index);
+    if (/\b(rate|rs|inr|gst|rupees?)\s*$/i.test(before)) continue;
+    const quantity = Number(match[1]);
+    if (quantity >= 1900 && quantity <= 2100) continue;
+    return { quantity, unit: '' };
+  }
+  return null;
+}
+
+function productBeside(text, quantity) {
+  const match = String(text || '').match(new RegExp(`\\b${quantity}\\s+([^\\n(]{2,80})`, 'i'));
+  if (!match) return '';
+  return match[1]
+    .replace(new RegExp(SIZE_PATTERN.source, 'gi'), ' ')
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .slice(0, 6)
+    .join(' ');
+}
+
+function applyMessageFacts(proposal, doc) {
+  const text = String(doc?.rawBody || '');
+  const senderEmail = addressIn(doc?.sender?.email);
+  const senderPhone = String(doc?.sender?.phone || '').trim();
+  if (senderEmail && !proposal.customer.email) proposal.customer.email = senderEmail;
+  if (senderPhone && !proposal.customer.mobile) proposal.customer.mobile = senderPhone;
+  if (!proposal.customer.name && doc?.sender?.name) proposal.customer.name = String(doc.sender.name).trim();
+
+  const size = findSize(text);
+  const counted = findQuantity(text);
+  if (!proposal.lines.length && (size || counted)) {
+    proposal.lines.push({
+      product: counted ? productBeside(text, counted.quantity) : '',
+      quantity: counted ? counted.quantity : null,
+      unit: counted?.unit || '',
+      rate: null,
+      material: '',
+      width: '',
+      length: '',
+      notes: '',
+    });
+  }
+
+  if (proposal.lines.length !== 1) return proposal;
+  const line = proposal.lines[0];
+  if (counted && blank(line.quantity)) {
+    line.quantity = counted.quantity;
+    if (!line.unit && counted.unit) line.unit = counted.unit;
+  }
+  if (!line.product && counted) line.product = productBeside(text, counted.quantity);
+  if (size && !line.width && !line.length) {
+    line.width = size.width;
+    line.length = size.length;
+    if (size.gusset && !/gusset/i.test(line.notes)) {
+      line.notes = [line.notes, `gusset ${size.gusset}`].filter(Boolean).join('. ');
+    }
+  }
+  return proposal;
+}
+
 async function readIntake(doc) {
   const settings = await getSettings();
   if (!settings.geminiApiKey) {
@@ -131,6 +229,10 @@ async function readIntake(doc) {
 
   const warnings = [];
   const geminiParts = [{ text: PROMPT }];
+  const senderBits = [doc.sender?.name, addressIn(doc.sender?.email) || doc.sender?.email, doc.sender?.phone].filter(Boolean);
+  if (senderBits.length) {
+    geminiParts.push({ text: `Sender from the channel: ${senderBits.join(', ')}` });
+  }
   if (doc.rawBody) geminiParts.push({ text: `Message:\n${doc.rawBody}` });
 
   for (const file of doc.files || []) {
@@ -170,7 +272,7 @@ async function readIntake(doc) {
   }
 
   const raw = await callGemini(settings, geminiParts);
-  return normalizeProposal(raw, warnings);
+  return applyMessageFacts(normalizeProposal(raw, warnings), doc);
 }
 
 module.exports = {

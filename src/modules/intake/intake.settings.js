@@ -1,4 +1,5 @@
 const IntakeSettings = require('./intakeSettings.model');
+const { parseKeywords } = require('./intake.keywords');
 
 const SECRET_FIELDS = ['whatsappAppSecret', 'whatsappAccessToken', 'gmailClientSecret', 'gmailRefreshToken', 'geminiApiKey'];
 
@@ -21,6 +22,7 @@ function presentSettings(doc) {
     gmailClientId: doc.gmailClientId || '',
     gmailEmail: doc.gmailEmail || '',
     geminiModel: doc.geminiModel || 'gemini-3.5-flash-lite',
+    orderKeywords: parseKeywords(doc.orderKeywords).join('\n'),
     whatsappAppSecretSet: Boolean(doc.whatsappAppSecret),
     whatsappAccessTokenSet: Boolean(doc.whatsappAccessToken),
     gmailClientSecretSet: Boolean(doc.gmailClientSecret),
@@ -42,6 +44,7 @@ async function saveSettings(payload) {
   doc.whatsappPhoneNumberId = text('whatsappPhoneNumberId');
   doc.gmailClientId = text('gmailClientId');
   doc.geminiModel = text('geminiModel') || 'gemini-3.5-flash-lite';
+  doc.orderKeywords = parseKeywords(text('orderKeywords')).join('\n');
   for (const field of SECRET_FIELDS) {
     if (field === 'gmailRefreshToken') continue;
     doc[field] = keepSecret(payload[field], doc[field]);

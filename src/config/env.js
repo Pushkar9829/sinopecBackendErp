@@ -22,6 +22,21 @@ if (missing.length) {
   throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
 }
 
+function normalizeOrigin(value) {
+  const raw = String(value || '').trim().replace(/\/$/, '');
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const scheme = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(raw) ? 'http' : 'https';
+  return `${scheme}://${raw}`;
+}
+
+const clientOrigins = String(
+  process.env.CLIENT_ORIGIN || 'http://localhost:5173,https://sinopecerpfrontend.vercel.app'
+)
+  .split(',')
+  .map(normalizeOrigin)
+  .filter(Boolean);
+
 const env = {
   port: Number(process.env.PORT) || 5000,
   mongoUri: process.env.MONGO_URI,
@@ -29,14 +44,8 @@ const env = {
   jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
   accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '15m',
   refreshTokenTtl: process.env.REFRESH_TOKEN_TTL || '7d',
-  clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
-  clientOrigins: String(
-    process.env.CLIENT_ORIGIN ||
-      'http://localhost:5173,https://sinopecerpfrontend.vercel.app'
-  )
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
+  clientOrigin: clientOrigins[0] || 'http://localhost:5173',
+  clientOrigins,
   superAdminUsername: process.env.SUPERADMIN_USERNAME,
   superAdminPassword: process.env.SUPERADMIN_PASSWORD,
   nodeEnv: process.env.NODE_ENV || 'development',

@@ -4,6 +4,8 @@ const env = require('../../config/env');
 const { uploadBuffer } = require('../../utils/storage');
 const { getSettings } = require('./intake.settings');
 const { createDraft } = require('./intake.service');
+const { findByProvider } = require('./intake.repo');
+const { parseKeywords, findKeywords } = require('./intake.keywords');
 
 function redirectUri(settings) {
   const base = String(settings.publicBaseUrl || '').replace(/\/$/, '');
@@ -89,6 +91,21 @@ function htmlToText(html) {
     .trim();
 }
 
+async function potentialOrderLabelId(gmail) {
+  const listed = await gmail.users.labels.list({ userId: 'me' });
+  const existing = (listed.data.labels || []).find((label) => label.name === 'Potential order');
+  if (existing?.id) return existing.id;
+  const created = await gmail.users.labels.create({
+    userId: 'me',
+    requestBody: {
+      name: 'Potential order',
+      labelListVisibility: 'labelShow',
+      messageListVisibility: 'show',
+    },
+  });
+  return created.data.id;
+}
+
 async function pollUnread() {
   const settings = await getSettings();
   if (!settings.gmailRefreshToken || !settings.gmailClientId || !settings.gmailClientSecret) return;
@@ -96,11 +113,18 @@ async function pollUnread() {
   const gmail = google.gmail({ version: 'v1', auth: client });
   const listed = await gmail.users.messages.list({
     userId: 'me',
-    q: 'is:unread newer_than:7d',
-    maxResults: 5,
+    q: 'newer_than:30d -in:spam -in:trash',
+    maxResults: 25,
+    pageToken: settings.gmailPageToken || undefined,
   });
+  settings.gmailPageToken = listed.data.nextPageToken || '';
+  await settings.save();
+
+  const keywords = parseKeywords(settings.orderKeywords);
   const messages = listed.data.messages || [];
   for (const item of messages) {
+    const already = await findByProvider('gmail', item.id);
+    if (already) continue;
     const full = await gmail.users.messages.get({ userId: 'me', id: item.id, format: 'full' });
     const bucket = { text: [], html: [], attachments: [] };
     walkParts(full.data.payload, bucket);
@@ -124,6 +148,9 @@ async function pollUnread() {
       );
     }
     const text = bucket.text.join('\n').trim() || htmlToText(bucket.html.join('\n'));
+    const subject = headerValue(headers, 'subject');
+    const matched = findKeywords(`${subject}\n${text}`, keywords);
+    const potentialOrder = matched.length > 0;
     const saved = await createDraft({
       channel: 'gmail',
       providerMessageId: full.data.id,
@@ -132,23 +159,37 @@ async function pollUnread() {
         email: headerValue(headers, 'from'),
         name: '',
       },
+      subject,
       rawBody: text,
       files,
+      potentialOrder,
+      matchedKeywords: matched,
+      status: potentialOrder ? 'received' : 'stored',
       warnings: [],
       receivedAt: full.data.internalDate ? new Date(Number(full.data.internalDate)) : new Date(),
     });
-    if (saved.doc) {
-      await gmail.users.messages.modify({
-        userId: 'me',
-        id: item.id,
-        requestBody: { removeLabelIds: ['UNREAD'] },
-      });
+    if (saved.created && potentialOrder) {
+      try {
+        const labelId = await potentialOrderLabelId(gmail);
+        await gmail.users.messages.modify({
+          userId: 'me',
+          id: item.id,
+          requestBody: { addLabelIds: [labelId] },
+        });
+      } catch (error) {
+        saved.doc.warnings = [`Gmail label was not applied: ${error.message}`];
+        await saved.doc.save();
+      }
     }
   }
 }
 
 function frontendRedirect(query) {
-  const origin = String(env.clientOrigin || 'http://localhost:5173').split(',')[0].trim();
+  let origin = String(env.clientOrigin || 'http://localhost:5173').split(',')[0].trim().replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(origin)) {
+    const scheme = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin) ? 'http' : 'https';
+    origin = `${scheme}://${origin}`;
+  }
   return `${origin}/draft-orders/setup?${query}`;
 }
 

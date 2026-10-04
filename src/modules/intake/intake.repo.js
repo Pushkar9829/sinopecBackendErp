@@ -1,7 +1,7 @@
 const Intake = require('./intake.model');
 
 function list() {
-  return Intake.find().sort({ receivedAt: -1 }).limit(200);
+  return Intake.find().sort({ receivedAt: -1 }).limit(500);
 }
 
 function findById(id) {
