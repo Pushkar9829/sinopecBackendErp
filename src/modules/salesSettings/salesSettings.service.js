@@ -97,7 +97,8 @@ async function getTemplate(id) {
 function templatePayload(payload) {
   const name = String(payload.name || '').trim();
   if (!name) throw new ApiError(400, 'Template name is required');
-  const spec = normalizeItem(payload);
+  // Quantity, discount and tax belong to each order line, not to the saved product.
+  const spec = normalizeItem({ ...payload, quantity: 0, discount: 0, taxPercent: 0 });
   delete spec._id;
   return {
     name,
@@ -129,21 +130,14 @@ const OPTION_FIELDS = [
   ['unit', 'unit'],
   ['color', 'color'],
   ['thickness', 'thickness'],
-  ['size', 'size'],
-  ['manufacturing.rawMaterial', 'rawMaterial'],
+  ['width', 'width'],
+  ['length', 'length'],
   ['manufacturing.materialType', 'materialType'],
   ['manufacturing.materialGrade', 'materialGrade'],
   ['manufacturing.additives', 'additive'],
-  ['manufacturing.width', 'width'],
-  ['manufacturing.length', 'length'],
-  ['manufacturing.thickness', 'thickness'],
-  ['manufacturing.color', 'color'],
+  ['manufacturing.specialRequirements', 'specialRequirement'],
   ['roll.width', 'width'],
   ['roll.length', 'length'],
-  ['roll.size', 'size'],
-  ['bag.width', 'width'],
-  ['bag.length', 'length'],
-  ['bag.size', 'size'],
   ['holes.count', 'holeCount'],
   ['holes.type', 'holeType'],
   ['holes.size', 'holeSize'],
@@ -191,7 +185,7 @@ async function ensureTemplatesFromItems(rawItems = [], items = []) {
     const name = String(item?.product || '').trim();
     if (!name) continue;
 
-    const templateId = String(rawItems[index]?.templateId || '').trim();
+    const templateId = String(item.templateId || '').trim();
     const linked = templateId ? byId.get(templateId) : null;
     const linkedName = String(linked?.product || linked?.name || '').trim().toLowerCase();
     if (linked && linkedName === name.toLowerCase()) continue;

@@ -16,6 +16,8 @@ router.get(
     query('from').optional().isISO8601().withMessage('Invalid from date'),
     query('to').optional().isISO8601().withMessage('Invalid to date'),
     query('stage').optional().isIn(['rolling', 'printing', 'cutting', 'dispatch', 'all', '']),
+    query('orderType').optional().isIn(['sales_order', 'job_work', '']),
+    query(['customer', 'product', 'operator', 'machine']).optional().isString().isLength({ max: 120 }),
   ]),
   analyticsController.getAnalytics
 );

@@ -18,7 +18,6 @@ const entrySchema = new mongoose.Schema(
     inputQty: { type: Number, default: 0, min: 0 },
     outputQty: { type: Number, default: 0, min: 0 },
     wasteQty: { type: Number, default: 0, min: 0 },
-    shift: { type: String, default: '', trim: true },
     workDate: { type: Date, default: Date.now },
     notes: { type: String, default: '', trim: true },
     machineName: { type: String, default: '', trim: true },

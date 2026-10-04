@@ -1,4 +1,4 @@
-const { INVENTORY_CATEGORIES, PRODUCTION_SHIFTS, DELIVERY_PARTNERS, SALES_ORDER_STATUSES } = require('../../config/constants');
+const { INVENTORY_CATEGORIES, DELIVERY_PARTNERS, SALES_ORDER_STATUSES } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
 const itemRepo = require('../inventory/item.repo');
 const stageRepo = require('../inventory/stage.repo');
@@ -27,7 +27,6 @@ function sameUnit(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
 
-const SHIFT_IDS = PRODUCTION_SHIFTS.map((item) => item.id);
 
 function applyOrderStatus(order) {
   order.status = syncOrderStatus(order);
@@ -99,6 +98,12 @@ function buildDetails(order, item, stage, raw) {
       throw new ApiError(400, 'Net weight cannot be more than gross weight');
     }
   }
+  if (stage === 'rolling' && typed.net === undefined && typed.gross !== undefined) {
+    const gross = Number(typed.gross);
+    const tare = Number(typed.tare) || 0;
+    if (Number.isFinite(gross) && tare > gross) throw new ApiError(400, 'Tare cannot be more than gross weight');
+    if (Number.isFinite(gross)) details.net = String(Math.round((gross - tare) * 1000) / 1000);
+  }
   return details;
 }
 
@@ -111,7 +116,6 @@ function toPublicWork(row) {
     inputQty: row.inputQty || 0,
     outputQty: row.outputQty || 0,
     wasteQty: row.wasteQty || 0,
-    shift: row.shift || 'morning',
     workDate: row.workDate || row.completedAt,
     notes: row.notes || '',
     fromStage: row.fromStage || '',
@@ -238,7 +242,6 @@ async function toJob(order, item, stage) {
     sourceLots,
     requirements: stageRequirements(order, item, stage),
     history: (item.stageWork || []).filter((row) => row.stage === stage).map(toPublicWork),
-    shifts: PRODUCTION_SHIFTS,
   };
 }
 
@@ -280,7 +283,6 @@ async function listQueue(user, stage) {
   return {
     stage: requested,
     stages: allowed.map((item) => ({ ...item, count: counts[item.id] || 0 })),
-    shifts: PRODUCTION_SHIFTS,
     deliveryPartners: DELIVERY_PARTNERS,
     jobs,
   };
@@ -312,15 +314,14 @@ async function loadFloorItem(user, payload, { mustWork }) {
   return { order, item, stage };
 }
 
-async function createShiftLot({ order, item, stage, category, qty, unit, shift, workDate }) {
+async function createEntryLot({ order, item, stage, category, qty, unit, workDate }) {
   if (!stage || isDeliveryStage(stage) || qty <= 0) return null;
   const stageDoc = await stageRepo.findBySlug(stage);
 
   const suffix = category === INVENTORY_CATEGORIES.WASTE ? 'waste' : 'output';
   const when = workDate ? new Date(workDate) : new Date();
   const dateLabel = Number.isNaN(when.getTime()) ? '' : when.toISOString().slice(0, 10);
-  const shiftLabel = shift ? ` · ${shift}` : '';
-  const name = `${order.number} · ${item.productCode || item.product || 'item'} · ${stage} ${suffix}${shiftLabel}${dateLabel ? ` · ${dateLabel}` : ''}`;
+  const name = `${order.number} · ${item.productCode || item.product || 'item'} · ${stage} ${suffix}${dateLabel ? ` · ${dateLabel}` : ''}`;
 
   return itemRepo.create({
     category,
@@ -465,7 +466,6 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     inputQty: used,
     outputQty: qty,
     wasteQty: 0,
-    shift: SHIFT_IDS.includes(payload.shift) ? payload.shift : 'morning',
     workDate,
     notes: String(payload.notes || '').trim(),
     fromStage: prev || '',
@@ -556,7 +556,7 @@ async function completeStage(user, payload) {
     throw new ApiError(400, 'Quantities cannot be negative');
   }
   if (produced <= 0) {
-    throw new ApiError(400, 'Enter how much this shift produced');
+    throw new ApiError(400, 'Enter how much this entry produced');
   }
   if (stats.capped && produced - stats.remaining > 1e-6) {
     throw new ApiError(400, `Only ${stats.remaining} ${stats.unit} left on this stage`);
@@ -579,7 +579,7 @@ async function completeStage(user, payload) {
     }
   }
   if (inputQty <= 0) {
-    throw new ApiError(400, 'Enter how much of the picked lot this shift used');
+    throw new ApiError(400, 'Enter how much of the picked lot this entry used');
   }
   if (inputQty - pickup.qty > 1e-6) {
     throw new ApiError(400, `Only ${pickup.qty} is marked for working from ${pickup.lotName}`);
@@ -596,7 +596,6 @@ async function completeStage(user, payload) {
     if (!vehicleNumber) throw new ApiError(400, 'Enter the vehicle number');
   }
 
-  const shift = SHIFT_IDS.includes(payload.shift) ? payload.shift : 'morning';
   const workDate = payload.workDate ? new Date(payload.workDate) : new Date();
   if (Number.isNaN(workDate.getTime())) {
     throw new ApiError(400, 'Work date is not valid');
@@ -619,25 +618,23 @@ async function completeStage(user, payload) {
   }
 
   const createdLots = [];
-  const outputLot = await createShiftLot({
+  const outputLot = await createEntryLot({
     order,
     item,
     stage,
     category: INVENTORY_CATEGORIES.OUTPUT,
     qty: produced,
     unit: stats.unit,
-    shift,
     workDate,
   });
   if (outputLot) createdLots.push(outputLot);
-  const wasteLot = await createShiftLot({
+  const wasteLot = await createEntryLot({
     order,
     item,
     stage,
     category: INVENTORY_CATEGORIES.WASTE,
     qty: wasteQty,
     unit: sameUnit(pickup.unit, stats.unit) ? stats.unit : pickup.unit || stats.unit,
-    shift,
     workDate,
   });
   if (wasteLot) createdLots.push(wasteLot);
@@ -651,7 +648,6 @@ async function completeStage(user, payload) {
     inputQty,
     outputQty: produced,
     wasteQty,
-    shift,
     workDate,
     notes: String(payload.notes || '').trim(),
     fromStage: pickup.fromStage || '',
@@ -665,7 +661,7 @@ async function completeStage(user, payload) {
     wasteLot: wasteLot?._id || null,
     completedAt: new Date(),
   };
-  if (stage === 'printing' && wasteQty && !workRow.details.wastage) {
+  if (wasteQty && !workRow.details.wastage) {
     workRow.details.wastage = String(wasteQty);
   }
   item.stageWork = item.stageWork || [];
@@ -714,12 +710,10 @@ async function enterFromRegister(user, payload) {
   const wasteQty = isDeliveryStage(stage)
     ? 0
     : payload.wasteQty === undefined || payload.wasteQty === null || payload.wasteQty === ''
-      ? stage === 'printing'
-        ? num(bookWaste)
-        : 0
+      ? num(bookWaste)
       : num(payload.wasteQty);
   const givenInput = !(payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === '');
-  if (stage === 'printing') {
+  if (!isDeliveryStage(stage)) {
     const wastageText = bookWaste == null ? '' : String(bookWaste).trim();
     if (wastageText !== '' && !Number.isFinite(Number(wastageText))) {
       throw new ApiError(400, 'Enter wastage as a number');
@@ -734,7 +728,9 @@ async function enterFromRegister(user, payload) {
 
   if (isDeliveryStage(stage)) {
     const lots = await listSourceLots(order, item, stage);
-    const match = chooseLot(lots, payload, outputQty);
+    const preferred = lots.find((lot) => lot.id === String(payload.lotId || '')) || lots[0];
+    const needed = preferred && !sameUnit(preferred.unit, stats.unit) ? num(payload.inputQty) : outputQty;
+    const match = chooseLot(lots, payload, needed);
     const lot = await itemRepo.findById(match.id);
     const prev = previousStage(item.productionRoute, stage);
     return sendDelivery(user, { order, item, stage, lot, qty: outputQty, prev, payload });
@@ -782,7 +778,6 @@ async function enterFromRegister(user, payload) {
     inputQty,
     outputQty,
     wasteQty,
-    shift: payload.shift,
     workDate: payload.workDate,
     notes: payload.notes,
     vehicleNumber: payload.vehicleNumber,
@@ -958,8 +953,10 @@ async function updateEntry(user, payload) {
   const matching = !delivery && sameUnit(sourceUnit, stats.unit);
   const givenInput = !(payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === '');
   let inputQty;
-  if (delivery) inputQty = outputQty;
-  else if (matching) inputQty = outputQty + wasteQty;
+  if (delivery) {
+    const deliveryMatching = sameUnit(sourceUnit, stats.unit);
+    inputQty = deliveryMatching ? outputQty : givenInput ? num(payload.inputQty) : oldIn;
+  } else if (matching) inputQty = outputQty + wasteQty;
   else inputQty = givenInput ? num(payload.inputQty) : oldIn;
   if (inputQty <= 0) throw new ApiError(400, 'Enter how much was used');
 
@@ -1005,7 +1002,7 @@ async function updateEntry(user, payload) {
           await itemRepo.addQuantity(outputLot._id, dOut);
           undo.push(() => itemRepo.takeQuantity(outputLot._id, dOut));
         } else {
-          outputLot = await createShiftLot({ order, item, stage, category: INVENTORY_CATEGORIES.OUTPUT, qty: dOut, unit: stats.unit, shift: row.shift, workDate });
+          outputLot = await createEntryLot({ order, item, stage, category: INVENTORY_CATEGORIES.OUTPUT, qty: dOut, unit: stats.unit, workDate });
           if (outputLot) created.push(outputLot);
           row.outputLot = outputLot?._id || null;
         }
@@ -1024,14 +1021,13 @@ async function updateEntry(user, payload) {
           await itemRepo.addQuantity(wasteLot._id, dWaste);
           undo.push(() => itemRepo.takeQuantity(wasteLot._id, dWaste));
         } else {
-          wasteLot = await createShiftLot({
+          wasteLot = await createEntryLot({
             order,
             item,
             stage,
             category: INVENTORY_CATEGORIES.WASTE,
             qty: dWaste,
             unit: matching ? stats.unit : sourceUnit || stats.unit,
-            shift: row.shift,
             workDate,
           });
           if (wasteLot) created.push(wasteLot);
@@ -1044,7 +1040,6 @@ async function updateEntry(user, payload) {
     row.outputQty = outputQty;
     row.wasteQty = wasteQty;
     row.workDate = workDate;
-    if (SHIFT_IDS.includes(payload.shift)) row.shift = payload.shift;
     if (machine) {
       row.machine = machine._id;
       row.machineName = `${machine.name}${machine.code ? ` (${machine.code})` : ''}`;
@@ -1057,7 +1052,7 @@ async function updateEntry(user, payload) {
     }
     if (payload.details && typeof payload.details === 'object') {
       row.details = buildDetails(order, item, stage, payload.details);
-      if (stage === 'printing' && wasteQty && !row.details.wastage) row.details.wastage = String(wasteQty);
+      if (!delivery && wasteQty && !row.details.wastage) row.details.wastage = String(wasteQty);
     }
     item.markModified('stageWork');
     item.currentStage = activeStage(item);

@@ -162,30 +162,38 @@ async function updateCustomer(id, payload) {
   return toPublicCustomer(updated);
 }
 
-async function attachProductsFromOrder(customerId, items) {
+// New products are added on every save; `refresh` (used on submit) also updates products already saved.
+async function attachProductsFromOrder(customerId, items, { refresh = false } = {}) {
   if (!customerId || !Array.isArray(items) || !items.length) return;
 
   const customer = await customerRepo.findById(customerId);
   if (!customer) return;
 
-  const existing = [...(customer.products || [])];
-  const known = new Set(existing.map(productKey).filter(Boolean));
+  const existing = [...(customer.products || [])].map((product) => (product?.toObject ? product.toObject() : product));
+  const known = new Map(existing.map((product, index) => [productKey(product), index]).filter(([key]) => key));
   let changed = false;
 
   for (const item of items) {
     const name = String(item?.product || '').trim();
     if (!name) continue;
     const key = productKey(item);
-    if (!key || known.has(key)) continue;
+    if (!key || (known.has(key) && !refresh)) continue;
 
     const { normalizeItem } = require('../salesOrder/salesOrder.service');
-    const spec = normalizeItem(item);
+    const plain = item?.toObject ? item.toObject() : item;
+    const spec = normalizeItem(plain);
     delete spec.currentStage;
     delete spec.stageWork;
+    delete spec.stagePickup;
     delete spec.amount;
     delete spec._id;
-    existing.push(spec);
-    known.add(key);
+    if (known.has(key)) {
+      const index = known.get(key);
+      existing[index] = { ...spec, _id: existing[index]._id };
+    } else {
+      existing.push(spec);
+      known.set(key, existing.length - 1);
+    }
     changed = true;
   }
 

@@ -118,14 +118,13 @@ function stageStats(item, stage) {
     const before = stageStats(item, prev);
     done = before.done && before.output > 0 && input + EPS >= before.output && !holding;
   }
-  if (!done && !prev && target <= 0) {
-    // No weight target: rolling stays open until the next stage has made its full quantity.
+  if (!done && !prev) {
+    // The first stage also closes once the next stage has made its full quantity, even if it came in under target.
     const following = nextStage(item.productionRoute, stage);
     const followingTarget = following && following !== 'completed' ? stageTarget(item, following) : 0;
-    done =
-      output > 0 &&
-      !holding &&
-      (!following || following === 'completed' || (followingTarget > 0 && sumWork(item, following, 'outputQty') + EPS >= followingTarget));
+    const followingDone = followingTarget > 0 && sumWork(item, following, 'outputQty') + EPS >= followingTarget;
+    const noFollowing = !following || following === 'completed';
+    done = output > 0 && !holding && (target <= 0 ? noFollowing || followingDone : followingDone);
   }
 
   return {
@@ -223,6 +222,7 @@ function previousOutput(item, stage) {
   const stats = stageStats(item, prev);
   return {
     stage: prev,
+    unit: stats.unit,
     outputQty: stats.output,
     availableQty: availableFromPrevious(item, stage),
     wasteQty: stats.waste,
@@ -244,7 +244,7 @@ function registerSpecs(order, item, stage) {
       jobSize: item.size || '',
       impression: item.printing?.impressions || '',
       colorUsed: item.printing?.colors || item.color || '',
-      artwork: item.printing?.artwork || item.printing?.design || '',
+      artwork: item.printing?.artwork || item.printing?.requirement || item.printing?.design || '',
     };
   }
   if (stage === 'cutting') {
@@ -278,15 +278,13 @@ function stageRequirements(order, item, stage) {
   if (stage === 'rolling') {
     return {
       ...common,
-      material: item.material || '',
+      material: item.material || item.manufacturing?.rawMaterial || '',
       thickness: item.thickness || item.manufacturing?.thickness || '',
-      rawMaterial: item.manufacturing?.rawMaterial || '',
       materialType: item.manufacturing?.materialType || '',
       materialGrade: item.manufacturing?.materialGrade || '',
       requiredWeight: item.manufacturing?.requiredWeight || '',
-      requiredQuantity: item.manufacturing?.requiredQuantity || '',
-      width: item.manufacturing?.width || item.width || '',
-      length: item.manufacturing?.length || item.length || '',
+      width: item.width || item.manufacturing?.width || '',
+      length: item.length || item.manufacturing?.length || '',
       additives: item.manufacturing?.additives || '',
       roll: item.roll || {},
       specialRequirements: item.manufacturing?.specialRequirements || '',

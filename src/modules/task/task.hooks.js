@@ -7,7 +7,7 @@ const {
   TASK_STATUSES,
 } = require('../../config/constants');
 const { nextTaskNumber } = require('../../utils/counter');
-const { itemVisibleAtStage, routeStages } = require('../production/production.flow');
+const { itemVisibleAtStage, routeStages, stageTarget, stageUnit } = require('../production/production.flow');
 const taskRepo = require('./task.repo');
 
 const STAGE_ROLES = {
@@ -70,13 +70,15 @@ function needsPayment(order) {
 }
 
 // One task per item per station that currently shows the item in its floor queue, so lots worked in parallel each get a task.
-function stageSpecs(order) {
+// A job work's first station waits until the customer's material is in inventory.
+function stageSpecs(order, materialIn) {
   const specs = [];
   (order.items || []).forEach((item, index) => {
     const stages = routeStages(item.productionRoute);
     const product = item.product || item.productCode || '';
     stages.forEach((stage, position) => {
       if (!STAGE_ROLES[stage] || !itemVisibleAtStage(item, stage, order.status)) return;
+      if (position === 0 && isJobWork(order) && !materialIn && !(item.stageWork || []).length) return;
       specs.push({
         key: `${order._id}:${TASK_CATEGORIES.STAGE_WORK}:${item._id}:${stage}`,
         category: TASK_CATEGORIES.STAGE_WORK,
@@ -85,8 +87,8 @@ function stageSpecs(order) {
         itemId: String(item._id),
         itemIndex: index,
         itemLabel: product,
-        quantity: Number(item.quantity) || null,
-        unit: item.unit || '',
+        quantity: stageTarget(item, stage) || null,
+        unit: stageUnit(item, stage),
         stage,
         dueDate: beforeDelivery(order, stages.length - 1 - position, 2),
         item,
@@ -190,7 +192,7 @@ function desiredTasks(order, openTasks, options) {
   }
 
   if (FLOOR_STATUSES.includes(order.status)) {
-    specs.push(...stageSpecs(order));
+    specs.push(...stageSpecs(order, options.materialIn));
     if (order.status === SALES_ORDER_STATUSES.READY_FOR_DISPATCH) {
       add(TASK_CATEGORIES.DISPATCH, {
         title: `Dispatch ${number}`,

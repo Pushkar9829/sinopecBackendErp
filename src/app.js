@@ -20,6 +20,8 @@ const analyticsRoutes = require('./modules/analytics/analytics.routes');
 const mediaRoutes = require('./modules/media/media.routes');
 const auditRoutes = require('./modules/audit/audit.routes');
 const taskRoutes = require('./modules/task/task.routes');
+const rateCalculatorRoutes = require('./modules/rateCalculator/rateCalculator.routes');
+const intakeRoutes = require('./modules/intake/intake.routes');
 const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
@@ -54,7 +56,16 @@ app.use(
   })
 );
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '8mb' }));
+app.use(
+  express.json({
+    limit: '8mb',
+    verify(req, _res, buf) {
+      if (req.originalUrl.split('?')[0] === '/api/intake/whatsapp') {
+        req.rawBody = buf;
+      }
+    },
+  })
+);
 app.use(cookieParser());
 app.use(
   '/uploads',
@@ -91,6 +102,8 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/audit-logs', auditRoutes);
 app.use('/api/tasks', taskRoutes);
+app.use('/api/rate-calculator', rateCalculatorRoutes);
+app.use('/api/intake', intakeRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));

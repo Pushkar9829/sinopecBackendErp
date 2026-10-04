@@ -23,16 +23,12 @@ function stageFields(order, item, stage) {
   if (stage === 'rolling') {
     return [
       field('size', 'Size', item.size),
-      field('thickness', 'Thickness', m.thickness || item.thickness),
+      field('thickness', 'Gauge', m.thickness || item.thickness),
       field('colour', 'Colour', m.color || item.color),
-      field('material', 'Material', item.material),
-      field('rawMaterial', 'Raw material', m.rawMaterial),
+      field('material', 'Material', item.material || m.rawMaterial),
       field('materialType', 'Material type', m.materialType),
       field('grade', 'Grade', m.materialGrade),
       field('requiredWeight', 'Required weight', m.requiredWeight),
-      field('requiredQuantity', 'Required quantity', m.requiredQuantity),
-      field('width', 'Width', m.width || item.width),
-      field('length', 'Length', m.length || item.length),
       field('rollSize', 'Roll size', rollSize),
       field('rollWeight', 'Roll weight', roll.weight),
       field('additives', 'Additives', m.additives),
@@ -43,16 +39,14 @@ function stageFields(order, item, stage) {
     return [
       field('jobSize', 'Job size', item.size),
       field('colours', 'Print colours', print.colors),
-      field('colourCount', 'No. of colours', print.colorCount),
       field('impression', 'Impression', print.impressions),
-      field('artwork', 'Artwork', print.artwork),
+      field('artwork', 'Print note', [print.artwork, print.requirement].filter(Boolean).join('; ')),
       field('design', 'Design', print.design),
-      field('requirement', 'Print requirement', print.requirement),
       field('rollSize', 'Roll size', rollSize),
       field('baseColour', 'Film colour', item.color || m.color),
-      field('thickness', 'Thickness', m.thickness || item.thickness),
+      field('thickness', 'Gauge', m.thickness || item.thickness),
       field('available', 'Ready from previous stage', available),
-      field('special', 'Special requirements', print.specialRequirements || m.specialRequirements, { long: true }),
+      field('special', 'Special requirements', m.specialRequirements || print.specialRequirements, { long: true }),
     ];
   }
   if (stage === 'cutting') {
@@ -64,9 +58,9 @@ function stageFields(order, item, stage) {
       field('tape', 'Tape', tape.required ? tape.type || 'Yes' : 'No'),
       field('printed', 'Printed', print.required ? words(print.colors, print.design && `(${print.design})`) || 'Yes' : 'No'),
       field('rollSize', 'Roll size', rollSize),
-      field('thickness', 'Thickness', m.thickness || item.thickness),
+      field('thickness', 'Gauge', m.thickness || item.thickness),
       field('available', 'Ready from previous stage', available),
-      field('special', 'Special requirements', holes.specialRequirements || m.specialRequirements, { long: true }),
+      field('special', 'Special requirements', m.specialRequirements || holes.specialRequirements, { long: true }),
     ];
   }
   return [];

@@ -30,6 +30,7 @@ const {
 } = require('../production/production.flow');
 const { uploadBuffer, deleteStoredObject } = require('../../utils/storage');
 const salesOrderRepo = require('./salesOrder.repo');
+const rateCalculator = require('../rateCalculator/rateCalculator.service');
 const taskHooks = require('../task/task.hooks');
 
 const ROUTE_IDS = Object.values(PRODUCTION_ROUTES);
@@ -114,7 +115,6 @@ function toPublicWork(row) {
     inputQty: row.inputQty || 0,
     outputQty: row.outputQty || 0,
     wasteQty: row.wasteQty || 0,
-    shift: row.shift || '',
     workDate: row.workDate || row.completedAt,
     notes: row.notes || '',
     fromStage: row.fromStage || '',
@@ -181,6 +181,17 @@ function normalizeImages(raw, { strict = false } = {}) {
   return images.slice(0, 20);
 }
 
+function rollingFor(item) {
+  return rateCalculator.rolling({
+    width: item.width || item.manufacturing?.width,
+    length: item.length || item.manufacturing?.length,
+    gauge: item.thickness || item.manufacturing?.thickness,
+    materialRate: item.manufacturing?.materialRate,
+    quantity: item.quantity,
+    unit: item.unit,
+  });
+}
+
 function toPublicItem(item) {
   return {
     id: String(item._id),
@@ -207,6 +218,7 @@ function toPublicItem(item) {
       materialGrade: item.manufacturing?.materialGrade || '',
       requiredWeight: item.manufacturing?.requiredWeight || '',
       requiredQuantity: item.manufacturing?.requiredQuantity || '',
+      materialRate: item.manufacturing?.materialRate || '',
       width: item.manufacturing?.width || '',
       length: item.manufacturing?.length || '',
       thickness: item.manufacturing?.thickness || '',
@@ -214,6 +226,7 @@ function toPublicItem(item) {
       additives: item.manufacturing?.additives || '',
       specialRequirements: item.manufacturing?.specialRequirements || '',
     },
+    rolling: rollingFor(item),
     roll: {
       width: item.roll?.width || '',
       length: item.roll?.length || '',
@@ -358,6 +371,15 @@ function stripCommercial(order) {
     delete copy.discount;
     delete copy.taxPercent;
     delete copy.amount;
+    if (copy.manufacturing) {
+      copy.manufacturing = { ...copy.manufacturing };
+      delete copy.manufacturing.materialRate;
+    }
+    if (copy.rolling) {
+      copy.rolling = { ...copy.rolling };
+      delete copy.rolling.materialPer1000;
+      delete copy.rolling.totalMaterial;
+    }
     return copy;
   });
   return next;
@@ -429,6 +451,65 @@ function normalizeGroup(source = {}, fields) {
   return result;
 }
 
+function productSize(width, length) {
+  const size = combinedSize(width, length);
+  const plain = /^\d+(\.\d+)?$/;
+  return plain.test(str(width)) && plain.test(str(length)) ? `${size} inch` : size;
+}
+
+function impressionColours(impressions) {
+  const match = str(impressions).match(/\d+(?:\s*\+\s*\d+)+/);
+  if (!match) return 0;
+  return match[0].split('+').reduce((sum, part) => sum + Number(part), 0);
+}
+
+// Specs entered once on the product are copied to every stage that reads them.
+function shareProductSpecs(item) {
+  const { manufacturing, bag, roll, printing, holes } = item;
+  item.material = item.material || manufacturing.rawMaterial;
+  manufacturing.rawMaterial = item.material;
+  printing.artwork = printing.artwork || printing.requirement;
+  printing.requirement = '';
+  const colours = impressionColours(printing.impressions);
+  printing.colorCount = colours ? String(colours) : '';
+  const special = manufacturing.specialRequirements || printing.specialRequirements || holes.specialRequirements;
+  manufacturing.specialRequirements = special;
+  printing.specialRequirements = special;
+  holes.specialRequirements = special;
+  item.width = item.width || manufacturing.width || bag.width;
+  item.length = item.length || manufacturing.length || bag.length;
+  item.thickness = item.thickness || manufacturing.thickness;
+  item.color = item.color || manufacturing.color;
+  if (item.width || item.length) item.size = productSize(item.width, item.length);
+  manufacturing.width = item.width;
+  manufacturing.length = item.length;
+  manufacturing.thickness = item.thickness;
+  manufacturing.color = item.color;
+  if (item.quantity > 0) manufacturing.requiredQuantity = `${item.quantity} ${item.unit}`.trim();
+  bag.width = item.width;
+  bag.length = item.length;
+  bag.size = productSize(bag.width, bag.length) || item.size;
+  if (!roll.width) roll.width = item.width;
+  roll.size = combinedSize(roll.width, roll.length);
+  clearUnusedStages(item);
+}
+
+function clearUnusedStages(item) {
+  const stages = routeStages(item.productionRoute);
+  if (stages[0] !== 'rolling') {
+    Object.assign(item.manufacturing, { materialType: '', materialGrade: '', requiredWeight: '', materialRate: '', additives: '' });
+    Object.assign(item.roll, { width: '', length: '', weight: '', size: '' });
+  }
+  if (!stages.includes('printing')) {
+    Object.assign(item.printing, { required: false, artwork: '', impressions: '', colorCount: '', colors: '', design: '' });
+  }
+  if (!stages.includes('cutting')) {
+    item.bag.gusset = '';
+    Object.assign(item.holes, { required: false, count: '', type: '', size: '', position: '' });
+    Object.assign(item.tape, { required: false, type: '' });
+  }
+}
+
 function normalizeItem(raw = {}) {
   const productionRoute = str(raw.productionRoute);
   if (!ROUTE_IDS.includes(productionRoute)) {
@@ -441,6 +522,7 @@ function normalizeItem(raw = {}) {
     'materialGrade',
     'requiredWeight',
     'requiredQuantity',
+    'materialRate',
     'width',
     'length',
     'thickness',
@@ -518,6 +600,9 @@ function normalizeItem(raw = {}) {
     throw new ApiError(400, `Line discount on ${item.product || 'a product'} is more than its value`);
   }
   item.amount = calcLine(item).amount;
+  shareProductSpecs(item);
+  const rolling = rollingFor(item);
+  if (routeStages(productionRoute)[0] === 'rolling' && rolling.totalWeight > 0) item.manufacturing.requiredWeight = String(rolling.totalWeight);
   const rawId = raw._id || raw.id;
   if (rawId && mongoose.isValidObjectId(rawId)) item._id = rawId;
   return item;
@@ -526,7 +611,9 @@ function normalizeItem(raw = {}) {
 function normalizeItems(rawItems, orderType = ORDER_TYPES.SALES_ORDER) {
   if (!Array.isArray(rawItems)) throw new ApiError(400, 'Items must be a list of products');
   const seen = new Set();
-  return rawItems.map((raw) => {
+  const blank = (raw) =>
+    !str(raw?.product) && !str(raw?.productCode) && !(num(raw?.quantity) > 0) && !(raw?.stageWork || []).length;
+  return rawItems.filter((raw) => !blank(raw)).map((raw) => {
     const item = normalizeItem(raw);
     if (ROUTE_BY_ID.get(item.productionRoute)?.orderType !== orderType) {
       throw new ApiError(
@@ -638,37 +725,34 @@ function assertDraftComplete(items) {
   }
 }
 
+// Lists every gap at once so the order can be fixed in one pass.
 function assertReadyToSubmit(order) {
-  if (!order.deliveryDate) {
-    throw new ApiError(400, 'Delivery date is required before submit');
-  }
-  if (!order.items.length) {
-    throw new ApiError(400, 'Add at least one product before submit');
-  }
+  const problems = [];
+  if (!order.deliveryDate) problems.push('Delivery date is required before submit');
+  if (!order.items.length) problems.push('Add at least one product before submit');
   order.items.forEach((item, index) => {
-    const n = index + 1;
-    if (!item.product) throw new ApiError(400, `Product name is required on line ${n}`);
-    if (!item.productCode) throw new ApiError(400, `Product code is required on line ${n}`);
-    if (!item.productType) throw new ApiError(400, `Product type is required on line ${n}`);
-    if (!item.size) throw new ApiError(400, `Size is required on line ${n}`);
-    if (!item.material) throw new ApiError(400, `Material is required on line ${n}`);
-    if (!item.quantity) throw new ApiError(400, `Quantity is required on line ${n}`);
-    if (!item.unit) throw new ApiError(400, `Unit is required on line ${n}`);
-    if (item.rate < 0) throw new ApiError(400, `Rate is invalid on line ${n}`);
-    if (!item.manufacturing?.rawMaterial) {
-      throw new ApiError(400, `Raw material is required on line ${n}`);
-    }
+    const missing = [];
+    if (!item.product) missing.push('product name');
+    if (!item.productCode) missing.push('product code');
+    if (!item.productType) missing.push('product type');
+    if (!str(item.width) || !str(item.length)) missing.push('width and length');
+    if (!item.material) missing.push('material');
+    if (!item.quantity) missing.push('quantity');
+    if (!item.unit) missing.push('unit');
     if (
       routeStages(item.productionRoute)[0] === 'rolling' &&
       String(item.unit || '').toLowerCase() !== 'kg' &&
       !(Number(String(item.manufacturing?.requiredWeight || '').replace(/,/g, '').match(/\d+(\.\d+)?/)?.[0]) > 0)
     ) {
-      throw new ApiError(400, `Required weight (kg) is needed on line ${n} so rolling knows when it is finished`);
+      missing.push('required weight (kg), so rolling knows when it is finished');
     }
     if (routeHasPrint(item.productionRoute) && !item.printing?.colorCount && !item.printing?.colors) {
-      throw new ApiError(400, `Printing colors are required on line ${n}`);
+      missing.push('an impression (like 1+1) or printing colours');
     }
+    if (item.rate < 0) missing.push('a valid rate');
+    if (missing.length) problems.push(`Line ${index + 1} (${item.product || 'unnamed'}) needs ${missing.join(', ')}`);
   });
+  if (problems.length) throw new ApiError(400, problems.join('\n'));
 }
 
 async function getOrderOrThrow(id) {
@@ -841,6 +925,9 @@ async function submitOrder(user, id) {
   order.status = SALES_ORDER_STATUSES.SUBMITTED;
   order.submittedAt = new Date();
   await salesOrderRepo.save(order);
+  await attachProductsFromOrder(order.customer?._id || order.customer, order.items, { refresh: true }).catch((error) =>
+    console.error('Updating customer products after submit failed', error.message)
+  );
   return presentAfterSync(order, user);
 }
 

@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
-const { DeleteObjectCommand, PutObjectCommand, S3Client } = require('@aws-sdk/client-s3');
+const { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } = require('@aws-sdk/client-s3');
 const env = require('../config/env');
 
 function safeExt(originalName = '') {
@@ -95,9 +95,22 @@ async function deleteStoredObject(key, storage = 's3') {
   await fs.promises.unlink(absolute).catch(() => {});
 }
 
+async function readStoredObject(key, storage = 'local') {
+  if (!key) return null;
+  if (storage === 's3') {
+    const client = createS3Client();
+    if (!client) return null;
+    const out = await client.send(new GetObjectCommand({ Bucket: env.s3.bucket, Key: key }));
+    const bytes = await out.Body.transformToByteArray();
+    return Buffer.from(bytes);
+  }
+  return fs.readFileSync(path.join(env.uploadsDir, key));
+}
+
 module.exports = {
   uploadBuffer,
   deleteStoredObject,
+  readStoredObject,
   publicUrlForKey,
   isS3Enabled: () => env.s3.enabled,
 };

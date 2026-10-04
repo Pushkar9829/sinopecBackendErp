@@ -4,7 +4,9 @@ const { COOKIES } = require('../config/constants');
 const { verifyAccessToken } = require('../utils/tokens');
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const SKIPPED = new Set(['/api/auth/refresh']);
+const SKIPPED = new Set(['/api/auth/refresh', '/api/intake/whatsapp']);
+// Calculations change nothing and run on every keystroke.
+const SKIPPED_PREFIXES = ['/api/rate-calculator/'];
 
 const MODULE_LABELS = {
   auth: 'Login',
@@ -20,6 +22,7 @@ const MODULE_LABELS = {
   registers: 'Registers',
   media: 'Files',
   tasks: 'Tasks',
+  intake: 'Draft orders',
 };
 
 const MODELS = {
@@ -179,7 +182,7 @@ async function writeLog(req, res, target, before, responseBody) {
 
 function auditTrail(req, res, next) {
   const path = req.originalUrl.split('?')[0];
-  if (!MUTATING.has(req.method) || SKIPPED.has(path)) return next();
+  if (!MUTATING.has(req.method) || SKIPPED.has(path) || SKIPPED_PREFIXES.some((prefix) => path.startsWith(prefix))) return next();
 
   const target = resolveTarget(req);
   let responseBody;

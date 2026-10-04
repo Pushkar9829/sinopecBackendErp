@@ -171,12 +171,6 @@ const TASK_CATEGORIES = {
 
 const DEMO_PASSWORD = 'Demo@1234';
 
-const PRODUCTION_SHIFTS = [
-  { id: 'morning', label: 'Morning' },
-  { id: 'afternoon', label: 'Afternoon' },
-  { id: 'night', label: 'Night' },
-];
-
 const DELIVERY_PARTNERS = ['In-house', 'Delhivery', 'Customer'];
 
 const INVENTORY_CATEGORIES = {
@@ -316,8 +310,8 @@ const SALES_OPTION_GROUPS = [
   { id: 'productType', label: 'Product type' },
   { id: 'material', label: 'Material' },
   { id: 'unit', label: 'Unit' },
-  { id: 'color', label: 'Color' },
-  { id: 'thickness', label: 'Thickness' },
+  { id: 'color', label: 'Colour' },
+  { id: 'thickness', label: 'Gauge' },
   { id: 'size', label: 'Size' },
   { id: 'width', label: 'Width' },
   { id: 'length', label: 'Length' },
@@ -341,11 +335,9 @@ const DEFAULT_SALES_OPTIONS = {
   material: ['HDPE', 'LDPE', 'LLDPE', 'PP', 'HM'],
   unit: ['pcs', 'kg', 'roll', 'm'],
   color: ['Red', 'Black', 'Green', 'Golden', 'Yellow', 'Blue', 'White', 'Natural'],
-  thickness: ['40 micron', '50 micron', '60 micron', '75 micron'],
-  size: ['10 × 14 inch', '12 × 16 inch', '20 × 30 inch', '25 × 35 inch'],
+  thickness: ['100', '150', '200', '250', '300'],
   width: ['10 inch', '12 inch', '20 inch', '25 inch', '500 mm'],
   length: ['14 inch', '16 inch', '30 inch', '35 inch', '800 m', '1000 m'],
-  rawMaterial: ['HDPE granules', 'LDPE granules', 'PP granules'],
   materialType: [
     'LD - Plain',
     'LD - BST',
@@ -453,7 +445,6 @@ module.exports = {
   DEFAULT_STAGES,
   PRODUCTION_ROUTES,
   PRODUCTION_ROUTE_LIST,
-  PRODUCTION_SHIFTS,
   DELIVERY_PARTNERS,
   SALES_ORDER_STATUSES,
   SALES_ORDER_STATUS_FLOW,
