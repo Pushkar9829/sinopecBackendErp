@@ -15,7 +15,7 @@ const fileSchema = new mongoose.Schema(
 const intakeSchema = new mongoose.Schema(
   {
     number: { type: String, required: true, unique: true, trim: true },
-    channel: { type: String, enum: ['whatsapp', 'gmail', 'paste'], required: true },
+    channel: { type: String, enum: ['whatsapp', 'gmail', 'panel', 'paste'], required: true },
     providerMessageId: { type: String, required: true, trim: true },
     sender: {
       phone: { type: String, default: '', trim: true },
@@ -36,6 +36,9 @@ const intakeSchema = new mongoose.Schema(
     },
     error: { type: String, default: '' },
     receivedAt: { type: Date, default: Date.now },
+    createdBy: { type: String, default: '', trim: true },
+    editedBy: { type: String, default: '', trim: true },
+    editedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

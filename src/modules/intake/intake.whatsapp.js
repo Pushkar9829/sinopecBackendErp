@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { uploadBuffer } = require('../../utils/storage');
 const { getSettings } = require('./intake.settings');
 const { createDraft } = require('./intake.service');
+const { parseKeywords, findKeywords } = require('./intake.keywords');
 
 function signaturesMatch(rawBody, header, secret) {
   if (!rawBody || !header || !secret) return false;
@@ -56,12 +57,19 @@ async function storeMessage(message, contactName, settings) {
   }
 
   const body = messageText(message);
+  const searchable = [body, message.document?.filename || ''].join('\n');
+  const matched = findKeywords(searchable, parseKeywords(settings.orderKeywords));
+  const isDocument = message.type === 'document' || message.type === 'image';
+  const potentialOrder = matched.length > 0 || (isDocument && files.length > 0 && !body.trim());
   const result = await createDraft({
     channel: 'whatsapp',
     providerMessageId: message.id,
     sender: { phone: message.from || '', email: '', name: contactName || '' },
     rawBody: body,
     files,
+    potentialOrder,
+    matchedKeywords: matched,
+    status: potentialOrder ? 'received' : 'stored',
     warnings,
     receivedAt: message.timestamp ? new Date(Number(message.timestamp) * 1000) : new Date(),
   });

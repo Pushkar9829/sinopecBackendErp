@@ -93,7 +93,13 @@ async function callGemini(settings, parts) {
   }
 }
 
-function normalizeProposal(raw, extraWarnings) {
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(String(value).replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeProposal(raw, extraWarnings = []) {
   const base = emptyProposal(extraWarnings);
   const customer = raw?.customer && typeof raw.customer === 'object' ? raw.customer : {};
   base.customer = {
@@ -108,9 +114,9 @@ function normalizeProposal(raw, extraWarnings) {
   base.lines = Array.isArray(raw?.lines)
     ? raw.lines.map((line) => ({
         product: String(line?.product || ''),
-        quantity: line?.quantity === null || line?.quantity === undefined || line?.quantity === '' ? null : Number(line.quantity),
+        quantity: numberOrNull(line?.quantity),
         unit: String(line?.unit || ''),
-        rate: line?.rate === null || line?.rate === undefined || line?.rate === '' ? null : Number(line.rate),
+        rate: numberOrNull(line?.rate),
         material: String(line?.material || ''),
         width: String(line?.width || ''),
         length: String(line?.length || ''),
@@ -277,4 +283,5 @@ async function readIntake(doc) {
 
 module.exports = {
   readIntake,
+  normalizeProposal,
 };

@@ -24,8 +24,36 @@ const saveSettingsView = asyncHandler(async (req, res) => {
 });
 
 const paste = asyncHandler(async (req, res) => {
-  const draft = await intakeService.pasteDraft(req.body?.text);
+  const draft = await intakeService.pasteDraft(req.body?.text, req.user);
   res.status(201).json({ success: true, data: draft });
+});
+
+const createPanel = asyncHandler(async (req, res) => {
+  const draft = await intakeService.createPanelDraft(req.body || {}, req.user);
+  res.status(201).json({ success: true, data: draft });
+});
+
+const readPanel = asyncHandler(async (req, res) => {
+  const sender = {
+    name: req.body?.senderName,
+    phone: req.body?.senderPhone,
+    email: req.body?.senderEmail,
+  };
+  const draft = await intakeService.readPanelDraft({ text: req.body?.text, sender }, req.files || [], req.user);
+  res.status(201).json({ success: true, data: draft });
+});
+
+const saveProposal = asyncHandler(async (req, res) => {
+  const draft = await intakeService.updateProposal(req.params.id, req.body || {}, req.user);
+  res.json({ success: true, data: draft });
+});
+
+const markPotential = asyncHandler(async (req, res) => {
+  res.json({ success: true, data: await intakeService.markPotential(req.params.id) });
+});
+
+const markNotOrder = asyncHandler(async (req, res) => {
+  res.json({ success: true, data: await intakeService.markNotOrder(req.params.id) });
 });
 
 const reread = asyncHandler(async (req, res) => {
@@ -78,6 +106,11 @@ module.exports = {
   getSettingsView,
   saveSettingsView,
   paste,
+  createPanel,
+  readPanel,
+  saveProposal,
+  markPotential,
+  markNotOrder,
   reread,
   discard,
   whatsappWebhook,
