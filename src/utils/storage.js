@@ -45,6 +45,7 @@ function buildKey(folder, originalName) {
 
 function createS3Client() {
   if (!env.s3.enabled) return null;
+  if (!env.s3.accessKeyId) return new S3Client({ region: env.s3.region });
   return new S3Client({
     region: env.s3.region,
     credentials: {

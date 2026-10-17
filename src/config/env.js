@@ -52,11 +52,12 @@ const env = {
   isProd: process.env.NODE_ENV === 'production',
   uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, '../../uploads'),
   s3: {
+    // With access keys, or with none on a server that has an IAM role
+    // (AWS_USE_INSTANCE_ROLE=1): the SDK then reads the role's credentials.
     enabled: Boolean(
-      process.env.AWS_ACCESS_KEY_ID &&
-        process.env.AWS_SECRET_ACCESS_KEY &&
-        process.env.AWS_REGION &&
-        process.env.S3_BUCKET
+      process.env.AWS_REGION &&
+        process.env.S3_BUCKET &&
+        ((process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) || process.env.AWS_USE_INSTANCE_ROLE === '1')
     ),
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
