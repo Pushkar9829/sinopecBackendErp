@@ -23,6 +23,7 @@ const rateCalculatorRoutes = require('./modules/rateCalculator/rateCalculator.ro
 const intakeRoutes = require('./modules/intake/intake.routes');
 const companyRoutes = require('./modules/company/company.routes');
 const supplierRoutes = require('./modules/supplier/supplier.routes');
+const billingRoutes = require('./modules/billing/billing.routes');
 const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
@@ -109,6 +110,7 @@ app.use('/api/rate-calculator', rateCalculatorRoutes);
 app.use('/api/intake', intakeRoutes);
 app.use('/api/company-settings', companyRoutes);
 app.use('/api/suppliers', supplierRoutes);
+app.use('/api/billing', billingRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));

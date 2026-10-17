@@ -25,6 +25,7 @@ const MODULE_LABELS = {
   intake: 'Draft orders',
   'company-settings': 'Company details',
   suppliers: 'Suppliers',
+  billing: 'Billing',
 };
 
 const MODELS = {

@@ -2317,6 +2317,8 @@ async function resetDemoCollections() {
     ProductTemplate.deleteMany({}),
     Register.deleteMany({}),
     mongoose.connection.collection('tasks').deleteMany({}),
+    mongoose.connection.collection('invoices').deleteMany({}),
+    mongoose.connection.collection('receipts').deleteMany({}),
   ]);
   await mongoose.connection.collection('counters').deleteMany({});
   console.log('Reset demo customers, orders, inventory, registers, and sales settings');
