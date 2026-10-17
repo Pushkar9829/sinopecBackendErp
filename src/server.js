@@ -3,6 +3,7 @@ const { connectDb } = require('./config/db');
 const app = require('./app');
 const { seedSystem } = require('./seeders/seed');
 const { startIntakeJobs } = require('./modules/intake/intake.jobs');
+const { startBillingJobs } = require('./modules/billing/billing.jobs');
 
 async function start() {
   await connectDb();
@@ -11,6 +12,7 @@ async function start() {
   app.listen(env.port, () => {
     console.log(`Sinopec API listening on http://localhost:${env.port}`);
     startIntakeJobs().catch((error) => console.error('Background jobs failed to start', error));
+    startBillingJobs().catch((error) => console.error('Billing jobs failed to start', error));
     require('./modules/task/task.hooks').startTaskReconciler();
   });
 }

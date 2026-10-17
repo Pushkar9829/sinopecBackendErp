@@ -344,6 +344,8 @@ function toPublicOrder(order) {
     attachments: (order.attachments || []).map(toPublicAttachment),
     sourceIntake: order.sourceIntake ? String(order.sourceIntake) : null,
     sourceIntakeNumber: order.sourceIntakeNumber || '',
+    creditCheck: order.creditCheck || null,
+    creditOverride: order.creditOverride ? { byName: order.creditOverride.byName, reason: order.creditOverride.reason, at: order.creditOverride.at } : null,
     createdBy: toPublicUser(order.createdBy),
     submittedAt: order.submittedAt,
     approvedAt: order.approvedAt,
@@ -376,6 +378,8 @@ function stripCommercial(order) {
     delete next.customer.gstNumber;
     delete next.customer.creditLimit;
   }
+  delete next.creditCheck;
+  delete next.creditOverride;
   delete next.subtotal;
   delete next.discount;
   delete next.tax;
@@ -687,6 +691,15 @@ async function creditDaysFor(value, customer) {
   if (value !== undefined && value !== null && String(value).trim() !== '') return Math.max(0, Math.round(num(value)));
   if (customer?.creditDays !== null && customer?.creditDays !== undefined) return customer.creditDays;
   return require('../company/company.service').defaultCreditDays();
+}
+
+async function creditCheckFor(order) {
+  try {
+    return await require('../billing/billing.service').creditCheck(order.customer?._id || order.customer, { orderId: order._id, orderTotal: order.grandTotal || 0 });
+  } catch (error) {
+    console.error('Credit check failed', error.message);
+    return null;
+  }
 }
 
 async function loadCustomer(customerId) {
@@ -1179,6 +1192,8 @@ async function submitOrder(user, id) {
   order.customerSnapshot = snapshotFromCustomer(customer);
   order.status = SALES_ORDER_STATUSES.SUBMITTED;
   order.submittedAt = new Date();
+  // Recorded for the approver; it never blocks the submit itself.
+  order.creditCheck = await creditCheckFor(order);
   await salesOrderRepo.save(order);
   await attachProductsFromOrder(order.customer?._id || order.customer, order.items, { refresh: true }).catch((error) =>
     console.error('Updating customer products after submit failed', error.message)
@@ -1186,13 +1201,21 @@ async function submitOrder(user, id) {
   return presentAfterSync(order, user);
 }
 
-async function approveOrder(user, id) {
+async function approveOrder(user, id, payload = {}) {
   if (!isSuperAdmin(user)) {
     throw new ApiError(403, 'Only Super Admin can approve an order');
   }
   const order = await getOrderOrThrow(id);
   if (order.status !== SALES_ORDER_STATUSES.SUBMITTED) {
     throw new ApiError(400, 'Only submitted orders can be approved');
+  }
+  // Checked again now: payments or new bills may have changed things since submit.
+  const check = await creditCheckFor(order);
+  order.creditCheck = check;
+  if (check?.status === 'hold') {
+    const reason = str(payload.creditOverrideReason);
+    if (!reason) throw new ApiError(409, `Credit hold: ${check.reasons.join('; ')}. Give a reason to approve anyway.`);
+    order.creditOverride = { byName: user.fullName || user.username || '', by: user._id, reason, at: new Date() };
   }
   order.status = SALES_ORDER_STATUSES.APPROVED;
   order.approvedAt = new Date();

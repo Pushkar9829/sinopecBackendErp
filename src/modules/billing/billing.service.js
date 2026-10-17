@@ -536,7 +536,152 @@ async function ledger(user, customerId) {
   };
 }
 
+
+// ---------------------------------------------------------------- credit control
+
+const OPEN_ORDER_STATUSES = ['submitted', 'approved', 'production_planned', 'in_production', 'ready_for_packing', 'packed', 'ready_for_dispatch', 'dispatched', 'delivered'];
+const inr = (n) => `₹${Number(n || 0).toLocaleString('en-IN')}`;
+
+// What the customer would owe if this order went ahead: unpaid bills, plus
+// orders already accepted but not billed yet, plus this order, less money
+// already paid in advance. "hold" when that passes the credit limit, or when
+// a bill is more days late than the company allows.
+async function creditCheck(customerId, { orderId = null, orderTotal = 0 } = {}) {
+  const [customer, company, account] = await Promise.all([
+    Customer.findById(customerId).select('creditLimit name').lean(),
+    companyService.getSettings(),
+    customerAccount(customerId),
+  ]);
+  const others = await SalesOrder.find({ customer: customerId, status: { $in: OPEN_ORDER_STATUSES }, ...(orderId ? { _id: { $ne: orderId } } : {}) })
+    .select('grandTotal')
+    .lean();
+  const billedByOrder = new Map();
+  const billed = await Invoice.aggregate([
+    { $match: { customer: new mongoose.Types.ObjectId(String(customerId)), status: 'issued', kind: 'sale', salesOrder: { $ne: null } } },
+    { $group: { _id: '$salesOrder', total: { $sum: '$total' } } },
+  ]);
+  for (const row of billed) billedByOrder.set(String(row._id), row.total);
+  const billedThis = orderId ? billedByOrder.get(String(orderId)) || 0 : 0;
+  const unbilled = money(others.reduce((sum, o) => sum + Math.max(0, (o.grandTotal || 0) - (billedByOrder.get(String(o._id)) || 0)), 0));
+  const exposure = money(Math.max(0, account.summary.outstanding + unbilled + Math.max(0, orderTotal - billedThis) - account.summary.advance));
+  const limit = customer?.creditLimit || 0;
+  const holdDays = company.overdueHoldDays ?? 30;
+  const reasons = [];
+  if (limit > 0 && exposure > limit + EPS) reasons.push(`Owing would reach ${inr(exposure)} against a credit limit of ${inr(limit)}`);
+  if (account.summary.oldestOverdueDays > holdDays) {
+    reasons.push(`A bill is ${account.summary.oldestOverdueDays} days overdue (${inr(account.summary.overdue)} overdue in all)`);
+  }
+  return {
+    status: reasons.length ? 'hold' : 'ok',
+    reasons,
+    exposure,
+    limit,
+    outstanding: account.summary.outstanding,
+    overdue: account.summary.overdue,
+    oldestOverdueDays: account.summary.oldestOverdueDays,
+    unbilledOrders: unbilled,
+    checkedAt: new Date(),
+  };
+}
+
+// ---------------------------------------------------------------- receivables
+
+async function receivables(user) {
+  assert(canView(user), 'You cannot see customer accounts');
+  const ids = new Set([
+    ...(await Invoice.distinct('customer', { status: 'issued' })).map(String),
+    ...(await Receipt.distinct('customer', { voidedAt: null })).map(String),
+  ]);
+  const customers = await Customer.find({ _id: { $in: [...ids] } }).select('code name companyName creditLimit creditDays mobile').lean();
+  const rows = [];
+  for (const c of customers) {
+    const account = await customerAccount(c._id);
+    rows.push({
+      id: String(c._id),
+      code: c.code,
+      name: c.companyName || c.name,
+      mobile: c.mobile || '',
+      creditLimit: c.creditLimit || 0,
+      creditDays: c.creditDays,
+      ...account.summary,
+      lastPaymentAt: account.credits.at(-1)?.date || null,
+      openBills: account.invoices.filter((i) => i.balance > EPS).length,
+    });
+  }
+  rows.sort((a, b) => b.overdue - a.overdue || b.outstanding - a.outstanding);
+  const total = (key) => money(rows.reduce((s, r) => s + (r[key] || 0), 0));
+  const ageing = {};
+  for (const key of ['current', 'd1_30', 'd31_60', 'd61_90', 'd90plus']) ageing[key] = money(rows.reduce((s, r) => s + r.ageing[key], 0));
+  return { rows, totals: { outstanding: total('outstanding'), overdue: total('overdue'), advance: total('advance'), ageing } };
+}
+
+// ---------------------------------------------------------------- overdue tasks
+
+// One "collect overdue payment" task per customer with overdue bills, for
+// Accounts. Kept up to date on each run; closes itself once nothing is overdue.
+async function syncOverdueTasks() {
+  const Task = require('../task/task.model');
+  const { TASK_CATEGORIES, TASK_OPEN_STATUSES, TASK_STATUSES, ROLE_SLUGS } = require('../../config/constants');
+  const { nextTaskNumber } = require('../../utils/counter');
+  const customerIds = (await Invoice.distinct('customer', { status: 'issued', dueDate: { $lt: new Date() } })).map(String);
+  const openTasks = await Task.find({ category: TASK_CATEGORIES.PAYMENT_OVERDUE, status: { $in: TASK_OPEN_STATUSES } });
+  const byCustomer = new Map(openTasks.map((t) => [String(t.customer), t]));
+  const stillOverdue = new Set();
+  for (const id of customerIds) {
+    const account = await customerAccount(id);
+    if (!(account.summary.overdue > EPS)) continue;
+    stillOverdue.add(id);
+    const customer = await Customer.findById(id).select('name companyName').lean();
+    const late = account.invoices.filter((i) => i.overdueDays > 0 && i.balance > EPS);
+    const title = `Collect ${inr(account.summary.overdue)} overdue from ${customer?.companyName || customer?.name}`;
+    const description = late.map((i) => `${i.number}: ${inr(i.balance)}, ${i.overdueDays} days late`).join('\n');
+    const days = account.summary.oldestOverdueDays;
+    const priority = days > 60 ? 'urgent' : days > 30 ? 'high' : 'normal';
+    const existing = byCustomer.get(id);
+    if (existing) {
+      if (existing.title !== title || existing.description !== description || existing.priority !== priority) {
+        existing.title = title;
+        existing.description = description;
+        existing.priority = priority;
+        await existing.save();
+      }
+      continue;
+    }
+    const key = `overdue:${id}`;
+    try {
+      await Task.create({
+        number: await nextTaskNumber(),
+        title,
+        description,
+        category: TASK_CATEGORIES.PAYMENT_OVERDUE,
+        source: 'auto',
+        autoKey: key,
+        openKey: key,
+        customer: id,
+        assigneeRole: ROLE_SLUGS.ACCOUNTS,
+        priority,
+        dueDate: endOfBusinessDay(new Date()),
+        history: [{ from: '', to: TASK_STATUSES.OPEN, byName: 'System', note: 'Created automatically' }],
+      });
+    } catch (error) {
+      if (error?.code !== 11000) throw error;
+    }
+  }
+  for (const task of openTasks) {
+    if (stillOverdue.has(String(task.customer))) continue;
+    task.history.push({ from: task.status, to: TASK_STATUSES.DONE, byName: 'System', note: 'Nothing overdue any more' });
+    task.status = TASK_STATUSES.DONE;
+    task.openKey = undefined;
+    task.completedAt = new Date();
+    await task.save();
+  }
+  return { open: stillOverdue.size };
+}
+
 module.exports = {
+  creditCheck,
+  receivables,
+  syncOverdueTasks,
   invoiceDraft,
   createInvoice,
   cancelInvoice,

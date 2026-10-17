@@ -39,6 +39,8 @@ const taskSchema = new mongoose.Schema(
     // Draft order (intake) this task is about, for draft review tasks.
     intake: { type: mongoose.Schema.Types.ObjectId, ref: 'Intake', default: null },
     intakeNumber: { type: String, default: '' },
+    // Customer a payment follow-up task is about.
+    customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', default: null },
     itemId: { type: String, default: '' },
     itemIndex: { type: Number, default: null },
     itemLabel: { type: String, default: '' },

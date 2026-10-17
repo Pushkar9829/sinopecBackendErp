@@ -23,6 +23,8 @@ const companySettingsSchema = new mongoose.Schema(
     invoicePrefix: { type: String, default: 'SP', trim: true },
     proformaPrefix: { type: String, default: 'PI', trim: true },
     defaultCreditDays: { type: Number, default: 30, min: 0 },
+    // Bills this many days past due put a customer's new orders on credit hold.
+    overdueHoldDays: { type: Number, default: 30, min: 0 },
     defaultGstPercent: { type: Number, default: 18, min: 0, max: 100 },
     defaultHsnCode: { type: String, default: '3923', trim: true },
     invoiceTerms: { type: String, default: '', trim: true },

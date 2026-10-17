@@ -43,6 +43,7 @@ function present(doc) {
   for (const field of TEXT_FIELDS) view[field] = doc[field] || '';
   view.defaultCreditDays = doc.defaultCreditDays ?? 30;
   view.defaultGstPercent = doc.defaultGstPercent ?? 18;
+  view.overdueHoldDays = doc.overdueHoldDays ?? 30;
   // First two digits of the GSTIN: decides CGST+SGST (same state) or IGST.
   view.stateCode = view.gstin ? view.gstin.slice(0, 2) : '';
   view.updatedAt = doc.updatedAt;
@@ -71,6 +72,7 @@ async function saveSettings(payload = {}) {
   if (!/^[A-Za-z0-9/-]{0,8}$/.test(doc.invoicePrefix || '')) throw new ApiError(400, 'Invoice prefix can be up to 8 letters, digits, / or -');
   if (!/^[A-Za-z0-9/-]{0,8}$/.test(doc.proformaPrefix || '')) throw new ApiError(400, 'Proforma prefix can be up to 8 letters, digits, / or -');
   if (payload.defaultCreditDays !== undefined) doc.defaultCreditDays = wholeNumber(payload.defaultCreditDays, 'Default credit days', 0, 365);
+  if (payload.overdueHoldDays !== undefined) doc.overdueHoldDays = wholeNumber(payload.overdueHoldDays, 'Overdue days before credit hold', 0, 365);
   if (payload.defaultGstPercent !== undefined) doc.defaultGstPercent = wholeNumber(payload.defaultGstPercent, 'Default GST %', 0, 100);
   if (!doc.legalName) throw new ApiError(400, 'Legal name is required');
   await doc.save();

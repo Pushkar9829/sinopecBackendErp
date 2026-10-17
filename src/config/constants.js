@@ -176,6 +176,7 @@ const TASK_CATEGORIES = {
   ORDER_COMPLETE: 'order_complete',
   PAYMENT_COLLECT: 'payment_collect',
   INTAKE_REVIEW: 'intake_review',
+  PAYMENT_OVERDUE: 'payment_overdue',
   CUSTOM: 'custom',
 };
 

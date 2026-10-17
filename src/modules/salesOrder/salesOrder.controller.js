@@ -46,7 +46,7 @@ const submit = asyncHandler(async (req, res) => {
 });
 
 const approve = asyncHandler(async (req, res) => {
-  const order = await salesOrderService.approveOrder(req.user, req.params.id);
+  const order = await salesOrderService.approveOrder(req.user, req.params.id, req.body || {});
   res.json({ success: true, data: order });
 });
 

@@ -252,6 +252,9 @@ const salesOrderSchema = new mongoose.Schema(
     // Draft order (WhatsApp / Gmail / panel) this order was converted from.
     sourceIntake: { type: mongoose.Schema.Types.ObjectId, ref: 'Intake', default: null },
     sourceIntakeNumber: { type: String, default: '', trim: true },
+    // Result of the credit check at submit / approve, and the owner's reason when approving anyway.
+    creditCheck: { type: mongoose.Schema.Types.Mixed, default: null },
+    creditOverride: { type: mongoose.Schema.Types.Mixed, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     submittedAt: { type: Date, default: null },
     approvedAt: { type: Date, default: null },
