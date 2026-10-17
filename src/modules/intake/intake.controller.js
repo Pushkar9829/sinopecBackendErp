@@ -1,92 +1,63 @@
 const asyncHandler = require('../../utils/asyncHandler');
 const ApiError = require('../../utils/ApiError');
+const { sendStoredFile } = require('../../utils/storage');
 const intakeService = require('./intake.service');
 const whatsapp = require('./intake.whatsapp');
 const gmail = require('./intake.gmail');
-const { getSettings } = require('./intake.settings');
 
-const list = asyncHandler(async (_req, res) => {
-  const drafts = await intakeService.listDrafts();
-  res.json({ success: true, data: drafts });
-});
+const ok = (res, data, status = 200) => res.status(status).json({ success: true, data });
 
-const getOne = asyncHandler(async (req, res) => {
-  const draft = await intakeService.getDraft(req.params.id);
-  res.json({ success: true, data: draft });
-});
+const list = asyncHandler(async (req, res) => ok(res, await intakeService.listDrafts(req.query)));
+const summary = asyncHandler(async (_req, res) => ok(res, await intakeService.summary()));
+const getOne = asyncHandler(async (req, res) => ok(res, await intakeService.getDraft(req.params.id)));
+const match = asyncHandler(async (req, res) => ok(res, await intakeService.matchInfo(req.params.id)));
+const file = asyncHandler(async (req, res) => sendStoredFile(res, await intakeService.getFile(req.params.id, req.params.fileId)));
 
-const getSettingsView = asyncHandler(async (_req, res) => {
-  res.json({ success: true, data: await intakeService.settingsView() });
-});
+const getSettingsView = asyncHandler(async (_req, res) => ok(res, await intakeService.settingsView()));
+const saveSettingsView = asyncHandler(async (req, res) => ok(res, await intakeService.updateSettings(req.body || {})));
 
-const saveSettingsView = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: await intakeService.updateSettings(req.body || {}) });
-});
-
-const paste = asyncHandler(async (req, res) => {
-  const draft = await intakeService.pasteDraft(req.body?.text, req.user);
-  res.status(201).json({ success: true, data: draft });
-});
-
-const createPanel = asyncHandler(async (req, res) => {
-  const draft = await intakeService.createPanelDraft(req.body || {}, req.user);
-  res.status(201).json({ success: true, data: draft });
-});
-
+const createPanel = asyncHandler(async (req, res) => ok(res, await intakeService.createPanelDraft(req.body || {}, req.user), 201));
 const readPanel = asyncHandler(async (req, res) => {
-  const sender = {
-    name: req.body?.senderName,
-    phone: req.body?.senderPhone,
-    email: req.body?.senderEmail,
-  };
-  const draft = await intakeService.readPanelDraft({ text: req.body?.text, sender }, req.files || [], req.user);
-  res.status(201).json({ success: true, data: draft });
+  const sender = { name: req.body?.senderName, phone: req.body?.senderPhone, email: req.body?.senderEmail };
+  ok(res, await intakeService.readPanelDraft({ text: req.body?.text, sender }, req.files || [], req.user), 201);
 });
 
-const saveProposal = asyncHandler(async (req, res) => {
-  const draft = await intakeService.updateProposal(req.params.id, req.body || {}, req.user);
-  res.json({ success: true, data: draft });
-});
+const saveProposal = asyncHandler(async (req, res) => ok(res, await intakeService.updateProposal(req.params.id, req.body || {}, req.user)));
+const useReading = asyncHandler(async (req, res) =>
+  ok(res, await intakeService.useReading(req.params.id, req.params.readingId, req.body || {}, req.user))
+);
+const reread = asyncHandler(async (req, res) => ok(res, await intakeService.reread(req.params.id, req.user)));
+const markNotOrder = asyncHandler(async (req, res) => ok(res, await intakeService.markNotOrder(req.params.id, req.body || {}, req.user)));
+const discard = asyncHandler(async (req, res) => ok(res, await intakeService.discard(req.params.id, req.body || {}, req.user)));
+const restore = asyncHandler(async (req, res) => ok(res, await intakeService.restore(req.params.id, req.user)));
+const confirmCustomer = asyncHandler(async (req, res) =>
+  ok(res, await intakeService.confirmCustomer(req.params.id, req.body || {}, req.user))
+);
+const clearCustomer = asyncHandler(async (req, res) => ok(res, await intakeService.clearCustomer(req.params.id, req.body || {}, req.user)));
+const convert = asyncHandler(async (req, res) => ok(res, await intakeService.convert(req.params.id, req.body || {}, req.user), 201));
 
-const markPotential = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: await intakeService.markPotential(req.params.id) });
-});
-
-const markNotOrder = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: await intakeService.markNotOrder(req.params.id) });
-});
-
-const reread = asyncHandler(async (req, res) => {
-  const draft = await intakeService.rereadDraft(req.params.id);
-  res.json({ success: true, data: draft });
-});
-
-const discard = asyncHandler(async (req, res) => {
-  const draft = await intakeService.discardDraft(req.params.id);
-  res.json({ success: true, data: draft });
+const whatsappVerify = asyncHandler(async (req, res) => {
+  if (!(await whatsapp.verifySubscription(req.query))) throw new ApiError(403, 'WhatsApp verification failed');
+  res.status(200).type('text/plain').send(String(req.query['hub.challenge'] || ''));
 });
 
 const whatsappWebhook = asyncHandler(async (req, res) => {
-  if (req.method === 'GET') {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-    const settings = await getSettings();
-    if (mode === 'subscribe' && token && settings.whatsappVerifyToken && token === settings.whatsappVerifyToken) {
-      return res.status(200).send(String(challenge || ''));
-    }
-    throw new ApiError(403, 'WhatsApp verification failed');
-  }
-
-  const ok = await whatsapp.verifyWebhook(req);
-  if (!ok) throw new ApiError(401, 'WhatsApp signature was rejected');
-  await whatsapp.ingestPayload(req.body || {});
-  return res.sendStatus(200);
+  if (!(await whatsapp.verifyWebhook(req))) throw new ApiError(401, 'WhatsApp signature was rejected');
+  await whatsapp.acceptPayload(req.body || {});
+  res.sendStatus(200);
 });
 
 const gmailStart = asyncHandler(async (_req, res) => {
-  const url = await gmail.startUrl();
-  res.json({ success: true, data: { url } });
+  try {
+    ok(res, { url: await gmail.startUrl() });
+  } catch (error) {
+    throw new ApiError(400, error.message);
+  }
+});
+
+const gmailDisconnect = asyncHandler(async (_req, res) => {
+  await gmail.disconnect();
+  ok(res, await intakeService.settingsView());
 });
 
 const gmailCallback = asyncHandler(async (req, res) => {
@@ -102,18 +73,26 @@ const gmailCallback = asyncHandler(async (req, res) => {
 
 module.exports = {
   list,
+  summary,
   getOne,
+  match,
+  file,
   getSettingsView,
   saveSettingsView,
-  paste,
   createPanel,
   readPanel,
   saveProposal,
-  markPotential,
-  markNotOrder,
+  useReading,
   reread,
+  markNotOrder,
   discard,
+  restore,
+  confirmCustomer,
+  clearCustomer,
+  convert,
+  whatsappVerify,
   whatsappWebhook,
   gmailStart,
+  gmailDisconnect,
   gmailCallback,
 };

@@ -1,8 +1,13 @@
 const asyncHandler = require('../../utils/asyncHandler');
+const { sendStoredFile } = require('../../utils/storage');
 const salesOrderService = require('./salesOrder.service');
 
 const list = asyncHandler(async (req, res) => {
-  const orders = await salesOrderService.listOrders(req.user);
+  // ?page= asks for one page of slim rows; without it the full list is
+  // returned as before.
+  const orders = req.query.page
+    ? await salesOrderService.listOrdersPage(req.user, req.query)
+    : await salesOrderService.listOrders(req.user);
   res.json({ success: true, data: orders });
 });
 
@@ -81,16 +86,13 @@ const recordPayment = asyncHandler(async (req, res) => {
 });
 
 const removePayment = asyncHandler(async (req, res) => {
-  const order = await salesOrderService.removePayment(req.user, req.params.id, req.params.paymentId);
+  const order = await salesOrderService.removePayment(req.user, req.params.id, req.params.paymentId, req.body?.reason);
   res.json({ success: true, data: order });
 });
 
 const downloadAttachment = asyncHandler(async (req, res) => {
-  const file = await salesOrderService.getAttachmentFile(req.params.id, req.params.attachmentId);
-  if (file.redirectUrl) {
-    return res.redirect(file.redirectUrl);
-  }
-  res.download(file.filePath, file.originalName);
+  const file = await salesOrderService.getAttachmentFile(req.params.id, req.params.attachmentId, req.user);
+  sendStoredFile(res, file);
 });
 
 module.exports = {

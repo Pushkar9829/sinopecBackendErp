@@ -36,6 +36,9 @@ const taskSchema = new mongoose.Schema(
     order: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     orderNumber: { type: String, default: '' },
     orderType: { type: String, enum: [...Object.values(ORDER_TYPES), ''], default: '' },
+    // Draft order (intake) this task is about, for draft review tasks.
+    intake: { type: mongoose.Schema.Types.ObjectId, ref: 'Intake', default: null },
+    intakeNumber: { type: String, default: '' },
     itemId: { type: String, default: '' },
     itemIndex: { type: Number, default: null },
     itemLabel: { type: String, default: '' },
@@ -67,6 +70,7 @@ taskSchema.index({ order: 1, status: 1 });
 taskSchema.index({ createdBy: 1, status: 1 });
 taskSchema.index({ dueDate: 1 });
 taskSchema.index({ openKey: 1 }, { unique: true, sparse: true });
+taskSchema.index({ autoKey: 1, status: 1 });
 
 taskSchema.set('toJSON', {
   transform(doc, ret) {

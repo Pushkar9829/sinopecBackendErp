@@ -25,6 +25,25 @@ function hasPermission(user, requiredKey) {
   return matchesPermission(collectPermissionKeys(user.role), requiredKey);
 }
 
+function isSuperAdmin(user) {
+  return user?.role?.slug === ROLE_SLUGS.SUPER_ADMIN;
+}
+
+// Keys in `role` that `actor` does not hold themselves. A non-Super-Admin may
+// only hand out, or manage people holding, access they already have.
+function permissionsBeyond(actor, role) {
+  if (isSuperAdmin(actor)) return [];
+  if (role?.slug === ROLE_SLUGS.SUPER_ADMIN) return ['*'];
+  const owned = collectPermissionKeys(actor?.role);
+  return collectPermissionKeys(role).filter((key) => !matchesPermission(owned, key));
+}
+
+// "false"/"0" must mean false; Boolean("false") is true.
+function toBool(value) {
+  if (typeof value === 'string') return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
+  return Boolean(value);
+}
+
 function toPublicUser(user) {
   const role = user.role;
   const permissions = role?.slug === ROLE_SLUGS.SUPER_ADMIN
@@ -52,5 +71,8 @@ module.exports = {
   collectPermissionKeys,
   matchesPermission,
   hasPermission,
+  isSuperAdmin,
+  permissionsBeyond,
+  toBool,
   toPublicUser,
 };

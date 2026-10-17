@@ -26,6 +26,8 @@ const itemSchema = new mongoose.Schema(
 
 itemSchema.index({ category: 1, name: 1 });
 itemSchema.index({ materialType: 1 });
+// Floor lookups: WIP lots per order/line/stage and customer material per order.
+itemSchema.index({ salesOrder: 1, kind: 1, category: 1, lineItem: 1, wipStage: 1 });
 
 itemSchema.set('toJSON', {
   transform(doc, ret) {

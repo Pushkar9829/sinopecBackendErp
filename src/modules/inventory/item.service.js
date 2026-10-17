@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const { INVENTORY_CATEGORIES, ORDER_TYPES, SALES_ORDER_STATUSES } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
+const { toBool } = require('../../utils/permissions');
 const itemRepo = require('./item.repo');
 const stageRepo = require('./stage.repo');
 const { toPublicStage } = require('./stage.service');
@@ -170,9 +171,19 @@ async function updateItem(id, payload, user = null) {
   if (payload.name !== undefined) updates.name = text(payload.name, 'Name', { required: true });
   if (payload.materialType !== undefined) updates.materialType = text(payload.materialType, 'Material type', { required: true });
   if (payload.unit !== undefined) updates.unit = text(payload.unit, 'Unit', { required: true });
-  if (payload.quantity !== undefined) updates.quantity = quantityOf(payload.quantity);
+  // Quantity is applied as a change from what the editor loaded
+  // (expectedQuantity), never as a blind overwrite.
+  let quantityDelta = 0;
+  let expectedQuantity = Number(item.quantity) || 0;
+  if (payload.quantity !== undefined) {
+    const wanted = quantityOf(payload.quantity);
+    if (payload.expectedQuantity !== undefined && payload.expectedQuantity !== null && payload.expectedQuantity !== '') {
+      expectedQuantity = quantityOf(payload.expectedQuantity);
+    }
+    quantityDelta = wanted - expectedQuantity;
+  }
   if (payload.notes !== undefined) updates.notes = text(payload.notes, 'Notes');
-  if (payload.isActive !== undefined) updates.isActive = Boolean(payload.isActive);
+  if (payload.isActive !== undefined) updates.isActive = toBool(payload.isActive);
 
   const stageId = payload.stageId !== undefined ? payload.stageId : item.stage?._id || item.stage;
   updates.stage = await assertStage(category, stageId);
@@ -191,9 +202,21 @@ async function updateItem(id, payload, user = null) {
     updates.salesOrder = null;
   }
 
-  const updated = await itemRepo.updateById(id, updates);
+  let updated;
+  if (Math.abs(quantityDelta) > 1e-9) {
+    updated = await itemRepo.updateWithQuantity(id, updates, expectedQuantity, quantityDelta);
+    if (!updated) {
+      const fresh = await itemRepo.findById(id);
+      throw new ApiError(
+        409,
+        `The stock on this lot changed while you were editing (it is now ${Math.round((Number(fresh?.quantity) || 0) * 1000) / 1000}). Reload and enter the quantity again.`
+      );
+    }
+  } else {
+    updated = await itemRepo.updateById(id, updates);
+  }
   await syncLinkedOrder(linkedTo, user);
-  const quantityChanged = updates.quantity !== undefined && updates.quantity !== item.quantity;
+  const quantityChanged = Math.abs(quantityDelta) > 1e-9;
   const activeChanged = updates.isActive !== undefined && updates.isActive !== item.isActive;
   if (previousLink && (String(updates.salesOrder ?? previousLink) !== String(previousLink) || quantityChanged || activeChanged)) {
     await syncLinkedOrder(previousLink, user);
@@ -205,7 +228,12 @@ async function assertNotInUse(item) {
   const SalesOrder = require('../salesOrder/salesOrder.model');
   const using = await SalesOrder.findOne({
     status: { $nin: [SALES_ORDER_STATUSES.CANCELLED, SALES_ORDER_STATUSES.COMPLETED] },
-    $or: [{ 'items.stagePickup.lot': item._id }, { 'items.stageWork.sourceLot': item._id }],
+    $or: [
+      { 'items.stagePickup.lot': item._id },
+      { 'items.stageWork.sourceLot': item._id },
+      { 'items.stageWork.outputLot': item._id },
+      { 'items.stageWork.wasteLot': item._id },
+    ],
   }).select('number');
   if (using) {
     throw new ApiError(400, `${using.number} has taken material from this lot. Set it inactive instead of deleting it.`);
@@ -221,7 +249,7 @@ async function deleteItem(id) {
   if (floorOutput && item.isActive !== false && Number(item.quantity) > 0) {
     throw new ApiError(400, 'This lot belongs to an order on the floor. It is used up by the next stage.');
   }
-  if (item.kind !== 'wip') await assertNotInUse(item);
+  await assertNotInUse(item);
   await itemRepo.deleteById(id);
   await syncLinkedOrder(item.salesOrder?._id || item.salesOrder, null).catch(() => {});
 }

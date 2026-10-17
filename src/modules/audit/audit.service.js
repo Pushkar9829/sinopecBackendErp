@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const AuditLog = require('./audit.model');
 
 const MAX_TEXT = 2000;
-const HIDDEN_KEY = /password|token|secret|hash/i;
+const HIDDEN_KEY = /password|token|secret|hash|api_?key/i;
 const IGNORED_FIELDS = new Set(['_id', '__v', 'createdAt', 'updatedAt', 'passwordHash', 'password']);
 
 function escapeRegex(value) {

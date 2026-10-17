@@ -4,8 +4,11 @@ function findByOrderId(orderId) {
   return Register.findOne({ salesOrder: orderId });
 }
 
-function findByOrderIds(orderIds) {
-  return Register.find({ salesOrder: { $in: orderIds } });
+// { lean: true } for list screens: plain objects, no save(). ensureRegister
+// loads a real document only for a register that actually needs updating.
+function findByOrderIds(orderIds, { lean = false } = {}) {
+  const query = Register.find({ salesOrder: { $in: orderIds } });
+  return lean ? query.lean() : query;
 }
 
 function create(data) {

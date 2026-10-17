@@ -1,9 +1,8 @@
 const path = require('path');
 const cookieParser = require('cookie-parser');
-const cors = require('cors');
 const express = require('express');
 const helmet = require('helmet');
-const { applyCorsHeaders, isAllowedOrigin } = require('./config/cors');
+const { applyCorsHeaders } = require('./config/cors');
 const errorHandler = require('./middlewares/errorHandler');
 const authRoutes = require('./modules/auth/auth.routes');
 const permissionRoutes = require('./modules/permission/permission.routes');
@@ -29,18 +28,10 @@ const env = require('./config/env');
 
 const app = express();
 
-const corsOptions = {
-  origin(origin, callback) {
-    if (isAllowedOrigin(origin)) {
-      return callback(null, true);
-    }
-    return callback(null, false);
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  optionsSuccessStatus: 204,
-};
+// Behind Render/Vercel the client IP is in X-Forwarded-For (one proxy hop).
+// Needed for login rate limiting and audit log IPs.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
 
 app.use((req, res, next) => {
   applyCorsHeaders(req, res);
@@ -55,18 +46,28 @@ app.use(
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
-app.use(cors(corsOptions));
-app.use(
-  express.json({
-    limit: '8mb',
+// Orders, customers and saved products can carry inline product images, so
+// those routes accept large bodies; everything else stays small.
+const LARGE_BODY_ROUTES = /^\/api\/(sales-orders|customers|sales-settings|intake)(\/|$)/;
+function jsonParser(limit) {
+  return express.json({
+    limit,
     verify(req, _res, buf) {
       if (req.originalUrl.split('?')[0] === '/api/intake/whatsapp') {
         req.rawBody = buf;
       }
     },
-  })
-);
+  });
+}
+const largeJson = jsonParser('8mb');
+const smallJson = jsonParser('1mb');
+app.use((req, res, next) => (LARGE_BODY_ROUTES.test(req.originalUrl.split('?')[0]) ? largeJson : smallJson)(req, res, next));
 app.use(cookieParser());
+// Order attachments (POs, artwork, documents) live under sales-orders/ and
+// are only served by the authenticated download routes.
+app.use('/uploads/sales-orders', (req, res) => res.status(404).end());
+// Customer messages' files: only through /api/intake/:id/files/:fileId.
+app.use('/uploads/intake', (req, res) => res.status(404).end());
 app.use(
   '/uploads',
   express.static(env.uploadsDir, {

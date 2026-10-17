@@ -1,3 +1,4 @@
+const { endOfBusinessDay } = require('../../utils/businessTime');
 const {
   ORDER_TYPES,
   ROLE_SLUGS,
@@ -36,9 +37,7 @@ const FLOOR_STATUSES = [
 const DAY = 24 * 60 * 60 * 1000;
 
 function endOfDay(date) {
-  const d = new Date(date);
-  d.setHours(23, 59, 59, 0);
-  return d;
+  return endOfBusinessDay(new Date(date));
 }
 
 function daysFromNow(days) {
@@ -286,6 +285,9 @@ function releaseToQueue(task, item, released, actor) {
 }
 
 async function createTask(spec, order) {
+  // Another sync may have opened this task a moment ago; checking first keeps
+  // task numbers from being used up by inserts that would be refused anyway.
+  if (await taskRepo.exists({ openKey: spec.key })) return;
   try {
     const task = await taskRepo.create({
       number: await nextTaskNumber(),
@@ -453,9 +455,20 @@ async function removeForOrder(orderId) {
   }
 }
 
+// syncOrder swallows errors so order actions never fail on tasks; this
+// periodic pass repairs anything a failed sync left behind.
+let reconcileTimer = null;
+function startTaskReconciler(intervalMs = Number(process.env.TASK_RECONCILE_MINUTES || 15) * 60 * 1000) {
+  if (reconcileTimer || !(intervalMs > 0)) return;
+  reconcileTimer = setInterval(() => {
+    backfillOpenOrders().catch((error) => console.error('Task reconcile pass failed', error.message));
+  }, intervalMs);
+  reconcileTimer.unref();
+}
+
 async function backfillOpenOrders() {
   const salesOrderRepo = require('../salesOrder/salesOrder.repo');
-  const orders = await salesOrderRepo.findAll({
+  const orders = await salesOrderRepo.findAllForFloor({
     status: { $nin: [SALES_ORDER_STATUSES.COMPLETED, SALES_ORDER_STATUSES.CANCELLED] },
   });
   for (const order of orders) {
@@ -469,4 +482,5 @@ module.exports = {
   syncOrder,
   removeForOrder,
   backfillOpenOrders,
+  startTaskReconciler,
 };

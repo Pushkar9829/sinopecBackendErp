@@ -5,6 +5,10 @@ function findOptions(filter = {}) {
   return SalesOption.find(filter).sort({ group: 1, value: 1 });
 }
 
+function insertOptions(rows) {
+  return SalesOption.insertMany(rows, { ordered: false });
+}
+
 function findOption(id) {
   return SalesOption.findById(id);
 }
@@ -54,6 +58,7 @@ function countTemplates() {
 }
 
 module.exports = {
+  insertOptions,
   findOptions,
   findOption,
   findOptionByGroupValue,

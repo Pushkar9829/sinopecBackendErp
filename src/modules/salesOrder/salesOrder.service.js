@@ -28,7 +28,9 @@ const {
   stageRequirements,
   stageStats,
 } = require('../production/production.flow');
-const { uploadBuffer, deleteStoredObject } = require('../../utils/storage');
+const { uploadBuffer, deleteStoredObject, readStoredObject } = require('../../utils/storage');
+const { storeListPhotos } = require('../../utils/inlineImages');
+const { inTransaction } = require('../../utils/transaction');
 const salesOrderRepo = require('./salesOrder.repo');
 const rateCalculator = require('../rateCalculator/rateCalculator.service');
 const taskHooks = require('../task/task.hooks');
@@ -84,18 +86,24 @@ function calcLine(item) {
 }
 
 function roundMoney(value) {
-  return Math.round((Number(value) || 0) * 100) / 100;
+  const n = Number(value) || 0;
+  // EPSILON so 1.005 rounds to 1.01, not 1.00.
+  return Math.round((n + Math.sign(n) * Number.EPSILON) * 100) / 100;
 }
 
+// GST is charged on the value after every discount. The order-level discount
+// is spread over the lines in proportion to their value, then each line is
+// taxed at its own rate on what is left. Keep in sync with calcOrder in
+// frontend/src/lib/sales.js.
 function calcTotals(items, orderDiscount, advanceAmount, paidAmount = 0) {
-  let subtotal = 0;
+  const lines = items.map(calcLine);
+  const subtotal = lines.reduce((sum, line) => sum + line.taxable, 0);
+  const discount = Math.min(Math.max(0, num(orderDiscount)), subtotal);
   let tax = 0;
-  for (const item of items) {
-    const line = calcLine(item);
-    subtotal += line.taxable;
-    tax += line.tax;
-  }
-  const discount = Math.max(0, num(orderDiscount));
+  lines.forEach((line, index) => {
+    const share = subtotal > 0 ? (discount * line.taxable) / subtotal : 0;
+    tax += roundMoney(((line.taxable - share) * num(items[index].taxPercent)) / 100);
+  });
   const grandTotal = Math.max(0, subtotal - discount + tax);
   const remainingAmount = Math.max(0, grandTotal - Math.max(0, num(advanceAmount)) - Math.max(0, num(paidAmount)));
   return {
@@ -269,6 +277,7 @@ function toPublicItem(item) {
   };
 }
 
+// No url/key: files are only reachable through the authenticated download route.
 function toPublicAttachment(attachment) {
   return {
     id: String(attachment._id),
@@ -276,8 +285,6 @@ function toPublicAttachment(attachment) {
     mimeType: attachment.mimeType || '',
     size: attachment.size || 0,
     kind: attachment.kind,
-    url: attachment.url || '',
-    key: attachment.key || attachment.storedName || '',
     storage: attachment.storage || 'local',
     uploadedBy: toPublicUser(attachment.uploadedBy),
     createdAt: attachment.createdAt,
@@ -317,6 +324,9 @@ function toPublicOrder(order) {
       note: payment.note || '',
       receivedAt: payment.receivedAt,
       byName: payment.byName || '',
+      voidedAt: payment.voidedAt || null,
+      voidedByName: payment.voidedByName || '',
+      voidReason: payment.voidReason || '',
     })),
     paymentRemarks: order.paymentRemarks || '',
     billingAddress: order.billingAddress || '',
@@ -331,6 +341,8 @@ function toPublicOrder(order) {
     tax: order.tax || 0,
     grandTotal: order.grandTotal || 0,
     attachments: (order.attachments || []).map(toPublicAttachment),
+    sourceIntake: order.sourceIntake ? String(order.sourceIntake) : null,
+    sourceIntakeNumber: order.sourceIntakeNumber || '',
     createdBy: toPublicUser(order.createdBy),
     submittedAt: order.submittedAt,
     approvedAt: order.approvedAt,
@@ -351,8 +363,18 @@ function toPublicOrder(order) {
   };
 }
 
+// Attachments a non-commercial reader (production, store) may open.
+const NON_COMMERCIAL_ATTACHMENTS = new Set(['artwork', 'spec', 'image']);
+
 function stripCommercial(order) {
   const next = { ...order };
+  next.attachments = (next.attachments || []).filter((attachment) => NON_COMMERCIAL_ATTACHMENTS.has(attachment.kind));
+  if (next.customer) {
+    next.customer = { ...next.customer };
+    delete next.customer.priceCategory;
+    delete next.customer.gstNumber;
+    delete next.customer.creditLimit;
+  }
   delete next.subtotal;
   delete next.discount;
   delete next.tax;
@@ -684,7 +706,10 @@ function applyTotals(doc, items, discount, advanceAmount) {
 }
 
 function applyHeader(doc, payload, snapshot) {
-  if (payload.orderDate !== undefined) doc.orderDate = parseDate(payload.orderDate, 'Order date', { required: true });
+  if (payload.orderDate !== undefined) {
+    doc.orderDate = parseDate(payload.orderDate, 'Order date', { required: true });
+    assertOrderDateWindow(doc.orderDate);
+  }
   if (payload.deliveryDate !== undefined) doc.deliveryDate = parseDate(payload.deliveryDate, 'Delivery date');
   if (payload.priority !== undefined) {
     assertIn(payload.priority, ORDER_PRIORITIES, 'Priority must be normal, high, or urgent');
@@ -775,6 +800,179 @@ function requireDraft(order) {
   }
 }
 
+// ---- Orders list (paged) -------------------------------------------------
+// The list screen shows one page of orders with a handful of columns. Reading
+// every order with every item and production entry made this the slowest
+// screen (4 MB / 4 s at ~600 orders), so the page is filtered, counted and
+// cut on the database, and each row carries only what the table shows.
+
+const LIST_PROJECTION = {
+  number: 1,
+  orderType: 1,
+  orderDate: 1,
+  deliveryDate: 1,
+  priority: 1,
+  status: 1,
+  grandTotal: 1,
+  createdAt: 1,
+  'customerSnapshot.name': 1,
+  'customerSnapshot.code': 1,
+  'customerSnapshot.companyName': 1,
+  'items._id': 1,
+  'items.productionRoute': 1,
+  'items.quantity': 1,
+  'items.unit': 1,
+  'items.manufacturing.requiredWeight': 1,
+  'items.stagePickup.stage': 1,
+  'items.stagePickup.qty': 1,
+  'items.stageWork.stage': 1,
+  'items.stageWork.inputQty': 1,
+  'items.stageWork.outputQty': 1,
+  'items.stageWork.wasteQty': 1,
+};
+
+const STAGE_SEARCH_LABELS = { rolling: 'rolling', printing: 'printing', cutting: 'cutting', dispatch: 'dispatch' };
+const TYPE_SEARCH_LABELS = { [ORDER_TYPES.SALES_ORDER]: 'sales order', [ORDER_TYPES.JOB_WORK]: 'job work' };
+
+function escapeRegex(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function listSearchFilter(q) {
+  const text = str(q).toLowerCase();
+  if (!text) return null;
+  const regex = new RegExp(escapeRegex(text), 'i');
+  const or = [
+    { number: regex },
+    { 'customerSnapshot.name': regex },
+    { 'customerSnapshot.code': regex },
+    { 'customerSnapshot.companyName': regex },
+  ];
+  const statuses = Object.values(SALES_ORDER_STATUSES).filter((status) => status.replace(/_/g, ' ').includes(text));
+  if (statuses.length) or.push({ status: { $in: statuses } });
+  const types = Object.entries(TYPE_SEARCH_LABELS).filter(([, label]) => label.includes(text)).map(([id]) => id);
+  if (types.length) or.push({ orderType: { $in: types } });
+  const stages = Object.entries(STAGE_SEARCH_LABELS).filter(([, label]) => label.includes(text)).map(([id]) => id);
+  if (stages.length) or.push({ 'items.currentStage': { $in: stages } });
+  return { $or: or };
+}
+
+function activeStagesOf(order) {
+  const seen = new Set();
+  for (const item of order.items || []) {
+    const current = routeStages(item.productionRoute).find((stage) => !stageStats(item, stage).done);
+    if (current) seen.add(current);
+  }
+  return ['rolling', 'printing', 'cutting', 'dispatch'].filter((stage) => seen.has(stage));
+}
+
+function toListRow(order, user) {
+  const snapshot = order.customerSnapshot || {};
+  return {
+    id: String(order._id),
+    number: order.number,
+    orderType: order.orderType || ORDER_TYPES.SALES_ORDER,
+    orderDate: order.orderDate,
+    deliveryDate: order.deliveryDate,
+    priority: order.priority,
+    status: order.status,
+    customer: { name: snapshot.name || '', code: snapshot.code || '', companyName: snapshot.companyName || '' },
+    activeStages: activeStagesOf(order),
+    ...(canSeeCommercial(user) ? { grandTotal: order.grandTotal || 0 } : {}),
+  };
+}
+
+async function listOrdersPage(user, query = {}) {
+  const pageSize = Math.min(Math.max(Number(query.pageSize) || 25, 1), 100);
+  const page = Math.max(Number(query.page) || 1, 1);
+  const SalesOrder = require('./salesOrder.model');
+
+  const base = {};
+  if (Object.values(ORDER_TYPES).includes(query.type)) base.orderType = query.type;
+  const search = listSearchFilter(query.q);
+
+  // Station operators keep their existing view rules (only orders with work
+  // at their stations); that set is small, so it is filtered in memory.
+  if (operatorStations(user).length) {
+    const visible = (await listOrders(user)).filter(
+      (order) => (!base.orderType || order.orderType === base.orderType) && (!search || matchesListSearch(order, query.q))
+    );
+    const counts = countByStatus(visible);
+    const closed = [SALES_ORDER_STATUSES.CANCELLED, SALES_ORDER_STATUSES.COMPLETED];
+    const rows =
+      query.status === 'open'
+        ? visible.filter((order) => !closed.includes(order.status))
+        : query.status && query.status !== 'all'
+          ? visible.filter((order) => order.status === query.status)
+          : visible;
+    return pageOf(
+      rows.map((order) => ({
+        id: order.id,
+        number: order.number,
+        orderType: order.orderType,
+        orderDate: order.orderDate,
+        deliveryDate: order.deliveryDate,
+        priority: order.priority,
+        status: order.status,
+        customer: { name: order.customer?.name || '', code: order.customer?.code || '', companyName: order.customer?.companyName || '' },
+        activeStages: activeStagesOf(order),
+      })),
+      page,
+      pageSize,
+      counts
+    );
+  }
+
+  const filter = { ...base, ...(search || {}) };
+  // status=open: everything not finished (used by pickers such as New task).
+  const statusFilter =
+    query.status === 'open'
+      ? { status: { $nin: [SALES_ORDER_STATUSES.CANCELLED, SALES_ORDER_STATUSES.COMPLETED] } }
+      : query.status && query.status !== 'all'
+        ? { status: str(query.status) }
+        : {};
+  const [grouped, total, docs] = await Promise.all([
+    SalesOrder.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    SalesOrder.countDocuments({ ...filter, ...statusFilter }),
+    SalesOrder.find({ ...filter, ...statusFilter }, LIST_PROJECTION)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .lean(),
+  ]);
+  const counts = { all: 0 };
+  for (const row of grouped) {
+    counts[row._id] = row.count;
+    counts.all += row.count;
+  }
+  return {
+    items: docs.map((order) => toListRow(order, user)),
+    total,
+    page,
+    pageSize,
+    pages: Math.max(1, Math.ceil(total / pageSize)),
+    counts,
+  };
+}
+
+function matchesListSearch(order, q) {
+  const text = str(q).toLowerCase();
+  return [order.number, order.customer?.name, order.customer?.code, order.customer?.companyName, order.status.replace(/_/g, ' ')]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(text));
+}
+
+function countByStatus(orders) {
+  const counts = { all: orders.length };
+  for (const order of orders) counts[order.status] = (counts[order.status] || 0) + 1;
+  return counts;
+}
+
+function pageOf(rows, page, pageSize, counts) {
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+  return { items: rows.slice((page - 1) * pageSize, page * pageSize), total: rows.length, page, pageSize, pages, counts };
+}
+
 async function listOrders(user) {
   const orders = await salesOrderRepo.findAll();
   if (operatorStations(user).length) {
@@ -813,15 +1011,30 @@ async function getOrder(user, id) {
   return present(order, user);
 }
 
-async function createOrder(user, payload) {
+function assertOrderDateWindow(date) {
+  if (!date) return;
+  const now = Date.now();
+  const year = 365 * 24 * 60 * 60 * 1000;
+  if (date.getTime() < now - 2 * year || date.getTime() > now + year) {
+    throw new ApiError(400, 'Order date must be within the last two years and no more than a year ahead');
+  }
+}
+
+// options.source: { intakeId, intakeNumber } when converted from a draft order.
+// options.rememberProducts: false keeps a converted draft from adding saved
+// products / templates until a person saves the order themselves.
+async function createOrder(user, payload, options = {}) {
   const customer = await loadCustomer(payload.customerId);
   const snapshot = snapshotFromCustomer(customer);
   const orderType = payload.orderType || ORDER_TYPES.SALES_ORDER;
   assertIn(orderType, ORDER_TYPES, 'Order type must be Sales order or Job work');
+  // Inline (base64) photos go to S3 first; the order only keeps the link.
+  await storeListPhotos(payload.items);
   const items = normalizeItems(payload.items || [], orderType);
   assertDraftComplete(items);
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
+  assertOrderDateWindow(orderDate);
   const doc = {
     orderType,
     orderDate,
@@ -842,6 +1055,8 @@ async function createOrder(user, payload) {
     remarks: str(payload.remarks),
     productionInstructions: str(payload.productionInstructions),
     createdBy: user._id,
+    sourceIntake: options.source?.intakeId || null,
+    sourceIntakeNumber: options.source?.intakeNumber || '',
   };
 
   doc.items = items;
@@ -854,15 +1069,40 @@ async function createOrder(user, payload) {
   assertIn(doc.paymentMethod, PAYMENT_METHODS, 'Invalid payment method');
   doc.number = await nextSalesOrderNumber(orderDate, orderType);
   const created = await salesOrderRepo.create(doc);
-  await rememberProducts(customer._id, payload.items, items);
+  if (options.rememberProducts !== false) await rememberProducts(customer._id, payload.items, items);
   const loaded = await salesOrderRepo.findById(created._id);
   await taskHooks.syncOrder(loaded, user);
   return present(loaded, user);
 }
 
-async function updateOrder(user, id, payload) {
+const COMMERCIAL_HEADER_FIELDS = ['discount', 'advanceAmount', 'paymentTerms', 'paymentMethod', 'creditDays', 'paymentRemarks'];
+
+// A user who can't see prices gets an order without them, so whatever they
+// send back for those fields is blank, not a change. Keep the stored values.
+function keepCommercialFields(order, payload) {
+  const next = { ...payload };
+  for (const field of COMMERCIAL_HEADER_FIELDS) delete next[field];
+  if (Array.isArray(payload.items)) {
+    const stored = new Map((order.items || []).map((item) => [String(item._id), item]));
+    next.items = payload.items.map((raw) => {
+      const before = stored.get(String(raw?.id || raw?._id || ''));
+      if (!before) return { ...raw, rate: 0, discount: 0 };
+      return {
+        ...raw,
+        rate: before.rate,
+        discount: before.discount,
+        taxPercent: before.taxPercent,
+        manufacturing: { ...(raw.manufacturing || {}), materialRate: before.manufacturing?.materialRate },
+      };
+    });
+  }
+  return next;
+}
+
+async function updateOrder(user, id, rawPayload) {
   const order = await getOrderOrThrow(id);
   requireDraft(order);
+  const payload = canSeeCommercial(user) ? rawPayload : keepCommercialFields(order, rawPayload);
 
   let snapshot = order.customerSnapshot;
   if (payload.customerId && String(payload.customerId) !== String(order.customer?._id || order.customer)) {
@@ -874,6 +1114,7 @@ async function updateOrder(user, id, payload) {
 
   applyHeader(order, payload, snapshot);
   const orderType = order.orderType || ORDER_TYPES.SALES_ORDER;
+  if (payload.items !== undefined) await storeListPhotos(payload.items);
   const items =
     payload.items !== undefined
       ? normalizeItems(payload.items, orderType)
@@ -903,7 +1144,8 @@ async function deleteOrder(id) {
     throw new ApiError(400, 'Only draft orders can be deleted');
   }
   if ((order.payments || []).length) {
-    throw new ApiError(400, 'This order has payments recorded. Remove them or cancel the order instead of deleting it');
+    // Even voided payments are part of the record; cancel the order instead.
+    throw new ApiError(400, 'This order has payments recorded. Cancel the order instead of deleting it');
   }
   if (await require('../inventory/item.repo').countOrderMaterial(order._id)) {
     throw new ApiError(400, 'Customer material in inventory is linked to this order. Unlink it or cancel the order instead');
@@ -922,6 +1164,10 @@ async function submitOrder(user, id) {
     throw new ApiError(400, 'Only draft orders can be submitted');
   }
   assertReadyToSubmit(order);
+  // The draft may be weeks old: take the customer's current GST number and
+  // addresses, and refuse a customer that has since been deactivated.
+  const customer = await loadCustomer(order.customer?._id || order.customer);
+  order.customerSnapshot = snapshotFromCustomer(customer);
   order.status = SALES_ORDER_STATUSES.SUBMITTED;
   order.submittedAt = new Date();
   await salesOrderRepo.save(order);
@@ -1019,6 +1265,14 @@ async function cancelOrder(user, id, reason) {
   if (anyDispatch) {
     throw new ApiError(400, 'Part of this order is already dispatched, so it cannot be cancelled');
   }
+  // Once cancelled, payments are locked, so received money would be stranded
+  // on a dead order. Refund and remove the payments first.
+  if (activePayments(order).length || Number(order.paidAmount) > 0) {
+    throw new ApiError(
+      400,
+      'This order has payments recorded. Refund them and remove the payments before cancelling, so the money is accounted for'
+    );
+  }
 
   const early = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.SUBMITTED, SALES_ORDER_STATUSES.APPROVED].includes(order.status);
   const salesCan = hasPermission(user, 'sales:update');
@@ -1031,23 +1285,32 @@ async function cancelOrder(user, id, reason) {
     throw new ApiError(403, 'Once production is planned, only Production Manager or Super Admin can cancel');
   }
 
-  if (!early) {
-    await require('../production/production.service').releaseOrderStock(order);
-  }
-  await require('../inventory/item.repo')
-    .noteOrderMaterial(order._id, `order ${order.number} cancelled - return to customer`)
-    .catch((error) => console.error('Marking customer material after cancel failed', error.message));
+  const production = require('../production/production.service');
+  const detached = early ? [] : production.detachOrderPickups(order);
   order.status = SALES_ORDER_STATUSES.CANCELLED;
   order.cancelledAt = new Date();
   order.cancelledBy = user._id;
   order.cancellationReason = str(reason);
-  await salesOrderRepo.save(order);
+  // One transaction: the cancelled status and the stock going back commit
+  // together. The save is also version-checked, so a second cancel, or a
+  // floor entry saved meanwhile, fails before any stock has moved.
+  await inTransaction(async () => {
+    await salesOrderRepo.save(order);
+    if (!early) {
+      await production.releaseOrderStock(order, detached);
+    }
+  });
+  await require('../inventory/item.repo')
+    .noteOrderMaterial(order._id, `order ${order.number} cancelled - return to customer`)
+    .catch((error) => console.error('Marking customer material after cancel failed', error.message));
   return presentAfterSync(order, user, { reason: order.cancellationReason });
 }
 
 function attachmentDir(orderId) {
   return path.join(env.uploadsDir, 'sales-orders', String(orderId));
 }
+
+const MAX_ATTACHMENTS = 50;
 
 async function addAttachment(user, id, file, kind) {
   if (!file) {
@@ -1058,9 +1321,13 @@ async function addAttachment(user, id, file, kind) {
     SALES_ORDER_STATUSES.CANCELLED,
     SALES_ORDER_STATUSES.COMPLETED,
     SALES_ORDER_STATUSES.DISPATCHED,
+    SALES_ORDER_STATUSES.DELIVERED,
   ];
   if (locked.includes(order.status)) {
     throw new ApiError(400, 'Attachments cannot be added in this status');
+  }
+  if ((order.attachments || []).length >= MAX_ATTACHMENTS) {
+    throw new ApiError(400, `An order can have at most ${MAX_ATTACHMENTS} attachments. Remove one first.`);
   }
   if (!isSuperAdmin(user) && !hasPermission(user, 'sales:update')) {
     throw new ApiError(403, 'You cannot attach files to this order');
@@ -1102,29 +1369,41 @@ async function removeAttachment(user, id, attachmentId) {
   if (!attachment) {
     throw new ApiError(404, 'Attachment not found');
   }
-  await deleteStoredObject(attachment.key || attachment.storedName, attachment.storage || 'local');
+  const stored = { key: attachment.key || attachment.storedName, storage: attachment.storage || 'local' };
   attachment.deleteOne();
+  // Save first: if it fails, the record must not point at a deleted file.
   await salesOrderRepo.save(order);
+  await deleteStoredObject(stored.key, stored.storage).catch((error) =>
+    console.error('Removing the stored attachment file failed', error.message)
+  );
   return present(await salesOrderRepo.findById(order._id), user);
 }
 
-async function getAttachmentFile(id, attachmentId) {
+async function getAttachmentFile(id, attachmentId, user = null) {
   const order = await getOrderOrThrow(id);
   const attachment = order.attachments.id(attachmentId);
   if (!attachment) {
     throw new ApiError(404, 'Attachment not found');
   }
+  // Same rule as the order view: only sales/accounts see POs and other
+  // commercial files; everyone else gets artwork, specs and images.
+  if (user && !canSeeCommercial(user) && !NON_COMMERCIAL_ATTACHMENTS.has(attachment.kind)) {
+    throw new ApiError(403, 'You cannot open this file');
+  }
 
-  if (attachment.url && (attachment.storage === 's3' || String(attachment.url).startsWith('http'))) {
-    return {
-      redirectUrl: attachment.url,
-      originalName: attachment.originalName,
-      mimeType: attachment.mimeType,
-    };
+  // Streamed through the API (which checked permissions) rather than handing
+  // out the storage URL, which anyone could reuse without logging in.
+  if (attachment.storage === 's3') {
+    const buffer = await readStoredObject(attachment.key || attachment.storedName, 's3').catch(() => null);
+    if (!buffer) throw new ApiError(404, 'File is missing');
+    return { buffer, originalName: attachment.originalName, mimeType: attachment.mimeType };
   }
 
   const key = attachment.key || attachment.storedName;
-  const filePath = path.isAbsolute(key) ? key : path.join(env.uploadsDir, key);
+  const filePath = path.resolve(env.uploadsDir, key);
+  if (!filePath.startsWith(path.resolve(env.uploadsDir) + path.sep)) {
+    throw new ApiError(404, 'File is missing');
+  }
   try {
     await fs.access(filePath);
   } catch {
@@ -1151,8 +1430,12 @@ function canRecordPayment(user) {
   );
 }
 
+function activePayments(order) {
+  return (order.payments || []).filter((payment) => !payment.voidedAt);
+}
+
 function refreshBalance(order) {
-  order.paidAmount = roundMoney((order.payments || []).reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0));
+  order.paidAmount = roundMoney(activePayments(order).reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0));
   order.remainingAmount = roundMoney(
     Math.max(0, (Number(order.grandTotal) || 0) - (Number(order.advanceAmount) || 0) - order.paidAmount)
   );
@@ -1189,15 +1472,26 @@ async function recordPayment(user, id, payload = {}) {
   return presentAfterSync(order, user);
 }
 
-async function removePayment(user, id, paymentId) {
+// Voids rather than deletes: the payment stays on the order, struck out, with
+// who voided it and why, and no longer counts towards the balance.
+async function removePayment(user, id, paymentId, reason) {
   if (!canRecordPayment(user)) throw new ApiError(403, 'You cannot change payments');
   const order = await getOrderOrThrow(id);
   if (order.status === SALES_ORDER_STATUSES.CANCELLED) {
     throw new ApiError(400, 'Payments on a cancelled order cannot be changed');
   }
+  if (order.status === SALES_ORDER_STATUSES.COMPLETED && !isSuperAdmin(user)) {
+    throw new ApiError(403, 'This order is completed. Only Super Admin can void its payments');
+  }
   const payment = order.payments.id(paymentId);
   if (!payment) throw new ApiError(404, 'Payment not found');
-  payment.deleteOne();
+  if (payment.voidedAt) throw new ApiError(400, 'This payment is already voided');
+  const why = str(reason);
+  if (why.length < 3) throw new ApiError(400, 'Give a reason for voiding this payment (for example "refunded" or "entered twice")');
+  payment.voidedAt = new Date();
+  payment.voidedBy = user._id;
+  payment.voidedByName = user.fullName || user.username || '';
+  payment.voidReason = why;
   refreshBalance(order);
   await salesOrderRepo.save(order);
   return presentAfterSync(order, user);
@@ -1222,9 +1516,6 @@ async function getSummary(user) {
     dispatchGroup:
       byStatus[SALES_ORDER_STATUSES.READY_FOR_DISPATCH] + byStatus[SALES_ORDER_STATUSES.DISPATCHED],
   };
-  if (!canSeeCommercial(user) && !hasPermission(user, 'production:read') && !hasPermission(user, 'dispatch:read')) {
-    return payload;
-  }
   return payload;
 }
 
@@ -1240,6 +1531,7 @@ function getMeta() {
 }
 
 module.exports = {
+  listOrdersPage,
   listOrders,
   getOrder,
   createOrder,

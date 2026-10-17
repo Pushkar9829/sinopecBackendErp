@@ -1,4 +1,6 @@
 const ApiError = require('../../utils/ApiError');
+const { toBool } = require('../../utils/permissions');
+const { storeListPhotos } = require('../../utils/inlineImages');
 const { nextCustomerCode } = require('../../utils/counter');
 const customerRepo = require('./customer.repo');
 const SalesOrder = require('../salesOrder/salesOrder.model');
@@ -14,10 +16,21 @@ function productKey(item) {
   return name ? `name:${name}` : '';
 }
 
-function toPublicProduct(product) {
+// Reads must not throw on an old product that today's validation rejects
+// (renamed route, oversized image, ...): one bad row used to fail the whole list.
+function readableSpec(product) {
   // Lazy require avoids circular import with salesOrder.service
   const { normalizeItem } = require('../salesOrder/salesOrder.service');
-  const spec = normalizeItem(product);
+  try {
+    return normalizeItem(product);
+  } catch (error) {
+    const plain = product?.toObject ? product.toObject() : { ...product };
+    return { ...plain, images: Array.isArray(plain.images) ? plain.images : [], needsReview: error.message };
+  }
+}
+
+function toPublicProduct(product) {
+  const spec = readableSpec(product);
   return {
     id: product._id ? String(product._id) : undefined,
     product: spec.product,
@@ -43,6 +56,7 @@ function toPublicProduct(product) {
     tape: spec.tape,
     image: spec.image,
     images: spec.images || [],
+    ...(spec.needsReview ? { needsReview: spec.needsReview } : {}),
   };
 }
 
@@ -115,9 +129,21 @@ function payloadFromBody(payload) {
   };
 }
 
+// The list leaves out saved products (each can carry several images), which
+// made this response huge. Open one customer to get its products.
 async function listCustomers() {
-  const customers = await customerRepo.findAll();
-  return customers.map(toPublicCustomer);
+  // Products (and any photos in them) are never read for the list; the
+  // database only counts them.
+  const Customer = require('./customer.model');
+  const customers = await Customer.aggregate([
+    { $sort: { createdAt: -1 } },
+    { $addFields: { productCount: { $size: { $ifNull: ['$products', []] } } } },
+    { $project: { products: 0 } },
+  ]);
+  return customers.map((customer) => ({
+    ...toPublicCustomer({ ...customer, products: [] }),
+    productCount: customer.productCount,
+  }));
 }
 
 async function getCustomer(id) {
@@ -134,7 +160,8 @@ async function createCustomer(payload) {
     throw new ApiError(400, 'Customer name is required');
   }
   data.code = await nextCustomerCode();
-  data.isActive = payload.isActive !== false;
+  data.isActive = payload.isActive === undefined ? true : toBool(payload.isActive);
+  await storeListPhotos(payload.products);
   data.products = normalizeCustomerProducts(payload.products);
   const customer = await customerRepo.create(data);
   return toPublicCustomer(customer);
@@ -150,11 +177,12 @@ async function updateCustomer(id, payload) {
   if (!data.name) {
     throw new ApiError(400, 'Customer name is required');
   }
-  if (payload.isActive !== undefined) data.isActive = Boolean(payload.isActive);
+  if (payload.isActive !== undefined) data.isActive = toBool(payload.isActive);
   if (payload.products !== undefined && payload.products !== null) {
     if (!Array.isArray(payload.products)) {
       throw new ApiError(400, 'Products must be a list');
     }
+    await storeListPhotos(payload.products);
     data.products = normalizeCustomerProducts(payload.products);
   }
 
@@ -166,8 +194,20 @@ async function updateCustomer(id, payload) {
 async function attachProductsFromOrder(customerId, items, { refresh = false } = {}) {
   if (!customerId || !Array.isArray(items) || !items.length) return;
 
+  // Optimistic retry: two orders for the same customer saved together each
+  // rewrite the products array, so the write is conditional on updatedAt.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await mergeProducts(customerId, items, refresh)) return;
+  }
+  console.error(`Saving products for customer ${customerId} kept colliding with other saves; skipped`);
+}
+
+// Newest products are kept; the oldest drop off once a customer passes this.
+const MAX_SAVED_PRODUCTS = 150;
+
+async function mergeProducts(customerId, items, refresh) {
   const customer = await customerRepo.findById(customerId);
-  if (!customer) return;
+  if (!customer) return true;
 
   const existing = [...(customer.products || [])].map((product) => (product?.toObject ? product.toObject() : product));
   const known = new Map(existing.map((product, index) => [productKey(product), index]).filter(([key]) => key));
@@ -197,9 +237,15 @@ async function attachProductsFromOrder(customerId, items, { refresh = false } = 
     changed = true;
   }
 
-  if (changed) {
-    await customerRepo.updateById(customerId, { products: existing });
-  }
+  if (!changed) return true;
+  const kept = existing.length > MAX_SAVED_PRODUCTS ? existing.slice(-MAX_SAVED_PRODUCTS) : existing;
+  const Customer = require('./customer.model');
+  const result = await Customer.updateOne(
+    { _id: customerId, updatedAt: customer.updatedAt },
+    { $set: { products: kept } },
+    { runValidators: true }
+  );
+  return result.matchedCount > 0;
 }
 
 async function deleteCustomer(id) {

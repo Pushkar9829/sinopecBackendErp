@@ -2,7 +2,7 @@ const env = require('./env');
 
 const allowedOrigins = new Set([
   ...env.clientOrigins,
-  'http://localhost:5173',
+  ...(env.isProd ? [] : ['http://localhost:5173']),
   'https://sinopecerpfrontend.vercel.app',
 ]);
 
@@ -17,16 +17,15 @@ function isAllowedOrigin(origin) {
     return false;
   }
 
-  if (url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) {
+  // Any local dev server may call a dev API, never the production one.
+  if (!env.isProd && url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) {
     return true;
   }
 
-  if (url.protocol !== 'https:') return false;
-
-  const host = url.hostname;
-  if (host === 'sinopecerpfrontend.vercel.app') return true;
-  if (host.startsWith('sinopecerpfrontend-') && host.endsWith('.vercel.app')) return true;
-  if (host.endsWith('-pushkar9829s-projects.vercel.app')) return true;
+  // Everything else must be listed exactly in CLIENT_ORIGIN. No suffix or
+  // prefix matching on *.vercel.app: anyone can register a matching project.
+  // The Vercel frontend calls /api same-origin through its rewrite, so it does
+  // not need CORS at all.
   return false;
 }
 

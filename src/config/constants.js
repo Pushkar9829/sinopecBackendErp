@@ -127,7 +127,16 @@ const TASK_PERMISSIONS = [
   { key: 'tasks:update', module: 'tasks', action: 'update', description: 'Work on own and role tasks' },
 ];
 
-const PERMISSIONS = [...AUTH_PERMISSIONS, ...MODULE_PERMISSIONS, ...TASK_PERMISSIONS];
+// Draft orders read from WhatsApp / Gmail. Only the Super Admin has these by
+// default; a role can be given them on the role screen.
+const INTAKE_PERMISSIONS = [
+  { key: 'intake:*', module: 'intake', action: '*', description: 'All draft order access' },
+  { key: 'intake:read', module: 'intake', action: 'read', description: 'View draft orders and their messages' },
+  { key: 'intake:update', module: 'intake', action: 'update', description: 'Review, edit, convert and discard draft orders' },
+  { key: 'intake:settings', module: 'intake', action: 'settings', description: 'Connect WhatsApp, Gmail and the AI reader' },
+];
+
+const PERMISSIONS = [...AUTH_PERMISSIONS, ...MODULE_PERMISSIONS, ...TASK_PERMISSIONS, ...INTAKE_PERMISSIONS];
 
 const TASK_WORKER_KEYS = ['tasks:read', 'tasks:update'];
 const TASK_MANAGER_KEYS = [...TASK_WORKER_KEYS, 'tasks:create'];
@@ -166,6 +175,7 @@ const TASK_CATEGORIES = {
   DELIVERY_CONFIRM: 'delivery_confirm',
   ORDER_COMPLETE: 'order_complete',
   PAYMENT_COLLECT: 'payment_collect',
+  INTAKE_REVIEW: 'intake_review',
   CUSTOM: 'custom',
 };
 

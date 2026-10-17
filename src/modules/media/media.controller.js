@@ -3,7 +3,7 @@ const ApiError = require('../../utils/ApiError');
 const { uploadBuffer, isS3Enabled } = require('../../utils/storage');
 const { isImageFile } = require('../../middlewares/upload');
 
-const ALLOWED_FOLDERS = new Set(['products', 'sales-orders', 'artwork', 'misc']);
+const ALLOWED_FOLDERS = new Set(['products', 'artwork', 'misc']);
 
 const upload = asyncHandler(async (req, res) => {
   if (!req.file) {

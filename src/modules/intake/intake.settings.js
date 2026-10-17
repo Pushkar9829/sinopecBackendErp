@@ -1,60 +1,142 @@
 const IntakeSettings = require('./intakeSettings.model');
 const { parseKeywords } = require('./intake.keywords');
+const { seal, open, isEncrypted } = require('../../utils/secretBox');
 
-const SECRET_FIELDS = ['whatsappAppSecret', 'whatsappAccessToken', 'gmailClientSecret', 'gmailRefreshToken', 'geminiApiKey'];
+const SECRET_FIELDS = [
+  'whatsappAppSecret',
+  'whatsappAccessToken',
+  'gmailClientSecret',
+  'gmailRefreshToken',
+  'geminiApiKey',
+  'claudeApiKey',
+  'openaiApiKey',
+];
+// Typed by a person on the setup screen (the Gmail refresh token comes from Google).
+const TYPED_SECRETS = SECRET_FIELDS.filter((field) => field !== 'gmailRefreshToken');
+const PROVIDERS = ['gemini', 'claude', 'openai'];
 
-async function getSettings() {
+const TEXT_FIELDS = [
+  'publicBaseUrl',
+  'whatsappVerifyToken',
+  'whatsappPhoneNumberId',
+  'gmailClientId',
+  'geminiModel',
+  'claudeModel',
+  'openaiBaseUrl',
+  'openaiModel',
+  'autoReplyTestRecipients',
+  'autoReplyText',
+];
+
+const NUMBER_FIELDS = {
+  whatsappWindowMinutes: [5, 24 * 60],
+  dailyReadLimit: [0, 100000],
+  autoReplyDailyPerSender: [0, 50],
+  retentionDays: [7, 3650],
+  reviewSlaHours: [1, 24 * 14],
+};
+
+async function loadDoc() {
   let doc = await IntakeSettings.findOne({ key: 'default' });
   if (!doc) {
-    doc = await IntakeSettings.create({ key: 'default', geminiModel: 'gemini-3.5-flash-lite' });
+    try {
+      doc = await IntakeSettings.create({ key: 'default' });
+    } catch (error) {
+      if (error?.code !== 11000) throw error;
+      doc = await IntakeSettings.findOne({ key: 'default' });
+    }
+  }
+  // Secrets saved before encryption existed are encrypted on first read.
+  const plain = SECRET_FIELDS.filter((field) => doc[field] && !isEncrypted(doc[field]));
+  if (plain.length) {
+    for (const field of plain) doc[field] = seal(doc[field]);
+    await doc.save();
   }
   return doc;
 }
 
-function presentSettings(doc) {
-  const base = String(doc.publicBaseUrl || '').replace(/\/$/, '');
-  return {
-    publicBaseUrl: doc.publicBaseUrl || '',
-    webhookUrl: base ? `${base}/api/intake/whatsapp` : '',
-    gmailRedirectUrl: base ? `${base}/api/intake/gmail/callback` : '',
-    whatsappVerifyToken: doc.whatsappVerifyToken || '',
-    whatsappPhoneNumberId: doc.whatsappPhoneNumberId || '',
-    gmailClientId: doc.gmailClientId || '',
-    gmailEmail: doc.gmailEmail || '',
-    geminiModel: doc.geminiModel || 'gemini-3.5-flash-lite',
-    orderKeywords: parseKeywords(doc.orderKeywords).join('\n'),
-    whatsappAppSecretSet: Boolean(doc.whatsappAppSecret),
-    whatsappAccessTokenSet: Boolean(doc.whatsappAccessToken),
-    gmailClientSecretSet: Boolean(doc.gmailClientSecret),
-    gmailConnected: Boolean(doc.gmailRefreshToken),
-    geminiApiKeySet: Boolean(doc.geminiApiKey),
-  };
+// Plain object with secrets readable. Never sent to the browser.
+async function getSettings() {
+  const doc = await loadDoc();
+  const settings = doc.toObject();
+  for (const field of SECRET_FIELDS) settings[field] = open(doc[field]);
+  return settings;
 }
 
-function keepSecret(next, previous) {
-  if (next === undefined || next === null || String(next).trim() === '') return previous || '';
-  return String(next).trim();
-}
-
-async function saveSettings(payload) {
-  const doc = await getSettings();
-  const text = (key) => (payload[key] === undefined ? doc[key] : String(payload[key] || '').trim());
-  doc.publicBaseUrl = text('publicBaseUrl');
-  doc.whatsappVerifyToken = text('whatsappVerifyToken');
-  doc.whatsappPhoneNumberId = text('whatsappPhoneNumberId');
-  doc.gmailClientId = text('gmailClientId');
-  doc.geminiModel = text('geminiModel') || 'gemini-3.5-flash-lite';
-  doc.orderKeywords = parseKeywords(text('orderKeywords')).join('\n');
-  for (const field of SECRET_FIELDS) {
-    if (field === 'gmailRefreshToken') continue;
-    doc[field] = keepSecret(payload[field], doc[field]);
+async function updateSettingsFields(fields) {
+  const doc = await loadDoc();
+  for (const [field, value] of Object.entries(fields)) {
+    doc[field] = SECRET_FIELDS.includes(field) ? seal(value) : value;
   }
   await doc.save();
   return doc;
 }
 
+function webhookBase(settings) {
+  return String(settings.publicBaseUrl || '').replace(/\/$/, '');
+}
+
+function presentSettings(settings) {
+  const base = webhookBase(settings);
+  const view = {
+    webhookUrl: base ? `${base}/api/intake/whatsapp` : '',
+    gmailRedirectUrl: base ? `${base}/api/intake/gmail/callback` : '',
+    orderKeywords: parseKeywords(settings.orderKeywords).join('\n'),
+    gmailEmail: settings.gmailEmail || '',
+    gmailConnected: Boolean(settings.gmailRefreshToken),
+    gmailLastSyncAt: settings.gmailLastSyncAt || null,
+    gmailLastError: settings.gmailLastError || '',
+    aiProvider: settings.aiProvider || 'gemini',
+    aiFallbackProvider: settings.aiFallbackProvider || '',
+    autoReplyEnabled: Boolean(settings.autoReplyEnabled),
+    autoReplyTestMode: settings.autoReplyTestMode !== false,
+  };
+  for (const field of TEXT_FIELDS) view[field] = settings[field] || '';
+  for (const field of Object.keys(NUMBER_FIELDS)) view[field] = settings[field];
+  for (const field of TYPED_SECRETS) view[`${field}Set`] = Boolean(settings[field]);
+  return view;
+}
+
+function clampNumber(value, [min, max], fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+async function saveSettings(payload) {
+  const doc = await loadDoc();
+  for (const field of TEXT_FIELDS) {
+    if (payload[field] !== undefined) doc[field] = String(payload[field] || '').trim();
+  }
+  if (!doc.geminiModel) doc.geminiModel = 'gemini-3.5-flash-lite';
+  if (!doc.claudeModel) doc.claudeModel = 'claude-opus-5-5';
+  if (!doc.autoReplyText) doc.autoReplyText = IntakeSettings.schema.path('autoReplyText').defaultValue;
+  if (payload.orderKeywords !== undefined) doc.orderKeywords = parseKeywords(payload.orderKeywords).join('\n');
+  for (const [field, range] of Object.entries(NUMBER_FIELDS)) {
+    if (payload[field] !== undefined) doc[field] = clampNumber(payload[field], range, doc[field]);
+  }
+  if (payload.aiProvider !== undefined && PROVIDERS.includes(payload.aiProvider)) doc.aiProvider = payload.aiProvider;
+  if (payload.aiFallbackProvider !== undefined) {
+    doc.aiFallbackProvider = PROVIDERS.includes(payload.aiFallbackProvider) ? payload.aiFallbackProvider : '';
+  }
+  if (doc.aiFallbackProvider === doc.aiProvider) doc.aiFallbackProvider = '';
+  for (const field of ['autoReplyEnabled', 'autoReplyTestMode']) {
+    if (payload[field] !== undefined) doc[field] = payload[field] === true || payload[field] === 'true';
+  }
+  // A blank secret keeps the saved one; `clear<Field>` removes it.
+  for (const field of TYPED_SECRETS) {
+    const clearFlag = `clear${field[0].toUpperCase()}${field.slice(1)}`;
+    if (payload[clearFlag] === true) doc[field] = '';
+    else if (payload[field] !== undefined && String(payload[field]).trim()) doc[field] = seal(String(payload[field]).trim());
+  }
+  await doc.save();
+  return getSettings();
+}
+
 module.exports = {
+  SECRET_FIELDS,
   getSettings,
+  updateSettingsFields,
   presentSettings,
   saveSettings,
 };

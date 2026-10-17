@@ -9,6 +9,33 @@ function safeExt(originalName = '') {
   return /^\.[a-z0-9.]+$/.test(ext) ? ext : '';
 }
 
+// Content type comes from the (allow-listed) extension, never from the
+// client's claimed MIME type, so a file can't be served as something else.
+const CONTENT_TYPES = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.csv': 'text/csv',
+  '.txt': 'text/plain',
+  '.zip': 'application/zip',
+  '.ai': 'application/postscript',
+  '.eps': 'application/postscript',
+  '.psd': 'image/vnd.adobe.photoshop',
+  '.cdr': 'application/octet-stream',
+};
+const INLINE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function contentTypeFor(originalName) {
+  return CONTENT_TYPES[safeExt(originalName)] || 'application/octet-stream';
+}
+
 function buildKey(folder, originalName) {
   const cleanFolder = String(folder || 'misc')
     .replace(/[^a-zA-Z0-9/_-]/g, '')
@@ -40,6 +67,7 @@ async function uploadBuffer({ buffer, originalName, mimeType, folder = 'misc' })
   }
 
   const key = buildKey(folder, originalName);
+  const contentType = contentTypeFor(originalName);
 
   if (env.s3.enabled) {
     const client = createS3Client();
@@ -48,15 +76,15 @@ async function uploadBuffer({ buffer, originalName, mimeType, folder = 'misc' })
         Bucket: env.s3.bucket,
         Key: key,
         Body: buffer,
-        ContentType: mimeType || 'application/octet-stream',
-        ...(String(mimeType || '').startsWith('image/') && !/svg/i.test(mimeType) ? {} : { ContentDisposition: 'attachment' }),
+        ContentType: contentType,
+        ...(INLINE_TYPES.has(contentType) ? {} : { ContentDisposition: 'attachment' }),
       })
     );
     return {
       key,
       url: publicUrlForKey(key),
       originalName: originalName || path.basename(key),
-      mimeType: mimeType || '',
+      mimeType: contentType,
       size: buffer.length,
       storage: 's3',
     };
@@ -69,7 +97,7 @@ async function uploadBuffer({ buffer, originalName, mimeType, folder = 'misc' })
     key,
     url: `/uploads/${key.split(path.sep).join('/')}`,
     originalName: originalName || path.basename(key),
-    mimeType: mimeType || '',
+    mimeType: contentType,
     size: buffer.length,
     storage: 'local',
   };
@@ -91,7 +119,12 @@ async function deleteStoredObject(key, storage = 's3') {
     return;
   }
 
-  const absolute = path.join(env.uploadsDir, key);
+  let absolute;
+  try {
+    absolute = insideUploads(key);
+  } catch {
+    return;
+  }
   await fs.promises.unlink(absolute).catch(() => {});
 }
 
@@ -104,13 +137,40 @@ async function readStoredObject(key, storage = 'local') {
     const bytes = await out.Body.transformToByteArray();
     return Buffer.from(bytes);
   }
-  return fs.readFileSync(path.join(env.uploadsDir, key));
+  return fs.readFileSync(insideUploads(key));
+}
+
+// Keys are joined onto the uploads folder; refuse anything that escapes it.
+function insideUploads(key) {
+  const root = path.resolve(env.uploadsDir);
+  const absolute = path.resolve(root, String(key));
+  if (absolute !== root && !absolute.startsWith(root + path.sep)) {
+    throw new Error('Stored file path is outside the uploads folder');
+  }
+  return absolute;
+}
+
+// Sends a file returned by a service: { buffer | filePath, originalName }.
+function sendStoredFile(res, file) {
+  const name = file.originalName || 'download';
+  const type = contentTypeFor(name);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; sandbox");
+  res.setHeader('Cache-Control', 'private, no-store');
+  if (file.buffer) {
+    res.setHeader('Content-Type', type);
+    res.attachment(name);
+    return res.send(file.buffer);
+  }
+  return res.download(file.filePath, name, { headers: { 'Content-Type': type } });
 }
 
 module.exports = {
   uploadBuffer,
   deleteStoredObject,
   readStoredObject,
+  sendStoredFile,
+  contentTypeFor,
   publicUrlForKey,
   isS3Enabled: () => env.s3.enabled,
 };

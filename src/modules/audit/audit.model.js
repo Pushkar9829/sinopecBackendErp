@@ -39,4 +39,11 @@ auditLogSchema.index({ module: 1, at: -1 });
 auditLogSchema.index({ actor: 1, at: -1 });
 auditLogSchema.index({ entityId: 1, at: -1 });
 
+// Optional retention: AUDIT_RETENTION_DAYS=730 lets MongoDB delete older rows.
+// Off by default because how long to keep the log is a business decision.
+const retentionDays = Number(process.env.AUDIT_RETENTION_DAYS) || 0;
+if (retentionDays > 0) {
+  auditLogSchema.index({ at: 1 }, { expireAfterSeconds: Math.round(retentionDays * 24 * 60 * 60) });
+}
+
 module.exports = mongoose.model('AuditLog', auditLogSchema);

@@ -1,4 +1,5 @@
 const ApiError = require('../../utils/ApiError');
+const { toBool } = require('../../utils/permissions');
 const machineRepo = require('./machine.repo');
 const stageRepo = require('../inventory/stage.repo');
 
@@ -56,7 +57,7 @@ async function updateMachine(id, payload) {
     if (!updates.name) throw new ApiError(400, 'Machine name is required');
   }
   if (payload.notes !== undefined) updates.notes = String(payload.notes ?? '').trim();
-  if (payload.isActive !== undefined) updates.isActive = Boolean(payload.isActive);
+  if (payload.isActive !== undefined) updates.isActive = toBool(payload.isActive);
   if (payload.code !== undefined) {
     updates.code = String(payload.code ?? '').trim();
     if (updates.code) {

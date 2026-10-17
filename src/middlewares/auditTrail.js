@@ -51,6 +51,25 @@ const PRODUCTION_ACTIONS = {
 
 const isId = (value) => /^[a-f0-9]{24}$/i.test(value);
 
+// Stored request bodies are capped so one large request can't bloat the log.
+const MAX_PAYLOAD_BYTES = 16 * 1024;
+
+function hasCredentials(req) {
+  const header = req.headers.authorization || '';
+  return header.toLowerCase().startsWith('bearer ') || Boolean(req.cookies?.[COOKIES.ACCESS]);
+}
+
+function capPayload(payload) {
+  if (!payload) return payload;
+  let size = 0;
+  try {
+    size = Buffer.byteLength(JSON.stringify(payload));
+  } catch {
+    return { omitted: 'not serialisable' };
+  }
+  return size > MAX_PAYLOAD_BYTES ? { omitted: `request body too large to keep (${size} bytes)` } : payload;
+}
+
 function modelByName(name) {
   try {
     return mongoose.model(name);
@@ -152,11 +171,11 @@ async function writeLog(req, res, target, before, responseBody) {
     .concat(stageNote);
 
   const changes = success && target.model && (before || after) ? audit.diff(before, after) : [];
-  const payload = audit.sanitize({
+  const payload = capPayload(audit.sanitize({
     body: req.body && Object.keys(req.body).length ? req.body : undefined,
     file: req.file ? { name: req.file.originalname, size: req.file.size, type: req.file.mimetype } : undefined,
     files: Array.isArray(req.files) ? req.files.map((file) => ({ name: file.originalname, size: file.size })) : undefined,
-  });
+  }));
 
   await audit.record({
     actor: actor?._id || null,
@@ -185,6 +204,11 @@ function auditTrail(req, res, next) {
   if (!MUTATING.has(req.method) || SKIPPED.has(path) || SKIPPED_PREFIXES.some((prefix) => path.startsWith(prefix))) return next();
 
   const target = resolveTarget(req);
+  // Anonymous calls to anything but login are rejected by authenticate; don't
+  // spend database reads or log rows on them.
+  const anonymous = target.module !== 'auth' && !hasCredentials(req);
+  if (anonymous) return next();
+
   let responseBody;
   const sendJson = res.json.bind(res);
   res.json = (body) => {
@@ -195,6 +219,8 @@ function auditTrail(req, res, next) {
   const loadBefore = target.model && target.id ? target.model.findById(target.id).lean().catch(() => null) : Promise.resolve(null);
   loadBefore.then((before) => {
     res.on('finish', () => {
+      // A bad or expired token: nobody to attribute it to, nothing changed.
+      if (res.statusCode === 401 && target.module !== 'auth') return;
       writeLog(req, res, target, before, responseBody).catch((error) => console.error('Audit log failed', error.message));
     });
     next();

@@ -1,24 +1,11 @@
 const { readStoredObject } = require('../../utils/storage');
 const { getSettings } = require('./intake.settings');
+const ai = require('./ai');
+const { conversationText } = require('./intake.text');
 
-const PROMPT = `You extract a packaging order from a customer message. The message may be Hindi, English, or both, and it may be a chat, an email, or the customer's own invoice.
-Return JSON only with this shape:
-{
-  "customer": {"name":"","companyName":"","mobile":"","email":"","gstNumber":"","billingAddress":"","shippingAddress":""},
-  "lines":[{"product":"","quantity":null,"unit":"","rate":null,"material":"","width":"","length":"","notes":""}],
-  "deliveryDate":"",
-  "notes":"",
-  "certainty":{"customer":"high|medium|low|missing","lines":"high|medium|low|missing"},
-  "warnings":[]
-}
-Rules:
-- Leave a field empty only when the message does not contain it. Do not invent material, GST, rate, or a delivery date.
-- A number written with a product is the quantity, even when the word pcs is missing and the mail only asks for a PI. "Please share the PI against 17000 Polly bag" means product Polly bag and quantity 17000. Leave unit empty when no unit is written.
-- A size written as 10*14*2, 10x14x2, or 10×14×2 means width 10, length 14, and gusset 2. Put "gusset 2" in that line's notes. A two-part size such as 12x18 is width and length. These are not a rate.
-- Their item code is not our product code.
-- A weekday such as Friday is medium certainty and must also be copied into notes.
-- When the message body has no email, copy the sender email given below into customer.email.
-- Put disagreements and anything unreadable into warnings.`;
+const MAX_PDF_TEXT = 20000;
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const READABLE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
 function emptyProposal(warnings = []) {
   return {
@@ -35,6 +22,7 @@ function emptyProposal(warnings = []) {
     deliveryDate: '',
     notes: '',
     certainty: { customer: 'missing', lines: 'missing' },
+    isOrder: true,
     warnings,
   };
 }
@@ -44,52 +32,8 @@ async function pdfText(buffer) {
     const pdfParse = require('pdf-parse');
     const parsed = await pdfParse(buffer);
     return String(parsed.text || '').replace(/\s+/g, ' ').trim();
-  } catch (error) {
-    return '';
-  }
-}
-
-function partsFromResponse(payload) {
-  const parts = payload?.candidates?.[0]?.content?.parts || [];
-  return parts.map((part) => part.text || '').join('').trim();
-}
-
-async function callGemini(settings, parts) {
-  const model = settings.geminiModel || 'gemini-3.5-flash-lite';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(settings.geminiApiKey)}`;
-  const body = {
-    contents: [{ role: 'user', parts }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      thinkingConfig: { thinkingBudget: 0 },
-    },
-  };
-
-  let response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (response.status === 400) {
-    delete body.generationConfig.thinkingConfig;
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  }
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = payload?.error?.message || `Gemini returned ${response.status}`;
-    throw new Error(message);
-  }
-  const text = partsFromResponse(payload);
-  if (!text) throw new Error('Gemini returned an empty reading');
-  try {
-    return JSON.parse(text);
   } catch {
-    throw new Error('Gemini did not return JSON');
+    return '';
   }
 }
 
@@ -125,10 +69,12 @@ function normalizeProposal(raw, extraWarnings = []) {
     : [];
   base.deliveryDate = String(raw?.deliveryDate || '');
   base.notes = String(raw?.notes || '');
+  const level = (value) => (['high', 'medium', 'low', 'missing'].includes(value) ? value : 'missing');
   base.certainty = {
-    customer: String(raw?.certainty?.customer || 'missing'),
-    lines: String(raw?.certainty?.lines || 'missing'),
+    customer: level(raw?.certainty?.customer),
+    lines: level(raw?.certainty?.lines),
   };
+  base.isOrder = raw?.isOrder !== false;
   const warnings = []
     .concat(extraWarnings)
     .concat(Array.isArray(raw?.warnings) ? raw.warnings.map(String) : []);
@@ -188,7 +134,7 @@ function productBeside(text, quantity) {
 }
 
 function applyMessageFacts(proposal, doc) {
-  const text = String(doc?.rawBody || '');
+  const text = messageText(doc);
   const senderEmail = addressIn(doc?.sender?.email);
   const senderPhone = String(doc?.sender?.phone || '').trim();
   if (senderEmail && !proposal.customer.email) proposal.customer.email = senderEmail;
@@ -227,61 +173,83 @@ function applyMessageFacts(proposal, doc) {
   return proposal;
 }
 
-async function readIntake(doc) {
-  const settings = await getSettings();
-  if (!settings.geminiApiKey) {
-    throw new Error('Gemini API key is not set. Add it in Draft orders setup.');
-  }
+// The conversation as the reader sees it, rebuilt from the stored messages.
+function messageText(doc) {
+  return doc?.messages?.length ? conversationText(doc.messages) : String(doc?.rawBody || '');
+}
 
+// Builds what the AI reader sees: sender, message text, and the files it can read.
+async function buildInput(doc, providerName) {
   const warnings = [];
-  const geminiParts = [{ text: PROMPT }];
+  const texts = [];
+  const files = [];
   const senderBits = [doc.sender?.name, addressIn(doc.sender?.email) || doc.sender?.email, doc.sender?.phone].filter(Boolean);
-  if (senderBits.length) {
-    geminiParts.push({ text: `Sender from the channel: ${senderBits.join(', ')}` });
-  }
-  if (doc.rawBody) geminiParts.push({ text: `Message:\n${doc.rawBody}` });
+  if (senderBits.length) texts.push(`Sender from the channel: ${senderBits.join(', ')}`);
+  if (doc.subject) texts.push(`Subject: ${doc.subject}`);
+  const body = messageText(doc);
+  if (body) texts.push(`Message:
+${body}`);
 
   for (const file of doc.files || []) {
+    const name = file.originalName || 'a file';
     if (!file.key) continue;
-    const buffer = await readStoredObject(file.key, file.storage || 'local');
+    if (file.size > MAX_FILE_BYTES) {
+      warnings.push(`${name} is too large to read.`);
+      continue;
+    }
+    let buffer = null;
+    try {
+      buffer = await readStoredObject(file.key, file.storage || 'local');
+    } catch {
+      buffer = null;
+    }
     if (!buffer || !buffer.length) {
-      warnings.push(`Could not open ${file.originalName || 'a file'}`);
+      warnings.push(`Could not open ${name}`);
       continue;
     }
     const mime = String(file.mimeType || '').toLowerCase();
-    if (mime === 'application/pdf' || file.originalName?.toLowerCase().endsWith('.pdf')) {
+    if (mime === 'application/pdf' || name.toLowerCase().endsWith('.pdf')) {
       const text = await pdfText(buffer);
       if (text.length > 40) {
-        geminiParts.push({ text: `Text extracted from ${file.originalName || 'PDF'}:\n${text.slice(0, 20000)}` });
+        texts.push(`Text extracted from ${name}:
+${text.slice(0, MAX_PDF_TEXT)}`);
+      } else if (ai.providerSupportsPdf(providerName)) {
+        files.push({ name, mimeType: 'application/pdf', base64: buffer.toString('base64') });
+        warnings.push(`${name} had no text layer, so the pages were read as images.`);
       } else {
-        geminiParts.push({
-          inline_data: { mime_type: 'application/pdf', data: buffer.toString('base64') },
-        });
-        warnings.push(`${file.originalName || 'PDF'} had no text layer, so the pages were read as images.`);
+        warnings.push(`${name} is a scanned PDF; the selected reader can't read scans.`);
       }
-    } else if (mime.startsWith('image/')) {
-      geminiParts.push({
-        inline_data: { mime_type: file.mimeType, data: buffer.toString('base64') },
-      });
+    } else if (READABLE_IMAGES.has(mime)) {
+      files.push({ name, mimeType: mime, base64: buffer.toString('base64') });
     } else if (mime.startsWith('audio/')) {
       warnings.push('A voice note was stored. It was not read as the order.');
     } else {
-      warnings.push(`${file.originalName || 'A file'} was stored and not read.`);
+      warnings.push(`${name} was stored and not read.`);
     }
   }
+  return { texts, files, warnings };
+}
 
-  if (geminiParts.length === 1 && !warnings.length) {
-    throw new Error('There is nothing to read on this draft');
+// Returns { proposal, provider, model, warning } or throws.
+async function readIntake(doc) {
+  const settings = await getSettings();
+  const input = await buildInput(doc, settings.aiProvider || 'gemini');
+  const hasContent = Boolean(messageText(doc) || doc.subject) || input.files.length || input.texts.length > 1;
+  if (!hasContent) {
+    if (!input.warnings.length) throw new Error('There is nothing to read on this draft');
+    return { proposal: emptyProposal(input.warnings), provider: '', model: '' };
   }
-  if (geminiParts.length === 1) {
-    return emptyProposal(warnings);
-  }
-
-  const raw = await callGemini(settings, geminiParts);
-  return applyMessageFacts(normalizeProposal(raw, warnings), doc);
+  const result = await ai.readOrder(settings, input, doc._id);
+  const warnings = result.warning ? [...input.warnings, result.warning] : input.warnings;
+  return {
+    proposal: applyMessageFacts(normalizeProposal(result.raw, warnings), doc),
+    provider: result.provider,
+    model: result.model,
+  };
 }
 
 module.exports = {
   readIntake,
   normalizeProposal,
+  emptyProposal,
 };

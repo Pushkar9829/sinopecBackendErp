@@ -153,6 +153,11 @@ const paymentSchema = new mongoose.Schema(
     receivedAt: { type: Date, default: Date.now },
     by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     byName: { type: String, default: '' },
+    // Removing a payment voids it (kept for the books) instead of deleting it.
+    voidedAt: { type: Date, default: null },
+    voidedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    voidedByName: { type: String, default: '' },
+    voidReason: { type: String, default: '', trim: true },
   },
   { _id: true, timestamps: true }
 );
@@ -243,6 +248,9 @@ const salesOrderSchema = new mongoose.Schema(
     tax: { type: Number, default: 0, min: 0 },
     grandTotal: { type: Number, default: 0, min: 0 },
     attachments: { type: [attachmentSchema], default: [] },
+    // Draft order (WhatsApp / Gmail / panel) this order was converted from.
+    sourceIntake: { type: mongoose.Schema.Types.ObjectId, ref: 'Intake', default: null },
+    sourceIntakeNumber: { type: String, default: '', trim: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     submittedAt: { type: Date, default: null },
     approvedAt: { type: Date, default: null },
@@ -252,11 +260,18 @@ const salesOrderSchema = new mongoose.Schema(
     cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     cancellationReason: { type: String, default: '', trim: true },
   },
-  { timestamps: true }
+  // Every save checks __v, so two requests editing the same order can't
+  // silently overwrite each other (payments, status changes, floor pickups).
+  { timestamps: true, optimisticConcurrency: true }
 );
 
 salesOrderSchema.index({ status: 1, createdAt: -1 });
 salesOrderSchema.index({ customer: 1 });
+// Default list sort, analytics work-date scans, and "which order uses this lot".
+salesOrderSchema.index({ createdAt: -1 });
+salesOrderSchema.index({ 'items.stageWork.workDate': 1 });
+salesOrderSchema.index({ 'items.stagePickup.lot': 1 }, { sparse: true });
+salesOrderSchema.index({ 'items.stageWork.sourceLot': 1 }, { sparse: true });
 
 salesOrderSchema.set('toJSON', {
   transform(doc, ret) {

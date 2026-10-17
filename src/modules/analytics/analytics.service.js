@@ -1,6 +1,7 @@
 const {
   INVENTORY_CATEGORIES,
   ORDER_TYPES,
+  ROLE_SLUGS,
   SALES_ORDER_STATUS_FLOW,
   SALES_ORDER_STATUSES,
 } = require('../../config/constants');
@@ -40,13 +41,17 @@ function endOfDay(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// Building an Intl formatter is slow and this runs for every order on every
+// request, so one formatter is made once and reused.
+const YMD_FORMAT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TZ,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
 function toYmd(date) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(date);
+  return YMD_FORMAT.format(date);
 }
 
 function addDays(ymd, amount) {
@@ -59,6 +64,14 @@ function text(value) {
   return String(value ?? '').trim();
 }
 
+const MAX_RANGE_DAYS = 366;
+
+// Same rule as the registers: only Super Admin sees customer names; everyone
+// else works with customer codes.
+function seesCustomerName(user) {
+  return user?.role?.slug === ROLE_SLUGS.SUPER_ADMIN;
+}
+
 function parseQuery(query = {}) {
   const today = toYmd(new Date());
   let to = text(query.to || today).slice(0, 10);
@@ -66,6 +79,9 @@ function parseQuery(query = {}) {
   if (!startOfDay(from)) from = addDays(today, -29);
   if (!endOfDay(to)) to = today;
   if (from > to) [from, to] = [to, from];
+  // Cap the window: from=1900-01-01 used to build ~46,000 daily buckets.
+  const earliest = addDays(to, -(MAX_RANGE_DAYS - 1));
+  if (from < earliest) from = earliest;
   const orderType = Object.values(ORDER_TYPES).includes(query.orderType) ? query.orderType : '';
   return {
     from,
@@ -176,7 +192,14 @@ function deltaPct(current, previous) {
 
 async function loadWork(fromDate, toDate) {
   const rows = await SalesOrder.aggregate([
-    { $match: { 'items.stageWork.workDate': { $gte: fromDate, $lte: toDate } } },
+    // Work on cancelled orders never became saleable output, so it is left
+    // out of output, waste and yield figures.
+    {
+      $match: {
+        status: { $ne: SALES_ORDER_STATUSES.CANCELLED },
+        'items.stageWork.workDate': { $gte: fromDate, $lte: toDate },
+      },
+    },
     { $unwind: '$items' },
     { $unwind: '$items.stageWork' },
     { $match: { 'items.stageWork.workDate': { $gte: fromDate, $lte: toDate } } },
@@ -187,6 +210,7 @@ async function loadWork(fromDate, toDate) {
         orderType: 1,
         customerId: '$customer',
         customer: '$customerSnapshot.name',
+        customerCode: '$customerSnapshot.code',
         date: { $dateToString: { format: '%Y-%m-%d', date: '$items.stageWork.workDate', timezone: TZ } },
         stage: '$items.stageWork.stage',
         operator: { $ifNull: ['$items.stageWork.operatorName', 'Unknown'] },
@@ -212,6 +236,7 @@ async function loadWork(fromDate, toDate) {
       orderType: row.orderType || ORDER_TYPES.SALES_ORDER,
       customerId: row.customerId ? String(row.customerId) : '',
       customer: row.customer || '',
+      customerCode: row.customerCode || '',
       status: row.status,
       date: row.date,
       stage: row.stage,
@@ -353,6 +378,7 @@ function orderFigures(orders, range, showMoney, today) {
         orderType: order.orderType || ORDER_TYPES.SALES_ORDER,
         status: order.status,
         customer: order.customerSnapshot?.name || '',
+        customerCode: order.customerSnapshot?.code || '',
         grandTotal: showMoney ? round(value) : null,
         orderDate: order.orderDate || null,
         deliveryDate: order.deliveryDate || null,
@@ -403,14 +429,20 @@ async function getAnalytics(user, query) {
     loadWork(startOfDay(prevFrom), endOfDay(prevTo)),
     SalesOrder.find({ status: { $ne: SALES_ORDER_STATUSES.DRAFT } }).select(
       'number status orderType customer grandTotal customerSnapshot completedAt orderDate deliveryDate updatedAt items.product items.productCode items.stageWork.stage items.stageWork.workDate items.stageWork.completedAt'
-    ),
+    ).lean(), // read-only: plain objects are far cheaper than full documents
   ]);
 
+  if (!seesCustomerName(user)) {
+    for (const row of [...allWork, ...allPrevious]) row.customer = row.customerCode || '';
+  }
   const details = allWork.filter((row) => matchesWork(row, filters));
   const previous = allPrevious.filter((row) => matchesWork(row, filters));
   const orders = allOrders.filter((order) => matchesOrder(order, filters));
   const previousOrders = orderFigures(orders, { fromDate: startOfDay(prevFrom), toDate: endOfDay(prevTo) }, showMoney, prevTo);
   const current = orderFigures(orders, { fromDate, toDate }, showMoney, today);
+  if (!seesCustomerName(user)) {
+    for (const row of current.rows) row.customer = row.customerCode || '';
+  }
 
   const kpis = totalsFrom(details);
   const prevTotals = totalsFrom(previous);

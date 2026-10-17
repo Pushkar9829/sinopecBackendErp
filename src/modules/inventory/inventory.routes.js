@@ -35,7 +35,7 @@ router.patch(
   validate([
     idParam,
     body('name').optional().trim().notEmpty().withMessage('Stage name cannot be empty'),
-    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean'),
+    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),
     body('machineIds').optional().isArray().withMessage('machineIds must be an array'),
     body('machineIds.*').optional().isMongoId().withMessage('Invalid machine id'),
     body('userIds').optional().isArray().withMessage('userIds must be an array'),

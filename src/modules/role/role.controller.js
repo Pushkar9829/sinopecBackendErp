@@ -7,7 +7,7 @@ const list = asyncHandler(async (req, res) => {
 });
 
 const updatePermissions = asyncHandler(async (req, res) => {
-  const role = await roleService.updateRolePermissions(req.params.id, req.body.permissionIds);
+  const role = await roleService.updateRolePermissions(req.user, req.params.id, req.body.permissionIds);
   res.json({ success: true, data: role });
 });
 

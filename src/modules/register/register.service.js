@@ -90,6 +90,9 @@ function publicDetails(raw) {
 
 function entryFromWork(item, row) {
   return {
+    // Same id as the production row it mirrors, so a register rebuilt from the
+    // order keeps the ids the screen already holds.
+    ...(row._id ? { _id: row._id } : {}),
     stage: row.stage,
     itemId: item._id,
     workId: row._id || null,
@@ -188,12 +191,14 @@ async function ensureRegister(order, preloaded) {
     }
   }
 
+  // Compare with schema defaults applied: a lean (plain) register has no
+  // value at all where a full document would hold '' or {}.
   let dirty = false;
-  if (doc.orderNumber !== order.number) {
+  if ((doc.orderNumber || '') !== (order.number || '')) {
     doc.orderNumber = order.number;
     dirty = true;
   }
-  if (doc.customerName !== customerName) {
+  if ((doc.customerName || '') !== (customerName || '')) {
     doc.customerName = customerName;
     dirty = true;
   }
@@ -219,7 +224,12 @@ async function ensureRegister(order, preloaded) {
     kept.add(existing);
     for (const field of SYNCED_FIELDS) {
       const next = entry[field];
-      const same = field === 'details' || field === 'workDate' ? JSON.stringify(existing[field] ?? null) === JSON.stringify(next ?? null) : String(existing[field] ?? '') === String(next ?? '');
+      const same =
+        field === 'details'
+          ? JSON.stringify(existing[field] ?? {}) === JSON.stringify(next ?? {})
+          : field === 'workDate'
+            ? JSON.stringify(existing[field] ?? null) === JSON.stringify(next ?? null)
+            : String(existing[field] ?? '') === String(next ?? '');
       if (!same) {
         existing[field] = next;
         dirty = true;
@@ -229,7 +239,22 @@ async function ensureRegister(order, preloaded) {
   const before = doc.entries.length;
   doc.entries = doc.entries.filter((row) => kept.has(row));
   if (doc.entries.length !== before) dirty = true;
-  if (dirty) await repo.save(doc);
+  if (dirty && typeof doc.save !== 'function') {
+    // Read from a lean list preload: redo the sync on a real document so
+    // the change is saved (and new entries get their ids).
+    const real = await repo.findByOrderId(order._id);
+    return real ? ensureRegister(order, real) : doc;
+  }
+  if (dirty) {
+    try {
+      await repo.save(doc);
+    } catch (error) {
+      // Two screens opened the same register at once and both rebuilt it from
+      // the order. The other one won; its copy is just as current.
+      if (error?.name !== 'VersionError') throw error;
+      return (await repo.findByOrderId(order._id)) || doc;
+    }
+  }
   return doc;
 }
 
@@ -249,7 +274,7 @@ const SYNCED_FIELDS = [
 ];
 
 async function preloadRegisters(orders) {
-  const docs = await repo.findByOrderIds(orders.map((order) => order._id));
+  const docs = await repo.findByOrderIds(orders.map((order) => order._id), { lean: true });
   return new Map(docs.map((doc) => [String(doc.salesOrder), doc]));
 }
 
@@ -329,9 +354,25 @@ function presentOrder(user, order, doc) {
   };
 }
 
-async function list(user) {
+// Completed orders stay in the books for this long; older ones only make every
+// register screen slower. Pass ?days= to look further back.
+const COMPLETED_HISTORY_DAYS = 90;
+
+function registerOrderFilter(query = {}) {
+  const days = Math.min(Math.max(Number(query.days) || COMPLETED_HISTORY_DAYS, 1), 3660);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const open = REGISTER_STATUSES.filter((status) => status !== SALES_ORDER_STATUSES.COMPLETED);
+  return {
+    $or: [
+      { status: { $in: open } },
+      { status: SALES_ORDER_STATUSES.COMPLETED, $or: [{ completedAt: { $gte: since } }, { completedAt: null, updatedAt: { $gte: since } }] },
+    ],
+  };
+}
+
+async function list(user, query = {}) {
   assertCanView(user);
-  const orders = await salesOrderRepo.findAll({ status: { $in: REGISTER_STATUSES } });
+  const orders = await salesOrderRepo.findAllForFloor(registerOrderFilter(query), { lean: true });
   const docs = await preloadRegisters(orders);
   const rows = [];
   for (const order of orders) {
@@ -373,13 +414,14 @@ async function getByOrder(user, orderId) {
   }
   const doc = await ensureRegister(order);
   const book = presentOrder(user, order, doc);
+  const lotCache = require('../production/production.service').createLotCache();
   for (const stage of book.stages) {
     for (const line of stage.lines) {
       const item = (order.items || []).find((row) => String(row._id) === line.itemId);
       const inHand = item?.stagePickup?.stage === stage.id && Number(item.stagePickup.qty) > 0;
       const lots =
         line.ready && item
-          ? await require('../production/production.service').sourceLots(order, item, stage.id)
+          ? await require('../production/production.service').sourceLots(order, item, stage.id, lotCache)
           : [];
       const hasMaterial = inHand || lots.some((lot) => Number(lot.quantity) > 0);
       line.canEnter = Boolean(line.canMark && hasMaterial);
@@ -389,7 +431,7 @@ async function getByOrder(user, orderId) {
   return book;
 }
 
-async function getStage(user, stage) {
+async function getStage(user, stage, query = {}) {
   if (!FLOOR_STAGES.some((item) => item.id === stage)) {
     throw new ApiError(400, 'Unknown production stage');
   }
@@ -397,8 +439,9 @@ async function getStage(user, stage) {
     throw new ApiError(403, 'You cannot view this stage register');
   }
 
-  const orders = await salesOrderRepo.findAll({ status: { $in: REGISTER_STATUSES } });
+  const orders = await salesOrderRepo.findAllForFloor(registerOrderFilter(query), { lean: true });
   const docs = await preloadRegisters(orders);
+  const lotCache = require('../production/production.service').createLotCache();
   const open = [];
   const entries = [];
   for (const order of orders) {
@@ -408,7 +451,7 @@ async function getStage(user, stage) {
       if (!routeStages(item.productionRoute).includes(stage)) continue;
       const line = lineView(user, order, item, stage, doc);
       const sourceLots = line.ready
-        ? await require('../production/production.service').sourceLots(order, item, stage)
+        ? await require('../production/production.service').sourceLots(order, item, stage, lotCache)
         : [];
       const inHand = item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
       const hasMaterial = inHand || sourceLots.some((lot) => Number(lot.quantity) > 0);
@@ -467,6 +510,12 @@ async function loadArtworkOrder(user, orderId) {
   }
   const order = await salesOrderRepo.findById(orderId);
   if (!order) throw new ApiError(404, 'Order not found');
+  if (!REGISTER_STATUSES.includes(order.status)) {
+    throw new ApiError(404, 'This order has no artwork on the floor');
+  }
+  if (!(order.items || []).some((item) => routeStages(item.productionRoute).includes('printing'))) {
+    throw new ApiError(404, 'Nothing on this order is printed');
+  }
   return order;
 }
 
@@ -507,7 +556,9 @@ async function getArtworkFile(user, orderId, attachmentId) {
 
 async function findEntry(order, entryId) {
   const doc = await ensureRegister(order);
-  const entry = doc.entries.id(entryId);
+  // Older entries have their own id; newer ones share the production row's
+  // id (workId). Accept either so links survive a rebuild.
+  const entry = doc.entries.id(entryId) || (doc.entries || []).find((row) => String(row.workId || '') === String(entryId));
   if (!entry) throw new ApiError(404, 'That register entry was not found');
   return { doc, entry };
 }
@@ -525,7 +576,8 @@ function workRowFor(order, entry) {
 }
 
 async function updateEntry(doc, entry, item, row) {
-  const fresh = entryFromWork(item, row);
+  // eslint-disable-next-line no-unused-vars
+  const { _id, ...fresh } = entryFromWork(item, row); // never change an existing entry's id
   for (const [key, value] of Object.entries(fresh)) entry[key] = value;
   doc.markModified('entries');
   return repo.save(doc);

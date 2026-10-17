@@ -12,6 +12,28 @@ async function find(filter, { limit = 500 } = {}) {
   return dated.concat(undated);
 }
 
+// One page in the same order as find(): dated tasks (soonest first), then
+// undated ones (newest first).
+async function findPage(filter, { page = 1, pageSize = 25 } = {}) {
+  const datedFilter = { $and: [filter, { dueDate: { $ne: null } }] };
+  const undatedFilter = { $and: [filter, { dueDate: null }] };
+  const [datedCount, undatedCount] = await Promise.all([Task.countDocuments(datedFilter), Task.countDocuments(undatedFilter)]);
+  const start = (page - 1) * pageSize;
+  let items = [];
+  if (start < datedCount) {
+    items = await Task.find(datedFilter).sort({ dueDate: 1, createdAt: -1 }).skip(start).limit(pageSize);
+  }
+  if (items.length < pageSize) {
+    const undatedStart = Math.max(0, start - datedCount);
+    const more = await Task.find(undatedFilter)
+      .sort({ createdAt: -1 })
+      .skip(undatedStart)
+      .limit(pageSize - items.length);
+    items = items.concat(more);
+  }
+  return { items, total: datedCount + undatedCount };
+}
+
 function findById(id) {
   return Task.findById(id);
 }
@@ -58,6 +80,7 @@ function releaseAssignee(userId, roleSlug) {
 }
 
 module.exports = {
+  findPage,
   find,
   findById,
   findByOrder,

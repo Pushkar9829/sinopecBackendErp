@@ -31,7 +31,7 @@ router.post(
       .withMessage('Password must be at least 8 characters'),
     body('fullName').trim().notEmpty().withMessage('Full name is required'),
     body('roleId').isMongoId().withMessage('Valid roleId is required'),
-    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean'),
+    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),
   ]),
   userController.create
 );
@@ -53,7 +53,7 @@ router.patch(
       .withMessage('Password must be at least 8 characters'),
     body('fullName').optional().trim().notEmpty().withMessage('Full name cannot be empty'),
     body('roleId').optional().isMongoId().withMessage('Invalid roleId'),
-    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean'),
+    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),
   ]),
   userController.update
 );

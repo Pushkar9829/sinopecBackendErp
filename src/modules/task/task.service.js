@@ -7,6 +7,7 @@ const {
   TASK_STATUSES,
 } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
+const { endOfBusinessDay } = require('../../utils/businessTime');
 const { nextTaskNumber } = require('../../utils/counter');
 const { hasPermission } = require('../../utils/permissions');
 const { operatorStations } = require('../production/production.flow');
@@ -78,8 +79,11 @@ function canManage(user, task) {
   );
 }
 
+// Anyone in the role may work an unassigned team task; once it is assigned to
+// someone, only that person (or a manager) can change it.
 function canWork(user, task) {
-  return canManage(user, task) || sameId(task.assignee, user._id) || (task.assigneeRole && task.assigneeRole === roleOf(user));
+  if (canManage(user, task) || sameId(task.assignee, user._id)) return true;
+  return Boolean(task.assigneeRole) && task.assigneeRole === roleOf(user) && !task.assignee;
 }
 
 function closesItself(task) {
@@ -149,6 +153,9 @@ function scopeFilter(user, scope) {
   switch (scope) {
     case 'mine':
       return { assignee: user._id };
+    case 'queue':
+      // Unassigned work waiting for my role (what the summary calls roleQueue).
+      return roleOf(user) ? { assigneeRole: roleOf(user), assignee: null } : { _id: null };
     case 'role':
       return { assigneeRole: { $in: teamRoles(user) } };
     case 'created':
@@ -187,6 +194,14 @@ async function listTasks(user, query = {}) {
     filter.$and = [{ $or: [{ title: regex }, { orderNumber: regex }, { number: regex }, { assigneeName: regex }] }];
   }
 
+  // ?page= returns one page plus the total; without it, the first 500 as
+  // before (the floor workers' task book shows all of its station's tasks).
+  if (query.page) {
+    const pageSize = Math.min(Math.max(Number(query.pageSize) || 25, 1), 100);
+    const page = Math.max(Number(query.page) || 1, 1);
+    const { items, total } = await taskRepo.findPage(filter, { page, pageSize });
+    return { items: await presentAll(items, user), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
+  }
   const tasks = await taskRepo.find(filter);
   return presentAll(tasks, user);
 }
@@ -253,7 +268,7 @@ async function resolveAssignee(payload) {
 function parseDue(value) {
   if (value === null || value === '') return null;
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value));
-  if (day) return new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3]), 23, 59, 59);
+  if (day) return endOfBusinessDay(String(value));
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) throw new ApiError(400, 'Due date is not valid');
   return date;

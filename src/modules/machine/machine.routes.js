@@ -28,7 +28,7 @@ router.patch(
   validate([
     idParam,
     body('name').optional().trim().notEmpty().withMessage('Machine name cannot be empty'),
-    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean'),
+    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),
   ]),
   machineController.update
 );

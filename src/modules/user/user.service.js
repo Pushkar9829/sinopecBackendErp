@@ -1,7 +1,7 @@
 const bcrypt = require('bcryptjs');
 const { ROLE_SLUGS } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
-const { toPublicUser } = require('../../utils/permissions');
+const { permissionsBeyond, toBool, toPublicUser } = require('../../utils/permissions');
 const authRepo = require('../auth/auth.repo');
 const roleRepo = require('../role/role.repo');
 const userRepo = require('./user.repo');
@@ -13,6 +13,15 @@ async function assertRoleChangeAllowed(actor, targetUser, nextRole) {
 
   if ((targetIsSuperAdmin || nextIsSuperAdmin) && !actorIsSuperAdmin) {
     throw new ApiError(403, 'Only a Super Admin can manage Super Admin accounts');
+  }
+
+  // Without this, anyone with users:update could reset the password of a
+  // user with more access (say roles:update) and sign in as them.
+  if (targetUser.role?.permissions && permissionsBeyond(actor, targetUser.role).length) {
+    throw new ApiError(403, 'You cannot manage a user who has access you do not have');
+  }
+  if (nextRole && permissionsBeyond(actor, nextRole).length) {
+    throw new ApiError(403, 'You cannot give a role that has access you do not have');
   }
 }
 
@@ -54,7 +63,16 @@ async function listDirectory() {
   }));
 }
 
+function assertStrings(payload, fields) {
+  for (const field of fields) {
+    if (payload[field] !== undefined && typeof payload[field] !== 'string') {
+      throw new ApiError(400, `${field} must be text`);
+    }
+  }
+}
+
 async function createUser(actor, payload) {
+  assertStrings(payload, ['username', 'password', 'fullName']);
   const username = payload.username.toLowerCase().trim();
   const existing = await userRepo.findByUsername(username);
   if (existing) {
@@ -74,14 +92,17 @@ async function createUser(actor, payload) {
     passwordHash,
     fullName: payload.fullName.trim(),
     role: role._id,
-    isActive: payload.isActive !== false,
+    isActive: payload.isActive === undefined ? true : toBool(payload.isActive),
   });
 
   const created = await userRepo.findByIdWithRole(user._id);
   return toPublicUser(created);
 }
 
-async function updateUser(actor, userId, payload) {
+async function updateUser(actor, userId, rawPayload) {
+  const payload = { ...rawPayload };
+  if (payload.isActive !== undefined) payload.isActive = toBool(payload.isActive);
+  assertStrings(payload, ['username', 'password', 'fullName']);
   const user = await userRepo.findByIdWithRole(userId);
   if (!user) {
     throw new ApiError(404, 'User not found');
@@ -135,6 +156,13 @@ async function updateUser(actor, userId, payload) {
   );
 
   const updated = await userRepo.updateById(userId, updates);
+  if (user.role?.slug === ROLE_SLUGS.SUPER_ADMIN && (updates.role || updates.isActive === false)) {
+    const left = await userRepo.countActiveByRole(user.role._id);
+    if (left < 1) {
+      await userRepo.updateById(userId, { role: user.role._id, isActive: user.isActive });
+      throw new ApiError(409, 'Another change just removed the other Super Admin. At least one must remain.');
+    }
+  }
   if (payload.password) {
     await authRepo.revokeAllForUser(user._id);
   }

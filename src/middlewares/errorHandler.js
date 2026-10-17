@@ -12,6 +12,17 @@ function errorHandler(err, req, res, next) {
     return res.status(400).json({ success: false, message: 'File is too large (max 15 MB)' });
   }
 
+  if (err.name === 'MulterError') {
+    return res.status(400).json({ success: false, message: err.message || 'Upload failed' });
+  }
+
+  if (err.name === 'VersionError') {
+    return res.status(409).json({
+      success: false,
+      message: 'Someone else changed this record at the same time. Reload and try again.',
+    });
+  }
+
   if (err.name === 'ValidationError') {
     return res.status(400).json({ success: false, message: err.message });
   }
@@ -33,7 +44,12 @@ function errorHandler(err, req, res, next) {
   }
 
   const statusCode = err.statusCode || 500;
-  const message = statusCode === 500 && env.isProd ? 'Internal server error' : err.message;
+  if (statusCode >= 500) {
+    console.error(`[${req.method} ${req.originalUrl}]`, err);
+  }
+  // Internal error text (driver messages, paths) only reaches the client on a
+  // machine explicitly marked NODE_ENV=development.
+  const message = statusCode >= 500 && env.nodeEnv !== 'development' ? 'Internal server error' : err.message;
   res.status(statusCode).json({
     success: false,
     message,

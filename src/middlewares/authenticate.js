@@ -5,7 +5,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { verifyAccessToken } = require('../utils/tokens');
 
 function readAccessToken(req) {
-  const header = req.headers.authorization || req.headers.Authorization;
+  const header = req.headers.authorization;
   if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
     return header.slice(7).trim();
   }

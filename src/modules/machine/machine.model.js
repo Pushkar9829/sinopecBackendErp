@@ -11,7 +11,11 @@ const machineSchema = new mongoose.Schema(
 );
 
 machineSchema.index({ name: 1 });
-machineSchema.index({ code: 1 });
+// Unique among machines that have a code; case-insensitive like the service check.
+machineSchema.index(
+  { code: 1 },
+  { unique: true, partialFilterExpression: { code: { $gt: '' } }, collation: { locale: 'en', strength: 2 }, name: 'code_unique_ci' }
+);
 
 machineSchema.set('toJSON', {
   transform(doc, ret) {

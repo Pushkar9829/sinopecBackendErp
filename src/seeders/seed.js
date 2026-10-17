@@ -116,6 +116,10 @@ async function seedSuperAdmin() {
     throw new Error('Super Admin role was not seeded');
   }
 
+  // Bootstrap only an empty system. A renamed owner must not bring back the
+  // default account and password on the next restart.
+  if ((await userRepo.countByRole(role._id)) > 0) return null;
+
   const passwordHash = await bcrypt.hash(env.superAdminPassword, 10);
   return userRepo.create({
     username: env.superAdminUsername.toLowerCase().trim(),
@@ -162,8 +166,10 @@ async function seedStages() {
       sortOrder: index + 1,
     });
   }
-  const retired = await stageRepo.findBySlug('delivery');
-  if (retired) await stageRepo.deleteById(retired._id);
+  await runOnce('retire-delivery-stage-v1', async () => {
+    const retired = await stageRepo.findBySlug('delivery');
+    if (retired) await stageRepo.deleteById(retired._id);
+  });
   return bySlug;
 }
 
@@ -2353,8 +2359,33 @@ async function seed() {
   await seedTaskScenarios();
 }
 
+function isLocalMongo(uri) {
+  const match = String(uri || '').match(/^mongodb:\/\/(?:[^@/]*@)?([^/?]+)/);
+  if (!match) return false;
+  return match[1]
+    .split(',')
+    .every((host) => /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host.trim()));
+}
+
+function assertDestructiveSeedAllowed() {
+  if (env.isProd) {
+    throw new Error('Refusing to run the demo seed with NODE_ENV=production');
+  }
+  if (!isLocalMongo(env.mongoUri)) {
+    throw new Error(
+      'Refusing to run the demo seed: it deletes orders, customers, inventory and registers, ' +
+        'and MONGODB_URI is not a local database'
+    );
+  }
+  if (process.env.ALLOW_DESTRUCTIVE_SEED !== '1') {
+    throw new Error('The demo seed wipes business data. Re-run with ALLOW_DESTRUCTIVE_SEED=1 to confirm');
+  }
+}
+
 if (require.main === module) {
-  connectDb()
+  Promise.resolve()
+    .then(() => assertDestructiveSeedAllowed())
+    .then(() => connectDb())
     .then(() => resetDemoCollections())
     .then(() => seed())
     .then(() => {
@@ -2367,4 +2398,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { seed, seedSystem };
+module.exports = { seed, seedSystem, resetDemoCollections, assertDestructiveSeedAllowed };

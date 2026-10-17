@@ -20,6 +20,17 @@ function updateById(id, data) {
   return InventoryItem.findByIdAndUpdate(id, { $set: data }, { new: true }).populate('stage');
 }
 
+// Changes the stock by a delta, but only if it still holds what the editor
+// saw. Floor pickups use $inc on the same field, so an absolute $set from a
+// stale form would undo them.
+function updateWithQuantity(id, data, expectedQuantity, delta) {
+  return InventoryItem.findOneAndUpdate(
+    { _id: id, quantity: { $gte: expectedQuantity - 1e-9, $lte: expectedQuantity + 1e-9 } },
+    { $set: data, $inc: { quantity: delta } },
+    { new: true }
+  ).populate('stage');
+}
+
 function deleteById(id) {
   return InventoryItem.findByIdAndDelete(id);
 }
@@ -75,6 +86,7 @@ module.exports = {
   findById,
   create,
   updateById,
+  updateWithQuantity,
   deleteById,
   countByStage,
   distinctValues,

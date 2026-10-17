@@ -34,7 +34,7 @@ router.patch(
   validate([
     idParam,
     body('value').optional().trim().notEmpty().withMessage('Value is required'),
-    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean'),
+    body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),
   ]),
   salesSettingsController.updateOption
 );

@@ -43,7 +43,8 @@ const PRINT_CHART = {
 function num(value) {
   if (value === '' || value === null || value === undefined) return 0;
   const parsed = Number(String(value).replace(/,/g, ''));
-  return Number.isFinite(parsed) ? parsed : 0;
+  // Sizes, rates and counts are never negative; a stray minus would flip totals.
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
 }
 
 function isBlank(value) {

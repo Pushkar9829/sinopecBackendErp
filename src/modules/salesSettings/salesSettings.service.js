@@ -1,5 +1,7 @@
 const { SALES_OPTION_GROUPS } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
+const { toBool } = require('../../utils/permissions');
+const { storeProductPhotos } = require('../../utils/inlineImages');
 const { normalizeItem } = require('../salesOrder/salesOrder.service');
 const repo = require('./salesSettings.repo');
 
@@ -15,7 +17,15 @@ function toPublicOption(option) {
 }
 
 function toPublicTemplate(template) {
-  const spec = normalizeItem(template);
+  let spec;
+  try {
+    spec = normalizeItem(template);
+  } catch (error) {
+    // Keep the list readable when one old template fails today's validation.
+    const plain = template?.toObject ? template.toObject() : { ...template };
+    spec = { ...plain, images: Array.isArray(plain.images) ? plain.images : [], needsReview: error.message };
+    delete spec._id;
+  }
   return {
     id: String(template._id),
     name: template.name,
@@ -73,7 +83,7 @@ async function updateOption(id, payload) {
     }
     data.value = value;
   }
-  if (payload.isActive !== undefined) data.isActive = Boolean(payload.isActive);
+  if (payload.isActive !== undefined) data.isActive = toBool(payload.isActive);
   return toPublicOption(await repo.updateOption(id, data));
 }
 
@@ -109,12 +119,14 @@ function templatePayload(payload) {
 }
 
 async function createTemplate(payload) {
+  await storeProductPhotos(payload);
   return toPublicTemplate(await repo.createTemplate(templatePayload(payload)));
 }
 
 async function updateTemplate(id, payload) {
   const template = await repo.findTemplate(id);
   if (!template) throw new ApiError(404, 'Template not found');
+  await storeProductPhotos(payload);
   return toPublicTemplate(await repo.updateTemplate(id, templatePayload({ ...template.toObject(), ...payload })));
 }
 
@@ -152,26 +164,52 @@ function readPath(source, path) {
   return path.split('.').reduce((current, key) => (current == null ? undefined : current[key]), source);
 }
 
-async function rememberNewOptions(items) {
-  const options = await repo.findOptions();
-  const known = new Set(options.map((option) => `${option.group}::${String(option.value || '').trim().toLowerCase()}`));
+const CASE_INSENSITIVE = { locale: 'en', strength: 2 };
 
+async function rememberNewOptions(items) {
+  const candidates = new Map();
   for (const item of items) {
     for (const [path, group] of OPTION_FIELDS) {
       const value = String(readPath(item, path) || '').trim();
       if (!value || value.length > 80) continue;
-      const key = `${group}::${value.toLowerCase()}`;
-      if (known.has(key)) continue;
-      known.add(key);
-      await repo.createOption({ group, value, isActive: true }).catch((error) => {
-        if (error?.code !== 11000) throw error;
-      });
+      candidates.set(`${group}::${value.toLowerCase()}`, { group, value });
     }
   }
+  if (!candidates.size) return;
+
+  // Look up only the words on this order instead of loading every option.
+  const values = [...new Set([...candidates.values()].map((row) => row.value))];
+  const groups = [...new Set([...candidates.values()].map((row) => row.group))];
+  const existing = await repo.findOptions({ group: { $in: groups }, value: { $in: values } }).collation(CASE_INSENSITIVE);
+  for (const option of existing) candidates.delete(`${option.group}::${String(option.value || '').trim().toLowerCase()}`);
+  if (!candidates.size) return;
+
+  await repo
+    .insertOptions([...candidates.values()].map((row) => ({ ...row, isActive: true })))
+    .catch((error) => {
+      // Another order added the same word meanwhile: fine.
+      if (error?.code !== 11000 && !(error?.writeErrors || []).every((row) => row.code === 11000)) throw error;
+    });
 }
 
 async function ensureTemplatesFromItems(rawItems = [], items = []) {
-  const templates = await repo.findTemplates();
+  const wantedNames = items.map((item) => String(item?.product || '').trim()).filter(Boolean);
+  if (!wantedNames.length) return rememberNewOptions(items);
+  const wantedCodes = items.map((item) => String(item?.productCode || '').trim()).filter(Boolean);
+  const wantedIds = items
+    .map((item) => String(item?.templateId || '').trim())
+    .filter((id) => /^[a-f0-9]{24}$/i.test(id));
+  // Only templates that could match this order, not the whole collection.
+  const templates = await repo
+    .findTemplates({
+      $or: [
+        { name: { $in: wantedNames } },
+        { product: { $in: wantedNames } },
+        ...(wantedCodes.length ? [{ code: { $in: wantedCodes } }, { productCode: { $in: wantedCodes } }] : []),
+        ...(wantedIds.length ? [{ _id: { $in: wantedIds } }] : []),
+      ],
+    })
+    .collation(CASE_INSENSITIVE);
   const byId = new Map(templates.map((template) => [String(template._id), template]));
   const names = new Set(
     templates.map((template) => String(template.product || template.name || '').trim().toLowerCase()).filter(Boolean)
@@ -200,6 +238,10 @@ async function ensureTemplatesFromItems(rawItems = [], items = []) {
     delete spec.currentStage;
     delete spec.stageWork;
     delete spec.amount;
+    // A template is shared by every customer: never carry one customer's price.
+    spec.rate = 0;
+    spec.discount = 0;
+    if (spec.manufacturing) spec.manufacturing = { ...spec.manufacturing, materialRate: 0 };
     const created = await repo.createTemplate(
       templatePayload({
         ...spec,
