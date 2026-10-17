@@ -574,7 +574,7 @@ async function clearCustomer(id, payload, user) {
 
 // ---------------------------------------------------------------- convert
 
-const COPY_FIELDS = ['product', 'productCode', 'productType', 'size', 'material', 'thickness', 'width', 'length', 'color', 'unit', 'taxPercent', 'manufacturing', 'roll', 'bag', 'printing', 'holes', 'tape', 'image', 'images', 'productionRoute'];
+const COPY_FIELDS = ['product', 'productCode', 'productType', 'size', 'material', 'thickness', 'width', 'length', 'color', 'unit', 'taxPercent', 'hsnCode', 'manufacturing', 'roll', 'bag', 'printing', 'holes', 'tape', 'image', 'images', 'productionRoute'];
 
 async function baseSpec(line, customerId) {
   if (line.source === 'customer' && line.sourceId) {

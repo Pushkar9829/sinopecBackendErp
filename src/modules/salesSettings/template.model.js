@@ -20,6 +20,7 @@ const templateSchema = new mongoose.Schema(
     rate: { type: Number, default: 0, min: 0 },
     discount: { type: Number, default: 0, min: 0 },
     taxPercent: { type: Number, default: 18, min: 0 },
+    hsnCode: { type: String, default: '', trim: true },
     productionRoute: {
       type: String,
       required: true,

@@ -16,6 +16,8 @@ function toPublicItem(item) {
     quantity: item.quantity,
     unitPrice: item.category === INVENTORY_CATEGORIES.WASTE ? null : item.unitPrice,
     notes: item.notes || '',
+    supplierId: item.supplier ? String(item.supplier._id || item.supplier) : '',
+    supplierName: item.supplierName || '',
     isActive: item.isActive,
     kind: item.kind || 'catalog',
     wipStage: item.wipStage || '',
@@ -125,6 +127,13 @@ async function syncLinkedOrder(orderId, user) {
   if (order) await require('../task/task.hooks').syncOrder(order, user);
 }
 
+// Raw material only; an empty id clears it.
+async function resolveSupplier(category, supplierId) {
+  if (!supplierId || category !== INVENTORY_CATEGORIES.RAW) return { supplier: null, supplierName: '' };
+  const supplier = await require('../supplier/supplier.service').loadSupplier(supplierId);
+  return { supplier: supplier._id, supplierName: supplier.name };
+}
+
 async function createItem(payload, user = null) {
   const category = payload.category;
   if (!Object.values(INVENTORY_CATEGORIES).includes(category)) {
@@ -144,6 +153,7 @@ async function createItem(payload, user = null) {
     notes: text(payload.notes, 'Notes'),
     isActive: payload.isActive !== false,
     salesOrder: jobWork?._id || null,
+    ...(await resolveSupplier(category, payload.supplierId)),
   });
 
   await syncLinkedOrder(jobWork?._id, user);
@@ -184,6 +194,8 @@ async function updateItem(id, payload, user = null) {
   }
   if (payload.notes !== undefined) updates.notes = text(payload.notes, 'Notes');
   if (payload.isActive !== undefined) updates.isActive = toBool(payload.isActive);
+  if (payload.supplierId !== undefined) Object.assign(updates, await resolveSupplier(category, payload.supplierId));
+  else if (category !== INVENTORY_CATEGORIES.RAW) Object.assign(updates, { supplier: null, supplierName: '' });
 
   const stageId = payload.stageId !== undefined ? payload.stageId : item.stage?._id || item.stage;
   updates.stage = await assertStage(category, stageId);

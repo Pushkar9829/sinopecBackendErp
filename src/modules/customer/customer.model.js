@@ -17,6 +17,7 @@ const customerProductSchema = new mongoose.Schema(
     rate: { type: Number, default: 0, min: 0 },
     discount: { type: Number, default: 0, min: 0 },
     taxPercent: { type: Number, default: 18, min: 0 },
+    hsnCode: { type: String, default: '', trim: true },
     productionRoute: {
       type: String,
       required: true,
@@ -46,6 +47,10 @@ const customerSchema = new mongoose.Schema(
     billingAddress: { type: String, default: '', trim: true },
     shippingAddress: { type: String, default: '', trim: true },
     priceCategory: { type: String, default: '', trim: true },
+    // Empty: the company's default credit days apply.
+    creditDays: { type: Number, default: null, min: 0 },
+    // Most the customer may owe at once; 0 means no limit.
+    creditLimit: { type: Number, default: 0, min: 0 },
     products: { type: [customerProductSchema], default: [] },
     isActive: { type: Boolean, default: true },
   },

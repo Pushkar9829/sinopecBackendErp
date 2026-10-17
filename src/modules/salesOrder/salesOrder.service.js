@@ -218,6 +218,7 @@ function toPublicItem(item) {
     rate: item.rate || 0,
     discount: item.discount || 0,
     taxPercent: item.taxPercent || 0,
+    hsnCode: item.hsnCode || '',
     amount: item.amount || 0,
     productionRoute: item.productionRoute,
     manufacturing: {
@@ -602,6 +603,7 @@ function normalizeItem(raw = {}) {
     rate: num(raw.rate),
     discount: num(raw.discount),
     taxPercent: num(raw.taxPercent),
+    hsnCode: str(raw.hsnCode).toUpperCase().replace(/\s+/g, ''),
     productionRoute,
     manufacturing,
     roll,
@@ -678,6 +680,13 @@ function assertIn(value, allowed, message) {
   if (!Object.values(allowed).includes(value)) {
     throw new ApiError(400, message);
   }
+}
+
+// Credit days typed on the order win; otherwise the customer's own, then the company default.
+async function creditDaysFor(value, customer) {
+  if (value !== undefined && value !== null && String(value).trim() !== '') return Math.max(0, Math.round(num(value)));
+  if (customer?.creditDays !== null && customer?.creditDays !== undefined) return customer.creditDays;
+  return require('../company/company.service').defaultCreditDays();
 }
 
 async function loadCustomer(customerId) {
@@ -1045,7 +1054,7 @@ async function createOrder(user, payload, options = {}) {
     status: SALES_ORDER_STATUSES.DRAFT,
     paymentTerms: payload.paymentTerms || PAYMENT_TERMS.CREDIT,
     paymentMethod: payload.paymentMethod || PAYMENT_METHODS.BANK_TRANSFER,
-    creditDays: Math.max(0, num(payload.creditDays)),
+    creditDays: await creditDaysFor(payload.creditDays, customer),
     advanceAmount: Math.max(0, num(payload.advanceAmount)),
     paymentRemarks: str(payload.paymentRemarks),
     billingAddress: str(payload.billingAddress) || snapshot.billingAddress,

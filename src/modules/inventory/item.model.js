@@ -15,6 +15,9 @@ const itemSchema = new mongoose.Schema(
     unitPrice: { type: Number, default: null, min: 0 },
     stage: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryStage', default: null },
     notes: { type: String, default: '', trim: true },
+    // Who the material was bought from (raw material only).
+    supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', default: null },
+    supplierName: { type: String, default: '', trim: true },
     isActive: { type: Boolean, default: true },
     kind: { type: String, enum: ['catalog', 'wip'], default: 'catalog' },
     wipStage: { type: String, default: '', trim: true },

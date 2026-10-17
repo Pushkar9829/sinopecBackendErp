@@ -47,6 +47,7 @@ function toPublicProduct(product) {
     rate: spec.rate,
     discount: spec.discount,
     taxPercent: spec.taxPercent,
+    hsnCode: spec.hsnCode || '',
     productionRoute: spec.productionRoute,
     manufacturing: spec.manufacturing,
     roll: spec.roll,
@@ -89,6 +90,8 @@ function toPublicCustomer(customer) {
     billingAddress: customer.billingAddress || '',
     shippingAddress: customer.shippingAddress || '',
     priceCategory: customer.priceCategory || '',
+    creditDays: customer.creditDays ?? null,
+    creditLimit: customer.creditLimit || 0,
     products: (customer.products || []).map(toPublicProduct),
     isActive: customer.isActive,
     createdAt: customer.createdAt,
@@ -115,8 +118,20 @@ function trim(value) {
   return value == null ? '' : String(value).trim();
 }
 
+// Empty means "not set"; anything else must be a number of zero or more.
+function optionalAmount(value, label) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new ApiError(400, `${label} must be zero or more`);
+  return parsed;
+}
+
 function payloadFromBody(payload) {
+  const creditDays = optionalAmount(payload.creditDays, 'Credit days');
+  if (creditDays !== null && (creditDays > 365 || !Number.isInteger(creditDays))) throw new ApiError(400, 'Credit days must be a whole number up to 365');
   return {
+    creditDays,
+    creditLimit: optionalAmount(payload.creditLimit, 'Credit limit') ?? 0,
     name: trim(payload.name),
     companyName: trim(payload.companyName),
     contactPerson: trim(payload.contactPerson),

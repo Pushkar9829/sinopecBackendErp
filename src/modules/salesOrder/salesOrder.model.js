@@ -26,6 +26,7 @@ const lineItemSchema = new mongoose.Schema(
     rate: { type: Number, default: 0, min: 0 },
     discount: { type: Number, default: 0, min: 0 },
     taxPercent: { type: Number, default: 0, min: 0 },
+    hsnCode: { type: String, default: '', trim: true },
     amount: { type: Number, default: 0, min: 0 },
     productionRoute: {
       type: String,

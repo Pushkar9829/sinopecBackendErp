@@ -21,6 +21,8 @@ const auditRoutes = require('./modules/audit/audit.routes');
 const taskRoutes = require('./modules/task/task.routes');
 const rateCalculatorRoutes = require('./modules/rateCalculator/rateCalculator.routes');
 const intakeRoutes = require('./modules/intake/intake.routes');
+const companyRoutes = require('./modules/company/company.routes');
+const supplierRoutes = require('./modules/supplier/supplier.routes');
 const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
@@ -105,6 +107,8 @@ app.use('/api/audit-logs', auditRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/rate-calculator', rateCalculatorRoutes);
 app.use('/api/intake', intakeRoutes);
+app.use('/api/company-settings', companyRoutes);
+app.use('/api/suppliers', supplierRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));

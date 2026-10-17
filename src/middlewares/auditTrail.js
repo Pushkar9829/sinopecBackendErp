@@ -23,6 +23,8 @@ const MODULE_LABELS = {
   media: 'Files',
   tasks: 'Tasks',
   intake: 'Draft orders',
+  'company-settings': 'Company details',
+  suppliers: 'Suppliers',
 };
 
 const MODELS = {
@@ -34,6 +36,7 @@ const MODELS = {
   'customers/': ['Customer', 'Customer'],
   'sales-orders/': ['SalesOrder', 'Order'],
   'tasks/': ['Task', 'Task'],
+  'suppliers/': ['Supplier', 'Supplier'],
   'sales-settings/options': ['SalesOption', 'List word'],
   'sales-settings/templates': ['ProductTemplate', 'Saved product'],
 };
