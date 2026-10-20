@@ -188,10 +188,21 @@ async function listTasks(user, query = {}) {
     filter.dueDate = { $lt: new Date() };
     filter.status = { $in: TASK_OPEN_STATUSES };
   }
+  // Who it is for: one person, nobody yet, or one role's queue.
+  const assignee = str(query.assignee);
+  if (assignee === 'unassigned') filter.assignee = null;
+  else if (mongoose.isValidObjectId(assignee)) filter.assignee = new mongoose.Types.ObjectId(assignee);
+  if (str(query.role)) filter.assigneeRole = str(query.role);
+  if (Object.values(ORDER_PRIORITIES).includes(str(query.priority))) filter.priority = str(query.priority);
+  const dayText = /^\d{4}-\d{2}-\d{2}$/;
+  const due = {};
+  if (dayText.test(str(query.dueFrom))) due.$gte = new Date(`${str(query.dueFrom)}T00:00:00.000+05:30`);
+  if (dayText.test(str(query.dueTo))) due.$lte = new Date(`${str(query.dueTo)}T23:59:59.999+05:30`);
+  if (Object.keys(due).length) filter.$and = [...(filter.$and || []), { dueDate: due }];
   const q = str(query.q);
   if (q) {
     const regex = new RegExp(escapeRegex(q), 'i');
-    filter.$and = [{ $or: [{ title: regex }, { orderNumber: regex }, { number: regex }, { assigneeName: regex }] }];
+    filter.$and = [...(filter.$and || []), { $or: [{ title: regex }, { orderNumber: regex }, { number: regex }, { assigneeName: regex }] }];
   }
 
   // ?page= returns one page plus the total; without it, the first 500 as

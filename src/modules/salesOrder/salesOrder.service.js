@@ -879,6 +879,40 @@ function listSearchFilter(q) {
   return { $or: or };
 }
 
+const DAY_TEXT = /^\d{4}-\d{2}-\d{2}$/;
+const LIST_SORTS = {
+  newest: { createdAt: -1 },
+  oldest: { createdAt: 1 },
+  delivery: { deliveryDate: 1, createdAt: -1 },
+  delivery_desc: { deliveryDate: -1, createdAt: -1 },
+};
+
+// List filters besides status/type/search: a date range on the order or the
+// delivery date, priority, and one customer.
+function listExtraFilter(query = {}) {
+  const filter = {};
+  const field = query.dateField === 'delivery' ? 'deliveryDate' : 'orderDate';
+  const range = {};
+  if (DAY_TEXT.test(str(query.from))) range.$gte = new Date(`${str(query.from)}T00:00:00.000+05:30`);
+  if (DAY_TEXT.test(str(query.to))) range.$lte = new Date(`${str(query.to)}T23:59:59.999+05:30`);
+  if (Object.keys(range).length) filter[field] = range;
+  if (Object.values(ORDER_PRIORITIES).includes(query.priority)) filter.priority = query.priority;
+  if (mongoose.isValidObjectId(query.customer)) filter.customer = new mongoose.Types.ObjectId(String(query.customer));
+  return filter;
+}
+
+function matchesExtraFilter(order, query = {}) {
+  const extra = listExtraFilter(query);
+  const field = query.dateField === 'delivery' ? 'deliveryDate' : 'orderDate';
+  if (extra[field]) {
+    const t = order[field] ? new Date(order[field]).getTime() : null;
+    if (t === null || (extra[field].$gte && t < extra[field].$gte.getTime()) || (extra[field].$lte && t > extra[field].$lte.getTime())) return false;
+  }
+  if (extra.priority && order.priority !== extra.priority) return false;
+  if (extra.customer && String(order.customer?.id || order.customer?._id || order.customer || '') !== String(extra.customer)) return false;
+  return true;
+}
+
 function activeStagesOf(order) {
   const seen = new Set();
   for (const item of order.items || []) {
@@ -909,7 +943,7 @@ async function listOrdersPage(user, query = {}) {
   const page = Math.max(Number(query.page) || 1, 1);
   const SalesOrder = require('./salesOrder.model');
 
-  const base = {};
+  const base = listExtraFilter(query);
   if (Object.values(ORDER_TYPES).includes(query.type)) base.orderType = query.type;
   const search = listSearchFilter(query.q);
 
@@ -917,7 +951,7 @@ async function listOrdersPage(user, query = {}) {
   // at their stations); that set is small, so it is filtered in memory.
   if (operatorStations(user).length) {
     const visible = (await listOrders(user)).filter(
-      (order) => (!base.orderType || order.orderType === base.orderType) && (!search || matchesListSearch(order, query.q))
+      (order) => (!base.orderType || order.orderType === base.orderType) && (!search || matchesListSearch(order, query.q)) && matchesExtraFilter(order, query)
     );
     const counts = countByStatus(visible);
     const closed = [SALES_ORDER_STATUSES.CANCELLED, SALES_ORDER_STATUSES.COMPLETED];
@@ -957,7 +991,7 @@ async function listOrdersPage(user, query = {}) {
     SalesOrder.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
     SalesOrder.countDocuments({ ...filter, ...statusFilter }),
     SalesOrder.find({ ...filter, ...statusFilter }, LIST_PROJECTION)
-      .sort({ createdAt: -1 })
+      .sort(LIST_SORTS[query.sort] || LIST_SORTS.newest)
       .skip((page - 1) * pageSize)
       .limit(pageSize)
       .lean(),

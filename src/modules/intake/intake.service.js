@@ -337,6 +337,12 @@ async function listDrafts(query = {}) {
   const pageSize = Math.min(100, Math.max(1, Number(query.pageSize) || 25));
   const filter = {};
   if (query.channel && ['whatsapp', 'gmail', 'panel', 'paste'].includes(query.channel)) filter.channel = query.channel;
+  // Received between two days (plant calendar).
+  const day = /^\d{4}-\d{2}-\d{2}$/;
+  const received = {};
+  if (day.test(String(query.from || ''))) received.$gte = new Date(`${query.from}T00:00:00.000+05:30`);
+  if (day.test(String(query.to || ''))) received.$lte = new Date(`${query.to}T23:59:59.999+05:30`);
+  if (Object.keys(received).length) filter.receivedAt = received;
   const q = String(query.q || '').trim();
   if (q) {
     const pattern = new RegExp(escapeRegex(q.slice(0, 80)), 'i');
