@@ -4,6 +4,8 @@ const authenticate = require('../../middlewares/authenticate');
 const authorize = require('../../middlewares/authorize');
 const validate = require('../../middlewares/validate');
 const productionController = require('./production.controller');
+const asyncHandler = require('../../utils/asyncHandler');
+const sheets = require('./production.sheets');
 
 const { FLOOR_STAGES } = require('./production.flow');
 
@@ -32,6 +34,22 @@ router.get(
   authorize.any(...VIEW_KEYS),
   validate([query('stage').optional().isIn(FLOOR_STAGE_IDS)]),
   productionController.listQueue
+);
+
+// Printable job sheet of one order (?stage= for one stage), and the work list of a stage.
+router.get(
+  '/job-sheet/:orderId',
+  authenticate,
+  authorize.any(...VIEW_KEYS),
+  validate([param('orderId').isMongoId(), query('stage').optional().isIn(FLOOR_STAGE_IDS)]),
+  asyncHandler(async (req, res) => res.json({ success: true, data: await sheets.jobSheet(req.user, req.params.orderId, { stage: req.query.stage }) }))
+);
+router.get(
+  '/stage-sheet/:stage',
+  authenticate,
+  authorize.any(...VIEW_KEYS),
+  validate([param('stage').isIn(FLOOR_STAGE_IDS)]),
+  asyncHandler(async (req, res) => res.json({ success: true, data: await sheets.stageSheet(req.user, req.params.stage) }))
 );
 
 router.get(
