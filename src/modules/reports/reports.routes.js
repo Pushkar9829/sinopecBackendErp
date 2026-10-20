@@ -8,6 +8,8 @@ const { overviewReport } = require('./reports.overview');
 const { salesReport } = require('./reports.sales');
 const { productionReport } = require('./reports.production');
 const { dispatchReport } = require('./reports.dispatch');
+const { stockReport } = require('./reports.stock');
+const { operationsReport } = require('./reports.operations');
 
 // Each report checks its own permission (Accounts, Sales, Production... see
 // the report files), so one login only sees the reports for its work.
@@ -22,6 +24,8 @@ router.get('/overview', authenticate, period, asyncHandler(async (req, res) => o
 router.get('/sales', authenticate, period, asyncHandler(async (req, res) => ok(res, await salesReport(req.user, req.query))));
 router.get('/production', authenticate, period, asyncHandler(async (req, res) => ok(res, await productionReport(req.user, req.query))));
 router.get('/dispatch', authenticate, period, asyncHandler(async (req, res) => ok(res, await dispatchReport(req.user, req.query))));
+router.get('/stock', authenticate, period, asyncHandler(async (req, res) => ok(res, await stockReport(req.user, req.query))));
+router.get('/operations', authenticate, period, asyncHandler(async (req, res) => ok(res, await operationsReport(req.user, req.query))));
 router.get('/accounts', authenticate, period, asyncHandler(async (req, res) => ok(res, await accountsReport(req.user, req.query))));
 
 module.exports = router;

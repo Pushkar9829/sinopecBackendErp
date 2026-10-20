@@ -1,7 +1,6 @@
 const ApiError = require('../../utils/ApiError');
 const { hasPermission } = require('../../utils/permissions');
 const { businessYmd } = require('../../utils/businessTime');
-const Customer = require('../customer/customer.model');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 const Invoice = require('../billing/invoice.model');
 const Receipt = require('../billing/receipt.model');
