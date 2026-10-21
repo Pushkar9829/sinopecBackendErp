@@ -3,6 +3,8 @@ const Customer = require('../customer/customer.model');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 const Invoice = require('../billing/invoice.model');
 const Receipt = require('../billing/receipt.model');
+const Supplier = require('../supplier/supplier.model');
+const { PurchaseBill, SupplierPayment, DebitNote } = require('../purchases/purchase.models');
 const { BookAccount, Voucher, BooksSettings } = require('./books.models');
 const { SYSTEM_ACCOUNTS, STARTER_ACCOUNTS } = require('./books.chart');
 
@@ -57,6 +59,21 @@ async function customerAccount(customerId) {
     { upsert: true, new: true }
   );
   customerAccountIds.set(id, doc._id);
+  return doc._id;
+}
+
+const supplierAccountIds = new Map();
+async function supplierAccount(supplierId) {
+  const id = String(supplierId);
+  if (supplierAccountIds.has(id)) return supplierAccountIds.get(id);
+  const supplier = await Supplier.findById(id).select('name code').lean();
+  const name = supplier ? `${supplier.name}${supplier.code ? ` (${supplier.code})` : ''}` : `Supplier ${id.slice(-6)}`;
+  const doc = await BookAccount.findOneAndUpdate(
+    { supplier: supplierId },
+    { $setOnInsert: { supplier: supplierId, group: 'sundry_creditors' }, $set: { name } },
+    { upsert: true, new: true }
+  );
+  supplierAccountIds.set(id, doc._id);
   return doc._id;
 }
 
@@ -175,6 +192,68 @@ async function postOrderMoney(order, sys, settings) {
   return results;
 }
 
+// Supplier bill: Dr purchases/expense and input GST, Cr the supplier.
+async function postPurchaseBill(bill, sys) {
+  const party = await supplierAccount(bill.supplier);
+  const lines = (bill.lines || []).map((l) => ({ account: l.account || sys.purchases, debit: l.taxable, credit: 0, note: l.description }));
+  const ro = Number(bill.roundOff) || 0;
+  return upsert(`pbill:${bill._id}`, {
+    type: 'purchase',
+    number: bill.number,
+    date: bill.billDate,
+    narration: `Bill ${bill.supplierBillNo} from ${bill.supplierName}`,
+    status: bill.status === 'cancelled' ? 'cancelled' : 'posted',
+    sourceRef: bill.supplierBillNo || bill.number,
+    sourceLink: `/suppliers/${bill.supplier}/account`,
+    lines: [
+      ...lines,
+      { account: sys.input_cgst, debit: bill.cgst || 0, credit: 0 },
+      { account: sys.input_sgst, debit: bill.sgst || 0, credit: 0 },
+      { account: sys.input_igst, debit: bill.igst || 0, credit: 0 },
+      { account: sys.round_off, debit: ro > 0 ? ro : 0, credit: ro < 0 ? -ro : 0 },
+      { account: party, debit: 0, credit: bill.total },
+    ],
+  });
+}
+
+async function postSupplierPayment(p, sys, settings) {
+  const party = await supplierAccount(p.supplier);
+  return upsert(`spay:${p._id}`, {
+    type: 'payment',
+    number: p.number,
+    date: p.paidAt,
+    narration: ['Paid to supplier', p.reference].filter(Boolean).join(' · '),
+    status: p.voidedAt ? 'cancelled' : 'posted',
+    sourceRef: p.number,
+    sourceLink: `/suppliers/${p.supplier}/account`,
+    lines: [
+      { account: party, debit: p.amount, credit: 0 },
+      { account: p.fromAccount || moneyAccount(sys, settings, p.method), debit: 0, credit: p.amount },
+    ],
+  });
+}
+
+// Debit note: Dr the supplier, Cr the purchase/expense and the input GST back.
+async function postDebitNote(n, sys) {
+  const party = await supplierAccount(n.supplier);
+  return upsert(`dnote:${n._id}`, {
+    type: 'debit_note',
+    number: n.number,
+    date: n.date,
+    narration: `Debit note: ${n.reason}`,
+    status: n.status === 'cancelled' ? 'cancelled' : 'posted',
+    sourceRef: n.number,
+    sourceLink: `/suppliers/${n.supplier}/account`,
+    lines: [
+      { account: party, debit: n.total, credit: 0 },
+      ...(n.lines || []).map((l) => ({ account: l.account || sys.purchases, debit: 0, credit: l.taxable, note: l.description })),
+      { account: sys.input_cgst, debit: 0, credit: n.cgst || 0 },
+      { account: sys.input_sgst, debit: 0, credit: n.sgst || 0 },
+      { account: sys.input_igst, debit: 0, credit: n.igst || 0 },
+    ],
+  });
+}
+
 let running = null;
 // Brings the books up to date with billing. `full` re-checks every document.
 async function syncBooks({ full = false } = {}) {
@@ -199,8 +278,12 @@ async function syncBooks({ full = false } = {}) {
       .select('number status customer orderDate advanceAmount paymentMethod payments')
       .lean();
     for (const order of orders) count(await postOrderMoney(order, sys, settings));
+    for (const bill of await PurchaseBill.find({ kind: 'purchase', ...changed }).lean()) count(await postPurchaseBill(bill, sys));
+    for (const p of await SupplierPayment.find(changed).lean()) count(await postSupplierPayment(p, sys, settings));
+    for (const n of await DebitNote.find(changed).lean()) count(await postDebitNote(n, sys));
     // Customer renames reach their account names on the next lookup.
     customerAccountIds.clear();
+    supplierAccountIds.clear();
     await BooksSettings.updateOne({ key: 'default' }, { $set: { syncedUntil: startedAt } });
     return counts;
   })().finally(() => {
@@ -209,4 +292,4 @@ async function syncBooks({ full = false } = {}) {
   return running;
 }
 
-module.exports = { ensureChart, systemAccounts, customerAccount, syncBooks };
+module.exports = { ensureChart, systemAccounts, customerAccount, supplierAccount, syncBooks };

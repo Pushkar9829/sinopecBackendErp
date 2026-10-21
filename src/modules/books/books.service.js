@@ -4,6 +4,7 @@ const { hasPermission, isSuperAdmin } = require('../../utils/permissions');
 const { nextSeq } = require('../../utils/counter');
 const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const Invoice = require('../billing/invoice.model');
+const { PurchaseBill } = require('../purchases/purchase.models');
 const { BookAccount, Voucher, BooksSettings } = require('./books.models');
 const { GROUPS, GROUP_BY_ID, natureOf } = require('./books.chart');
 const { ensureChart, syncBooks } = require('./books.post');
@@ -54,6 +55,7 @@ function present(account) {
     key: account.key || null,
     system: Boolean(account.key),
     customer: account.customer ? String(account.customer) : null,
+    supplier: account.supplier ? String(account.supplier) : null,
     party: Boolean(account.customer || account.supplier),
     openingDr: account.openingDr || 0,
     openingCr: account.openingCr || 0,
@@ -69,13 +71,20 @@ async function customerOpenings() {
   return new Map(rows.map((r) => [String(r._id), money(r.total)]));
 }
 
+// What the plant owed each supplier on the start date: their opening bills.
+async function supplierOpenings() {
+  const rows = await PurchaseBill.aggregate([{ $match: { kind: 'opening', status: 'issued' } }, { $group: { _id: '$supplier', total: { $sum: '$total' } } }]);
+  return new Map(rows.map((r) => [String(r._id), money(r.total)]));
+}
+
 // Net opening (debit positive) of every account.
 async function openingByAccount(accounts) {
-  const fromBills = await customerOpenings();
+  const [fromBills, owedToSuppliers] = await Promise.all([customerOpenings(), supplierOpenings()]);
   const map = new Map();
   for (const a of accounts) {
     const bills = a.customer ? fromBills.get(String(a.customer)) || 0 : 0;
-    map.set(String(a._id), money((a.openingDr || 0) - (a.openingCr || 0) + bills));
+    const owed = a.supplier ? owedToSuppliers.get(String(a.supplier)) || 0 : 0;
+    map.set(String(a._id), money((a.openingDr || 0) - (a.openingCr || 0) + bills - owed));
   }
   return map;
 }
@@ -170,7 +179,7 @@ async function updateAccount(user, id, payload = {}) {
   }
   if (payload.openingDr !== undefined || payload.openingCr !== undefined) {
     assert(canCorrect(user), 'Only Accounts managers and the owner can change opening balances');
-    if (account.customer) throw new ApiError(400, "A customer's opening balance comes from their opening bills");
+    if (account.customer || account.supplier) throw new ApiError(400, 'A customer or supplier opening balance comes from their opening bills');
     account.openingDr = Math.max(0, money(payload.openingDr ?? account.openingDr));
     account.openingCr = Math.max(0, money(payload.openingCr ?? account.openingCr));
   }
@@ -197,7 +206,7 @@ async function saveOpenings(user, rows = []) {
     const debit = Math.max(0, money(row.debit));
     const credit = Math.max(0, money(row.credit));
     if (debit > 0 && credit > 0) throw new ApiError(400, 'An opening balance is either debit or credit, not both');
-    await BookAccount.updateOne({ _id: row.accountId, customer: { $exists: false } }, { $set: { openingDr: debit, openingCr: credit } });
+    await BookAccount.updateOne({ _id: row.accountId, customer: { $exists: false }, supplier: { $exists: false } }, { $set: { openingDr: debit, openingCr: credit } });
   }
   return trialBalance(user, {});
 }
@@ -306,6 +315,7 @@ async function createVoucher(user, payload = {}) {
     if (a.isActive === false) throw new ApiError(400, `${a.name} is inactive`);
     // Customer balances come from billing (invoices, payments, opening bills).
     if (a.customer) throw new ApiError(400, `${a.name} is a customer account; record their bills and payments on the customer's account page`);
+    if (a.supplier) throw new ApiError(400, `${a.name} is a supplier account; record their bills, payments and debit notes under Purchases`);
   }
   const moneySide = (side) => lines.some((l) => l[side] > 0 && MONEY_GROUPS.includes(accounts.get(l.account).group));
   if (type === 'contra' && lines.some((l) => !MONEY_GROUPS.includes(accounts.get(l.account).group))) throw new ApiError(400, 'A contra entry only moves money between cash and bank accounts');

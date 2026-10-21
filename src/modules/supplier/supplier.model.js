@@ -11,6 +11,8 @@ const supplierSchema = new mongoose.Schema(
     email: { type: String, default: '', trim: true },
     address: { type: String, default: '', trim: true },
     materials: { type: String, default: '', trim: true },
+    // Days to pay their bills; empty means the company default.
+    creditDays: { type: Number, default: null, min: 0 },
     notes: { type: String, default: '', trim: true },
     isActive: { type: Boolean, default: true },
   },

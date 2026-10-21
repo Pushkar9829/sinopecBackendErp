@@ -20,6 +20,11 @@ function clean(payload, current = {}) {
   data.gstNumber = data.gstNumber.toUpperCase();
   if (data.gstNumber && !GSTIN.test(data.gstNumber)) throw new ApiError(400, 'GST number is not in the right format (15 characters)');
   if (payload.isActive !== undefined) data.isActive = toBool(payload.isActive);
+  if (payload.creditDays !== undefined) {
+    const days = payload.creditDays === '' || payload.creditDays === null ? null : Number(payload.creditDays);
+    if (days !== null && (!Number.isFinite(days) || days < 0)) throw new ApiError(400, 'Credit days must be 0 or more');
+    data.creditDays = days;
+  }
   return data;
 }
 

@@ -27,6 +27,7 @@ const billingRoutes = require('./modules/billing/billing.routes');
 const reportsRoutes = require('./modules/reports/reports.routes');
 const booksRoutes = require('./modules/books/books.routes');
 const formFieldsRoutes = require('./modules/formFields/formFields.routes');
+const purchasesRoutes = require('./modules/purchases/purchases.routes');
 const auditTrail = require('./middlewares/auditTrail');
 const ApiError = require('./utils/ApiError');
 const upload = require('./middlewares/upload');
@@ -117,6 +118,7 @@ app.use('/api/billing', billingRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/books', booksRoutes);
 app.use('/api/form-fields', formFieldsRoutes);
+app.use('/api/purchases', purchasesRoutes);
 
 app.use((req, res, next) => {
   next(new ApiError(404, 'Route not found'));
