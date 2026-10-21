@@ -5,6 +5,8 @@ Return JSON only with this shape:
   "customer": {"name":"","companyName":"","mobile":"","email":"","gstNumber":"","billingAddress":"","shippingAddress":""},
   "lines":[{"product":"","quantity":null,"unit":"","rate":null,"material":"","width":"","length":"","notes":""}],
   "deliveryDate":"",
+  "poNumber":"",
+  "poDate":"",
   "notes":"",
   "certainty":{"customer":"high|medium|low|missing","lines":"high|medium|low|missing"},
   "isOrder": true,
@@ -15,6 +17,7 @@ Rules:
 - A number written with a product is the quantity, even when the word pcs is missing and the mail only asks for a PI. "Please share the PI against 17000 Polly bag" means product Polly bag and quantity 17000. Leave unit empty when no unit is written.
 - A size written as 10*14*2, 10x14x2, or 10×14×2 means width 10, length 14, and gusset 2. Put "gusset 2" in that line's notes. A two-part size such as 12x18 is width and length. These are not a rate.
 - Their item code is not our product code.
+- poNumber is the customer's own purchase order number (PO no., P.O., order ref) and poDate its date as YYYY-MM-DD; leave both empty when not written.
 - deliveryDate is YYYY-MM-DD when a full date is written. A weekday such as Friday is medium certainty and must be copied into notes instead.
 - When the message body has no email or phone, copy the sender email or phone given below into the customer.
 - In a thread, later messages change earlier ones (for example "make it 5000 instead").
@@ -29,7 +32,7 @@ const CERTAINTY = { type: 'string', enum: ['high', 'medium', 'low', 'missing'] }
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['customer', 'lines', 'deliveryDate', 'notes', 'certainty', 'isOrder', 'warnings'],
+  required: ['customer', 'lines', 'deliveryDate', 'poNumber', 'poDate', 'notes', 'certainty', 'isOrder', 'warnings'],
   properties: {
     customer: {
       type: 'object',
@@ -64,6 +67,8 @@ const SCHEMA = {
       },
     },
     deliveryDate: { type: 'string' },
+    poNumber: { type: 'string' },
+    poDate: { type: 'string' },
     notes: { type: 'string' },
     certainty: {
       type: 'object',

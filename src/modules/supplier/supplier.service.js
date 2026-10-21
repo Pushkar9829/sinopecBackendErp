@@ -45,16 +45,18 @@ async function getSupplier(id) {
   return present(await loadSupplier(id));
 }
 
-async function createSupplier(payload = {}) {
+async function createSupplier(payload = {}, { checkFields = false } = {}) {
   const data = clean(payload);
+  if (checkFields) await require('../formFields/formFields.service').assertComplete('supplier', data, 'This supplier');
   await assertUniqueGst(data.gstNumber);
   data.code = `SUP-${String(await nextSeq('supplier')).padStart(5, '0')}`;
   return present(await Supplier.create(data));
 }
 
-async function updateSupplier(id, payload = {}) {
+async function updateSupplier(id, payload = {}, { checkFields = false } = {}) {
   const doc = await loadSupplier(id);
   const data = clean(payload, doc.toObject());
+  if (checkFields) await require('../formFields/formFields.service').assertComplete('supplier', data, 'This supplier');
   await assertUniqueGst(data.gstNumber, doc._id);
   doc.set(data);
   await doc.save();

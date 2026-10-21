@@ -11,6 +11,7 @@ const customerProductSchema = new mongoose.Schema(
     thickness: { type: String, default: '', trim: true },
     width: { type: String, default: '', trim: true },
     length: { type: String, default: '', trim: true },
+    flap: { type: String, default: '', trim: true },
     color: { type: String, default: '', trim: true },
     quantity: { type: Number, default: 0, min: 0 },
     unit: { type: String, default: 'pcs', trim: true },

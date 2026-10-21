@@ -20,6 +20,8 @@ const lineItemSchema = new mongoose.Schema(
     thickness: { type: String, default: '', trim: true },
     width: { type: String, default: '', trim: true },
     length: { type: String, default: '', trim: true },
+    // Flap (same unit as length); half of it is added to the length in the weight formula.
+    flap: { type: String, default: '', trim: true },
     color: { type: String, default: '', trim: true },
     quantity: { type: Number, default: 0, min: 0 },
     unit: { type: String, default: 'pcs', trim: true },
@@ -211,6 +213,9 @@ const salesOrderSchema = new mongoose.Schema(
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
     customerSnapshot: { type: customerSnapshotSchema, default: () => ({}) },
     deliveryDate: { type: Date, default: null },
+    // The customer's own purchase order, printed on the invoice.
+    customerPoNumber: { type: String, default: '', trim: true },
+    customerPoDate: { type: Date, default: null },
     priority: {
       type: String,
       enum: Object.values(ORDER_PRIORITIES),

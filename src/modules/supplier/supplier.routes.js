@@ -30,14 +30,14 @@ router.post(
   '/',
   authenticate,
   authorize('inventory:create'),
-  asyncHandler(async (req, res) => res.status(201).json({ success: true, data: await supplierService.createSupplier(req.body || {}) }))
+  asyncHandler(async (req, res) => res.status(201).json({ success: true, data: await supplierService.createSupplier(req.body || {}, { checkFields: true }) }))
 );
 router.patch(
   '/:id',
   authenticate,
   authorize('inventory:update'),
   validate([idParam]),
-  asyncHandler(async (req, res) => res.json({ success: true, data: await supplierService.updateSupplier(req.params.id, req.body || {}) }))
+  asyncHandler(async (req, res) => res.json({ success: true, data: await supplierService.updateSupplier(req.params.id, req.body || {}, { checkFields: true }) }))
 );
 router.delete(
   '/:id',

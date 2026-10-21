@@ -116,15 +116,22 @@ function jobWork(input = {}) {
   return { stages, total: round(total) };
 }
 
+// With a flap, half of it is added to the length: width × (length + flap ÷ 2) × gauge.
+function lengthText(length, flap) {
+  return flap > 0 ? `(${plain(length)} + ${plain(flap)} ÷ 2)` : plain(length);
+}
+
 function salesOrder(input = {}) {
   const divisor = num(input.divisor);
-  const weight = divisor > 0 ? (num(input.width) * num(input.length) * num(input.gauge)) / divisor : 0;
+  const flap = num(input.flap);
+  const length = num(input.length) + flap / 2;
+  const weight = divisor > 0 ? (num(input.width) * length * num(input.gauge)) / divisor : 0;
   const material = weight * num(input.materialRate);
   const kg = weight.toFixed(4);
   return {
     weight: round(weight, 4),
     material: round(material),
-    weightWorking: `${plain(input.width)} × ${plain(input.length)} × ${plain(input.gauge)} ÷ ${plain(input.divisor)} = ${kg} kg`,
+    weightWorking: `${plain(input.width)} × ${lengthText(num(input.length), flap)} × ${plain(input.gauge)} ÷ ${plain(input.divisor)} = ${kg} kg`,
     materialWorking: `${kg} kg × ₹${plain(input.materialRate)} = ${money(material)}`,
   };
 }
@@ -161,7 +168,8 @@ function gauge(value) {
 
 function rolling(input = {}) {
   const width = inches(input.width);
-  const length = inches(input.length);
+  const flap = inches(input.flap);
+  const length = inches(input.length) + flap / 2;
   const gaugeValue = gauge(input.gauge);
   const rate = num(input.materialRate);
   const weightPer1000 = (width * length * gaugeValue) / ROLLING_DIVISOR;
@@ -176,7 +184,7 @@ function rolling(input = {}) {
     materialPer1000: round(weightPer1000 * rate),
     totalMaterial: round(totalWeight * rate),
     weightWorking: ready
-      ? `${plain(width)} × ${plain(length)} × ${plain(gaugeValue)} ÷ ${ROLLING_DIVISOR} = ${weightPer1000.toFixed(4)} kg per 1,000 pcs`
+      ? `${plain(width)} × ${lengthText(length - flap / 2, flap)} × ${plain(gaugeValue)} ÷ ${ROLLING_DIVISOR} = ${weightPer1000.toFixed(4)} kg per 1,000 pcs`
       : '',
     totalWorking: ready && pcs > 0 ? `${weightPer1000.toFixed(4)} kg × ${plain(pcs)} pcs ÷ 1000 = ${totalWeight.toFixed(2)} kg` : '',
   };

@@ -169,11 +169,14 @@ async function getCustomer(id) {
   return toPublicCustomer(customer);
 }
 
-async function createCustomer(payload) {
+// `checkFields` (from the Customers screen) applies the owner's mandatory
+// inputs; imports and draft orders create customers without them.
+async function createCustomer(payload, { checkFields = false } = {}) {
   const data = payloadFromBody(payload);
   if (!data.name) {
     throw new ApiError(400, 'Customer name is required');
   }
+  if (checkFields) await require('../formFields/formFields.service').assertComplete('customer', data, 'This customer');
   data.code = await nextCustomerCode();
   data.isActive = payload.isActive === undefined ? true : toBool(payload.isActive);
   await storeListPhotos(payload.products);
@@ -182,7 +185,7 @@ async function createCustomer(payload) {
   return toPublicCustomer(customer);
 }
 
-async function updateCustomer(id, payload) {
+async function updateCustomer(id, payload, { checkFields = false } = {}) {
   const customer = await customerRepo.findById(id);
   if (!customer) {
     throw new ApiError(404, 'Customer not found');
@@ -192,6 +195,7 @@ async function updateCustomer(id, payload) {
   if (!data.name) {
     throw new ApiError(400, 'Customer name is required');
   }
+  if (checkFields) await require('../formFields/formFields.service').assertComplete('customer', data, 'This customer');
   if (payload.isActive !== undefined) data.isActive = toBool(payload.isActive);
   if (payload.products !== undefined && payload.products !== null) {
     if (!Array.isArray(payload.products)) {

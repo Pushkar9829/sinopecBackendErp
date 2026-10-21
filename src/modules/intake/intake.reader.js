@@ -20,6 +20,8 @@ function emptyProposal(warnings = []) {
     },
     lines: [],
     deliveryDate: '',
+    poNumber: '',
+    poDate: '',
     notes: '',
     certainty: { customer: 'missing', lines: 'missing' },
     isOrder: true,
@@ -68,6 +70,8 @@ function normalizeProposal(raw, extraWarnings = []) {
       }))
     : [];
   base.deliveryDate = String(raw?.deliveryDate || '');
+  base.poNumber = String(raw?.poNumber || '').slice(0, 60);
+  base.poDate = String(raw?.poDate || '');
   base.notes = String(raw?.notes || '');
   const level = (value) => (['high', 'medium', 'low', 'missing'].includes(value) ? value : 'missing');
   base.certainty = {

@@ -34,6 +34,7 @@ function specRows(order, item, stage) {
   const rows = [
     ['Product', [req.product, req.productCode && req.productCode !== req.product ? `(${req.productCode})` : ''].filter(Boolean).join(' ')],
     ['Size', req.size],
+    ['Flap', item.flap],
     ['Colour', req.color],
   ];
   if (stage === 'rolling') {

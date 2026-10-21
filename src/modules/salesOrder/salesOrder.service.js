@@ -193,6 +193,7 @@ function rollingFor(item) {
   return rateCalculator.rolling({
     width: item.width || item.manufacturing?.width,
     length: item.length || item.manufacturing?.length,
+    flap: item.flap,
     gauge: item.thickness || item.manufacturing?.thickness,
     materialRate: item.manufacturing?.materialRate,
     quantity: item.quantity,
@@ -212,6 +213,7 @@ function toPublicItem(item) {
     thickness: item.thickness || '',
     width: item.width || '',
     length: item.length || '',
+    flap: item.flap || '',
     color: item.color || '',
     quantity: item.quantity || 0,
     unit: item.unit || 'pcs',
@@ -309,6 +311,8 @@ function toPublicOrder(order) {
       ...(order.customerSnapshot?.toObject?.() || order.customerSnapshot || {}),
     },
     deliveryDate: order.deliveryDate,
+    customerPoNumber: order.customerPoNumber || '',
+    customerPoDate: order.customerPoDate || null,
     priority: order.priority,
     status: order.status,
     paymentTerms: order.paymentTerms,
@@ -601,6 +605,7 @@ function normalizeItem(raw = {}) {
     thickness: str(raw.thickness),
     width: str(raw.width),
     length: str(raw.length),
+    flap: str(raw.flap),
     color: str(raw.color),
     quantity: num(raw.quantity),
     unit: str(raw.unit) || 'pcs',
@@ -733,6 +738,8 @@ function applyHeader(doc, payload, snapshot) {
     assertOrderDateWindow(doc.orderDate);
   }
   if (payload.deliveryDate !== undefined) doc.deliveryDate = parseDate(payload.deliveryDate, 'Delivery date');
+  if (payload.customerPoNumber !== undefined) doc.customerPoNumber = str(payload.customerPoNumber);
+  if (payload.customerPoDate !== undefined) doc.customerPoDate = parseDate(payload.customerPoDate, 'PO date');
   if (payload.priority !== undefined) {
     assertIn(payload.priority, ORDER_PRIORITIES, 'Priority must be normal, high, or urgent');
     doc.priority = payload.priority;
@@ -772,33 +779,19 @@ function assertDraftComplete(items) {
   }
 }
 
-// Lists every gap at once so the order can be fixed in one pass.
-function assertReadyToSubmit(order) {
+// Lists every gap at once so the order can be fixed in one pass. Which inputs
+// are mandatory is set by the owner (Settings → Form fields).
+async function assertReadyToSubmit(order) {
+  const formFields = require('../formFields/formFields.service');
   const problems = [];
-  if (!order.deliveryDate) problems.push('Delivery date is required before submit');
+  const header = await formFields.missing('order', order);
+  if (header.length) problems.push(`The order needs ${header.join(', ')}`);
   if (!order.items.length) problems.push('Add at least one product before submit');
-  order.items.forEach((item, index) => {
-    const missing = [];
-    if (!item.product) missing.push('product name');
-    if (!item.productCode) missing.push('product code');
-    if (!item.productType) missing.push('product type');
-    if (!str(item.width) || !str(item.length)) missing.push('width and length');
-    if (!item.material) missing.push('material');
-    if (!item.quantity) missing.push('quantity');
-    if (!item.unit) missing.push('unit');
-    if (
-      routeStages(item.productionRoute)[0] === 'rolling' &&
-      String(item.unit || '').toLowerCase() !== 'kg' &&
-      !(Number(String(item.manufacturing?.requiredWeight || '').replace(/,/g, '').match(/\d+(\.\d+)?/)?.[0]) > 0)
-    ) {
-      missing.push('required weight (kg), so rolling knows when it is finished');
-    }
-    if (routeHasPrint(item.productionRoute) && !item.printing?.colorCount && !item.printing?.colors) {
-      missing.push('an impression (like 1+1) or printing colours');
-    }
+  for (const [index, item] of order.items.entries()) {
+    const missing = await formFields.missing('orderLine', item);
     if (item.rate < 0) missing.push('a valid rate');
     if (missing.length) problems.push(`Line ${index + 1} (${item.product || 'unnamed'}) needs ${missing.join(', ')}`);
-  });
+  }
   if (problems.length) throw new ApiError(400, problems.join('\n'));
 }
 
@@ -833,6 +826,7 @@ const LIST_PROJECTION = {
   orderType: 1,
   orderDate: 1,
   deliveryDate: 1,
+  customerPoNumber: 1,
   priority: 1,
   status: 1,
   grandTotal: 1,
@@ -869,6 +863,7 @@ function listSearchFilter(q) {
     { 'customerSnapshot.name': regex },
     { 'customerSnapshot.code': regex },
     { 'customerSnapshot.companyName': regex },
+    { customerPoNumber: regex },
   ];
   const statuses = Object.values(SALES_ORDER_STATUSES).filter((status) => status.replace(/_/g, ' ').includes(text));
   if (statuses.length) or.push({ status: { $in: statuses } });
@@ -930,6 +925,7 @@ function toListRow(order, user) {
     orderType: order.orderType || ORDER_TYPES.SALES_ORDER,
     orderDate: order.orderDate,
     deliveryDate: order.deliveryDate,
+    customerPoNumber: order.customerPoNumber || '',
     priority: order.priority,
     status: order.status,
     customer: { name: snapshot.name || '', code: snapshot.code || '', companyName: snapshot.companyName || '' },
@@ -1097,6 +1093,8 @@ async function createOrder(user, payload, options = {}) {
     customer: customer._id,
     customerSnapshot: snapshot,
     deliveryDate: parseDate(payload.deliveryDate, 'Delivery date'),
+    customerPoNumber: str(payload.customerPoNumber),
+    customerPoDate: parseDate(payload.customerPoDate, 'PO date'),
     priority: payload.priority || ORDER_PRIORITIES.NORMAL,
     status: SALES_ORDER_STATUSES.DRAFT,
     paymentTerms: payload.paymentTerms || PAYMENT_TERMS.CREDIT,
@@ -1219,7 +1217,7 @@ async function submitOrder(user, id) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft orders can be submitted');
   }
-  assertReadyToSubmit(order);
+  await assertReadyToSubmit(order);
   // The draft may be weeks old: take the customer's current GST number and
   // addresses, and refuse a customer that has since been deactivated.
   const customer = await loadCustomer(order.customer?._id || order.customer);

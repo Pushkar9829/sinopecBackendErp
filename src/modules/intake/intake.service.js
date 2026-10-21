@@ -661,6 +661,8 @@ async function convert(id, payload, user) {
         customerId: String(doc.customer),
         orderType: payload.orderType === 'job_work' ? 'job_work' : 'sales_order',
         deliveryDate: payload.deliveryDate !== undefined ? payload.deliveryDate || null : deliveryDateFrom(proposal.deliveryDate),
+        customerPoNumber: payload.customerPoNumber ?? proposal.poNumber ?? '',
+        customerPoDate: payload.customerPoDate !== undefined ? payload.customerPoDate || null : deliveryDateFrom(proposal.poDate),
         billingAddress: proposal.customer?.billingAddress || '',
         shippingAddress: proposal.customer?.shippingAddress || '',
         remarks: [`From draft order ${doc.number} (${doc.channel})`, String(payload.remarks ?? proposal.notes ?? '').trim()].filter(Boolean).join('. '),

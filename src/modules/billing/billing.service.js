@@ -234,6 +234,8 @@ async function createInvoice(user, orderId, payload = {}) {
           seller: company,
           salesOrder: order._id,
           orderNumber: order.number,
+          poNumber: order.customerPoNumber || '',
+          poDate: order.customerPoDate || null,
           orderType: order.orderType,
           invoiceDate,
           creditDays,

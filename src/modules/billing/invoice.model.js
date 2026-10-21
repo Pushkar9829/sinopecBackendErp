@@ -50,6 +50,8 @@ const invoiceSchema = new mongoose.Schema(
     seller: { type: mongoose.Schema.Types.Mixed, default: null },
     salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     orderNumber: { type: String, default: '' },
+    poNumber: { type: String, default: '' },
+    poDate: { type: Date, default: null },
     orderType: { type: String, default: '' },
     invoiceDate: { type: Date, required: true },
     creditDays: { type: Number, default: 0, min: 0 },

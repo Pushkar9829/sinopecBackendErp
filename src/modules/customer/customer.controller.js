@@ -12,12 +12,12 @@ const getOne = asyncHandler(async (req, res) => {
 });
 
 const create = asyncHandler(async (req, res) => {
-  const customer = await customerService.createCustomer(req.body);
+  const customer = await customerService.createCustomer(req.body, { checkFields: true });
   res.status(201).json({ success: true, data: customer });
 });
 
 const update = asyncHandler(async (req, res) => {
-  const customer = await customerService.updateCustomer(req.params.id, req.body);
+  const customer = await customerService.updateCustomer(req.params.id, req.body, { checkFields: true });
   res.json({ success: true, data: customer });
 });
 

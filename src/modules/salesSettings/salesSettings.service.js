@@ -119,15 +119,19 @@ function templatePayload(payload) {
 }
 
 async function createTemplate(payload) {
+  const data = templatePayload(payload);
+  await require('../formFields/formFields.service').assertComplete('template', data, 'This product');
   await storeProductPhotos(payload);
-  return toPublicTemplate(await repo.createTemplate(templatePayload(payload)));
+  return toPublicTemplate(await repo.createTemplate(data));
 }
 
 async function updateTemplate(id, payload) {
   const template = await repo.findTemplate(id);
   if (!template) throw new ApiError(404, 'Template not found');
+  const data = templatePayload({ ...template.toObject(), ...payload });
+  await require('../formFields/formFields.service').assertComplete('template', data, 'This product');
   await storeProductPhotos(payload);
-  return toPublicTemplate(await repo.updateTemplate(id, templatePayload({ ...template.toObject(), ...payload })));
+  return toPublicTemplate(await repo.updateTemplate(id, data));
 }
 
 async function deleteTemplate(id) {
