@@ -50,6 +50,10 @@ const voucherSchema = new mongoose.Schema(
     sourceKey: { type: String, default: undefined },
     sourceRef: { type: String, default: '' },
     sourceLink: { type: String, default: '' },
+    // Quick expense entries: who was paid and their bill, for the expense list.
+    kind: { type: String, default: undefined },
+    paidTo: { type: String, default: '', trim: true },
+    billNo: { type: String, default: '', trim: true },
     createdBy: { type: ObjectId, ref: 'User', default: null },
     createdByName: { type: String, default: '' },
     cancelledAt: { type: Date, default: null },
@@ -62,6 +66,7 @@ voucherSchema.index({ sourceKey: 1 }, { unique: true, partialFilterExpression: {
 voucherSchema.index({ type: 1, number: 1 }, { unique: true });
 voucherSchema.index({ date: 1, _id: 1 });
 voucherSchema.index({ 'lines.account': 1, date: 1 });
+voucherSchema.index({ kind: 1, date: -1 }, { partialFilterExpression: { kind: { $type: 'string' } } });
 
 const settingsSchema = new mongoose.Schema(
   {
