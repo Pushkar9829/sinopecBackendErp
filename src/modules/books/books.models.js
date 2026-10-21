@@ -86,4 +86,31 @@ const BookAccount = mongoose.models.BookAccount || mongoose.model('BookAccount',
 const Voucher = mongoose.models.Voucher || mongoose.model('Voucher', voucherSchema);
 const BooksSettings = mongoose.models.BooksSettings || mongoose.model('BooksSettings', settingsSchema);
 
-module.exports = { BookAccount, Voucher, BooksSettings };
+// Value of stock on hand on a day (from the stock count), entered by Accounts.
+// It closes the P&L for a period ending that day and opens the next one.
+const closingStockSchema = new mongoose.Schema(
+  {
+    day: { type: String, required: true, unique: true, match: /^\d{4}-\d{2}-\d{2}$/ },
+    value: { type: Number, required: true, min: 0 },
+    note: { type: String, default: '', trim: true },
+    byName: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+const ClosingStock = mongoose.models.ClosingStock || mongoose.model('ClosingStock', closingStockSchema);
+
+// A financial year that has been closed: the books are locked to its last
+// day, with the year's result kept as it was at closing.
+const yearCloseSchema = new mongoose.Schema(
+  {
+    fy: { type: String, required: true, unique: true },
+    endDay: { type: String, required: true },
+    netProfit: { type: Number, default: 0 },
+    closingStock: { type: Number, default: 0 },
+    closedByName: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+const YearClose = mongoose.models.YearClose || mongoose.model('YearClose', yearCloseSchema);
+
+module.exports = { BookAccount, Voucher, BooksSettings, ClosingStock, YearClose };

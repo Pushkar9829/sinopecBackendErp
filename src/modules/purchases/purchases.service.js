@@ -8,6 +8,7 @@ const InventoryItem = require('../inventory/item.model');
 const companyService = require('../company/company.service');
 const { BookAccount, BooksSettings } = require('../books/books.models');
 const { ensureChart } = require('../books/books.post');
+const { assertOpenPeriod: lockCheck } = require('../books/books.lock');
 const { PurchaseBill, SupplierPayment, DebitNote } = require('./purchase.models');
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -65,9 +66,8 @@ async function booksSettings() {
 }
 // Entries before the books start or in a locked period cannot change.
 async function assertOpenPeriod(date, what) {
-  const s = await booksSettings();
-  if (s.lockDate && date <= s.lockDate) throw new ApiError(400, `The books are locked up to ${businessYmd(s.lockDate)}; ${what} cannot be changed`);
-  return s;
+  await lockCheck(date, what);
+  return booksSettings();
 }
 
 async function loadSupplier(id) {

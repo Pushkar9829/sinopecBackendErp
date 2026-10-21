@@ -5,8 +5,7 @@ const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const { hasPermission, isSuperAdmin } = require('../../utils/permissions');
 const Customer = require('../customer/customer.model');
 const companyService = require('../company/company.service');
-const { BooksSettings } = require('../books/books.models');
-const { ensureChart } = require('../books/books.post');
+const { assertOpenPeriod } = require('../books/books.lock');
 const Invoice = require('./invoice.model');
 const CreditNote = require('./creditNote.model');
 const billing = require('./billing.service');
@@ -33,12 +32,6 @@ function parseDay(value, label) {
   const date = new Date(`${text}T12:00:00+05:30`);
   if (date.getTime() > endOfBusinessDay(new Date()).getTime()) throw new ApiError(400, `${label} cannot be in the future`);
   return date;
-}
-
-async function assertOpenPeriod(date, what) {
-  await ensureChart();
-  const s = await BooksSettings.findOne({ key: 'default' }).lean();
-  if (s?.lockDate && date <= s.lockDate) throw new ApiError(400, `The books are locked up to ${businessYmd(s.lockDate)}; ${what} cannot be changed`);
 }
 
 async function nextNumber(prefix, date) {

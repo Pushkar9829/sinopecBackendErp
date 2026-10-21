@@ -316,6 +316,7 @@ async function createVoucher(user, payload = {}) {
     // Customer balances come from billing (invoices, payments, opening bills).
     if (a.customer) throw new ApiError(400, `${a.name} is a customer account; record their bills and payments on the customer's account page`);
     if (a.supplier) throw new ApiError(400, `${a.name} is a supplier account; record their bills, payments and debit notes under Purchases`);
+    if (a.group === 'stock') throw new ApiError(400, `${a.name} is a stock account; enter the stock value as closing stock on the Statements page`);
   }
   const moneySide = (side) => lines.some((l) => l[side] > 0 && MONEY_GROUPS.includes(accounts.get(l.account).group));
   if (type === 'contra' && lines.some((l) => !MONEY_GROUPS.includes(accounts.get(l.account).group))) throw new ApiError(400, 'A contra entry only moves money between cash and bank accounts');
@@ -443,4 +444,6 @@ module.exports = {
   trialBalance,
   resync,
   TYPE_LABEL,
+  openingByAccount,
+  movements,
 };

@@ -12,6 +12,7 @@ const { stageStats } = require('../production/production.flow');
 const Invoice = require('./invoice.model');
 const Receipt = require('./receipt.model');
 const CreditNote = require('./creditNote.model');
+const { assertOpenPeriod } = require('../books/books.lock');
 
 const DAY = 24 * 60 * 60 * 1000;
 const EPS = 0.005;
@@ -176,6 +177,7 @@ async function createInvoice(user, orderId, payload = {}) {
   if (!company.gstin) throw new ApiError(400, 'Add your GSTIN in Company details before making invoices');
   const invoiceDate = parseDay(payload.invoiceDate || new Date(), 'Invoice date');
   if (invoiceDate.getTime() > Date.now() + DAY) throw new ApiError(400, 'Invoice date cannot be in the future');
+  await assertOpenPeriod(invoiceDate, 'an invoice dated then');
   const buyer = buyerOf(customer, order);
   const intraState = !buyer.stateCode || buyer.stateCode === company.stateCode;
   const wanted = new Map((Array.isArray(payload.lines) ? payload.lines : []).map((line) => [String(line.itemId), Number(line.quantity) || 0]));
@@ -264,6 +266,8 @@ async function cancelInvoice(user, id, reason) {
   assert(canCorrect(user), 'Only Accounts or the Super Admin can cancel invoices');
   const why = str(reason);
   if (!why) throw new ApiError(400, 'Give a reason for cancelling');
+  const current = mongoose.isValidObjectId(id) ? await Invoice.findById(id).select('invoiceDate kind').lean() : null;
+  if (current?.kind === 'sale') await assertOpenPeriod(current.invoiceDate, 'this invoice');
   const updated = await Invoice.findOneAndUpdate(
     { _id: id, status: 'issued' },
     { $set: { status: 'cancelled', cancelledAt: new Date(), cancelledByName: actor(user), cancelReason: why } },
@@ -378,6 +382,7 @@ async function addReceipt(user, customerId, payload = {}) {
   if (tds > amount) throw new ApiError(400, 'TDS looks too high: it is a small part of the bill (usually 0.1%–10%)');
   const receivedAt = parseDay(payload.receivedAt || new Date(), 'Received date');
   if (receivedAt.getTime() > Date.now() + DAY) throw new ApiError(400, 'Received date cannot be in the future');
+  await assertOpenPeriod(receivedAt, 'a payment dated then');
   const method = str(payload.method) || PAYMENT_METHODS.BANK_TRANSFER;
   if (!Object.values(PAYMENT_METHODS).includes(method)) throw new ApiError(400, 'Invalid payment method');
   let invoice = null;
@@ -412,6 +417,8 @@ async function voidReceipt(user, id, reason) {
   assert(canCorrect(user), 'Only Accounts or the Super Admin can void payments');
   const why = str(reason);
   if (!why) throw new ApiError(400, 'Give a reason for voiding');
+  const current = mongoose.isValidObjectId(id) ? await Receipt.findById(id).select('receivedAt').lean() : null;
+  if (current) await assertOpenPeriod(current.receivedAt, 'this payment');
   const updated = await Receipt.findOneAndUpdate(
     { _id: id, voidedAt: null },
     { $set: { voidedAt: new Date(), voidedByName: actor(user), voidReason: why } },

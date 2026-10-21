@@ -1166,6 +1166,10 @@ async function updateOrder(user, id, rawPayload) {
     order.customerSnapshot = snapshot;
   }
 
+  // The advance is in the books on the order date; a locked period keeps it.
+  if (payload.advanceAmount !== undefined && Math.abs(Math.max(0, num(payload.advanceAmount)) - (Number(order.advanceAmount) || 0)) > 0.004) {
+    await require('../books/books.lock').assertOpenPeriod(order.orderDate, 'the advance on this order');
+  }
   applyHeader(order, payload, snapshot);
   const orderType = order.orderType || ORDER_TYPES.SALES_ORDER;
   if (payload.items !== undefined) await storeListPhotos(payload.items);
@@ -1522,6 +1526,7 @@ async function recordPayment(user, id, payload = {}) {
   if (receivedAt && receivedAt.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
     throw new ApiError(400, 'Received date cannot be in the future');
   }
+  await require('../books/books.lock').assertOpenPeriod(receivedAt || new Date(), 'a payment dated then');
   order.payments.push({
     amount,
     method,
@@ -1550,6 +1555,7 @@ async function removePayment(user, id, paymentId, reason) {
   const payment = order.payments.id(paymentId);
   if (!payment) throw new ApiError(404, 'Payment not found');
   if (payment.voidedAt) throw new ApiError(400, 'This payment is already voided');
+  await require('../books/books.lock').assertOpenPeriod(payment.receivedAt, 'this payment');
   const why = str(reason);
   if (why.length < 3) throw new ApiError(400, 'Give a reason for voiding this payment (for example "refunded" or "entered twice")');
   payment.voidedAt = new Date();
