@@ -2319,6 +2319,11 @@ async function resetDemoCollections() {
     mongoose.connection.collection('tasks').deleteMany({}),
     mongoose.connection.collection('invoices').deleteMany({}),
     mongoose.connection.collection('receipts').deleteMany({}),
+    // The books are rebuilt from billing, so they go with it (accounts and settings stay).
+    mongoose.connection.collection('vouchers').deleteMany({}),
+    mongoose.connection.collection('bookaccounts').deleteMany({ customer: { $exists: true } }),
+    mongoose.connection.collection('bookaccounts').updateMany({}, { $set: { openingDr: 0, openingCr: 0 } }),
+    mongoose.connection.collection('bookssettings').updateMany({}, { $set: { syncedUntil: null } }),
   ]);
   await mongoose.connection.collection('counters').deleteMany({});
   console.log('Reset demo customers, orders, inventory, registers, and sales settings');
