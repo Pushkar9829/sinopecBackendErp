@@ -10,6 +10,9 @@ const receiptSchema = new mongoose.Schema(
     invoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     receivedAt: { type: Date, required: true },
     amount: { type: Number, required: true, min: 0.01 },
+    // Income tax the customer deducted (TDS): settles the bill with the money received.
+    tds: { type: Number, default: 0, min: 0 },
+    tdsSection: { type: String, default: '', trim: true },
     method: { type: String, default: 'bank_transfer' },
     reference: { type: String, default: '', trim: true },
     note: { type: String, default: '', trim: true },

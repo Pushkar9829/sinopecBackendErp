@@ -4,6 +4,7 @@ const authenticate = require('../../middlewares/authenticate');
 const validate = require('../../middlewares/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const books = require('./books.service');
+const { tdsSummary } = require('./books.tds');
 
 // The books (chart of accounts, vouchers, ledger, trial balance). Each action
 // checks accounts permissions in the service.
@@ -26,6 +27,7 @@ router.post('/vouchers', authenticate, asyncHandler(async (req, res) => ok(res, 
 router.post('/vouchers/:id/cancel', authenticate, id('id'), asyncHandler(async (req, res) => ok(res, await books.cancelVoucher(req.user, req.params.id, req.body?.reason))));
 
 router.get('/ledger/:accountId', authenticate, id('accountId'), asyncHandler(async (req, res) => ok(res, await books.ledger(req.user, req.params.accountId, req.query))));
+router.get('/tds', authenticate, asyncHandler(async (req, res) => ok(res, await tdsSummary(req.user, req.query))));
 router.get('/trial-balance', authenticate, asyncHandler(async (req, res) => ok(res, await books.trialBalance(req.user, req.query))));
 router.post('/sync', authenticate, asyncHandler(async (req, res) => ok(res, await books.resync(req.user))));
 

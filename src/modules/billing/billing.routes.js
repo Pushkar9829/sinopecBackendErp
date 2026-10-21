@@ -4,6 +4,7 @@ const authenticate = require('../../middlewares/authenticate');
 const validate = require('../../middlewares/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const billing = require('./billing.service');
+const notes = require('./creditNotes.service');
 
 // Each action checks its own permission in the service (Accounts, Sales and
 // the Super Admin share this area with different rights).
@@ -24,5 +25,11 @@ router.post('/customers/:id/openings', authenticate, validate([id('id')]), async
 router.post('/openings/import', authenticate, asyncHandler(async (req, res) => ok(res, await billing.importOpeningBills(req.user, req.body?.rows, req.body?.apply === true))));
 router.post('/customers/:id/receipts', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await billing.addReceipt(req.user, req.params.id, req.body || {}), 201)));
 router.post('/receipts/:id/void', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await billing.voidReceipt(req.user, req.params.id, req.body?.reason))));
+
+router.post('/customers/:id/credit-notes', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await notes.createCreditNote(req.user, req.params.id, req.body || {}), 201)));
+router.post('/customers/:id/write-offs', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await notes.writeOff(req.user, req.params.id, req.body || {}), 201)));
+router.get('/credit-notes', authenticate, asyncHandler(async (req, res) => ok(res, await notes.listNotes(req.user, req.query))));
+router.get('/credit-notes/:id', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await notes.getNote(req.user, req.params.id))));
+router.post('/credit-notes/:id/cancel', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await notes.cancelNote(req.user, req.params.id, req.body?.reason))));
 
 module.exports = router;

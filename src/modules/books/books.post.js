@@ -3,6 +3,7 @@ const Customer = require('../customer/customer.model');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 const Invoice = require('../billing/invoice.model');
 const Receipt = require('../billing/receipt.model');
+const CreditNote = require('../billing/creditNote.model');
 const Supplier = require('../supplier/supplier.model');
 const { PurchaseBill, SupplierPayment, DebitNote } = require('../purchases/purchase.models');
 const { BookAccount, Voucher, BooksSettings } = require('./books.models');
@@ -145,7 +146,8 @@ async function postReceipt(r, sys, settings) {
     sourceLink: `/customers/${r.customer}/account`,
     lines: [
       { account: moneyAccount(sys, settings, r.method), debit: r.amount, credit: 0 },
-      { account: party, debit: 0, credit: r.amount },
+      { account: sys.tds_receivable, debit: r.tds || 0, credit: 0 },
+      { account: party, debit: 0, credit: money(r.amount + (r.tds || 0)) },
     ],
   });
 }
@@ -189,6 +191,13 @@ async function postOrderMoney(order, sys, settings) {
       })
     );
   }
+  // A payment taken off the order altogether (not just voided) leaves the books too.
+  const keep = new Set((order.payments || []).map((p) => `orderpay:${order._id}:${p._id}`));
+  const gone = await Voucher.find({ sourceKey: new RegExp(`^orderpay:${order._id}:`), status: 'posted' }, 'sourceKey').lean();
+  for (const v of gone.filter((x) => !keep.has(x.sourceKey))) {
+    await Voucher.updateOne({ _id: v._id }, { $set: { status: 'cancelled' } });
+    results.push('updated');
+  }
   return results;
 }
 
@@ -227,8 +236,9 @@ async function postSupplierPayment(p, sys, settings) {
     sourceRef: p.number,
     sourceLink: `/suppliers/${p.supplier}/account`,
     lines: [
-      { account: party, debit: p.amount, credit: 0 },
+      { account: party, debit: money(p.amount + (p.tds || 0)), credit: 0 },
       { account: p.fromAccount || moneyAccount(sys, settings, p.method), debit: 0, credit: p.amount },
+      { account: sys.tds_payable, debit: 0, credit: p.tds || 0 },
     ],
   });
 }
@@ -250,6 +260,39 @@ async function postDebitNote(n, sys) {
       { account: sys.input_cgst, debit: 0, credit: n.cgst || 0 },
       { account: sys.input_sgst, debit: 0, credit: n.sgst || 0 },
       { account: sys.input_igst, debit: 0, credit: n.igst || 0 },
+    ],
+  });
+}
+
+// Credit note: Dr sales returns and output GST, Cr the customer.
+// Write-off: Dr bad debts, Cr the customer.
+async function postCreditNote(n, sys) {
+  const party = await customerAccount(n.customer);
+  const status = n.status === 'cancelled' ? 'cancelled' : 'posted';
+  const base = { number: n.number, date: n.date, status, sourceRef: n.number, sourceLink: n.kind === 'credit_note' ? `/credit-notes/${n._id}/print` : `/customers/${n.customer}/account` };
+  if (n.kind === 'write_off') {
+    return upsert(`cnote:${n._id}`, {
+      ...base,
+      type: 'journal',
+      narration: `Bad debt written off${n.invoiceNumber ? ` (${n.invoiceNumber})` : ''}: ${n.reason}`,
+      lines: [
+        { account: sys.bad_debts, debit: n.total, credit: 0 },
+        { account: party, debit: 0, credit: n.total },
+      ],
+    });
+  }
+  const ro = Number(n.roundOff) || 0;
+  return upsert(`cnote:${n._id}`, {
+    ...base,
+    type: 'credit_note',
+    narration: `Credit note${n.invoiceNumber ? ` against ${n.invoiceNumber}` : ''}: ${n.reason}`,
+    lines: [
+      { account: sys.sales_returns, debit: n.taxable || 0, credit: 0 },
+      { account: sys.output_cgst, debit: n.cgst || 0, credit: 0 },
+      { account: sys.output_sgst, debit: n.sgst || 0, credit: 0 },
+      { account: sys.output_igst, debit: n.igst || 0, credit: 0 },
+      { account: sys.round_off, debit: ro > 0 ? ro : 0, credit: ro < 0 ? -ro : 0 },
+      { account: party, debit: 0, credit: n.total },
     ],
   });
 }
@@ -281,6 +324,7 @@ async function syncBooks({ full = false } = {}) {
     for (const bill of await PurchaseBill.find({ kind: 'purchase', ...changed }).lean()) count(await postPurchaseBill(bill, sys));
     for (const p of await SupplierPayment.find(changed).lean()) count(await postSupplierPayment(p, sys, settings));
     for (const n of await DebitNote.find(changed).lean()) count(await postDebitNote(n, sys));
+    for (const n of await CreditNote.find(changed).select('-lines -buyer -seller').lean()) count(await postCreditNote(n, sys));
     // Customer renames reach their account names on the next lookup.
     customerAccountIds.clear();
     supplierAccountIds.clear();

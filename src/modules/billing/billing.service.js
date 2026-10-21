@@ -11,6 +11,7 @@ const companyService = require('../company/company.service');
 const { stageStats } = require('../production/production.flow');
 const Invoice = require('./invoice.model');
 const Receipt = require('./receipt.model');
+const CreditNote = require('./creditNote.model');
 
 const DAY = 24 * 60 * 60 * 1000;
 const EPS = 0.005;
@@ -372,6 +373,9 @@ async function addReceipt(user, customerId, payload = {}) {
   const customer = await loadCustomer(customerId);
   const amount = money(payload.amount);
   if (!(amount > 0)) throw new ApiError(400, 'Amount must be more than 0');
+  const tds = money(payload.tds);
+  if (tds < 0) throw new ApiError(400, 'TDS cannot be negative');
+  if (tds > amount) throw new ApiError(400, 'TDS looks too high: it is a small part of the bill (usually 0.1%–10%)');
   const receivedAt = parseDay(payload.receivedAt || new Date(), 'Received date');
   if (receivedAt.getTime() > Date.now() + DAY) throw new ApiError(400, 'Received date cannot be in the future');
   const method = str(payload.method) || PAYMENT_METHODS.BANK_TRANSFER;
@@ -393,6 +397,8 @@ async function addReceipt(user, customerId, payload = {}) {
     invoice: invoice?._id || null,
     receivedAt,
     amount,
+    tds,
+    tdsSection: tds ? str(payload.tdsSection).toUpperCase().slice(0, 20) : '',
     method,
     reference: str(payload.reference),
     note: str(payload.note),
@@ -424,10 +430,11 @@ async function voidReceipt(user, id, reason) {
 // bills that fell due first. Nothing is stored, so voids and cancellations can
 // never leave a stale balance behind.
 async function customerAccount(customerId, { asOf = new Date() } = {}) {
-  const [invoices, receipts, orders] = await Promise.all([
+  const [invoices, receipts, orders, notes] = await Promise.all([
     Invoice.find({ customer: customerId, status: 'issued' }).select('-lines -seller -buyer').sort({ dueDate: 1, invoiceDate: 1, _id: 1 }).lean(),
     Receipt.find({ customer: customerId, voidedAt: null }).sort({ receivedAt: 1, _id: 1 }).lean(),
     SalesOrder.find({ customer: customerId, status: { $ne: SALES_ORDER_STATUSES.CANCELLED } }).select('number orderDate advanceAmount payments').lean(),
+    CreditNote.find({ customer: customerId, status: 'issued' }).select('-lines -buyer -seller').sort({ date: 1, _id: 1 }).lean(),
   ]);
   const state = invoices.map((inv) => ({ ...inv, paid: 0 }));
   const balanceOf = (row) => money(row.total - row.paid);
@@ -447,10 +454,19 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
   const credits = [];
   let pool = 0;
   let orderAdvance = 0;
+  // Credit notes and write-offs go to their bill first, like payments.
+  for (const note of notes) {
+    credits.push({ date: note.date, type: note.kind, ref: note.number, detail: [note.invoiceNumber && `against ${note.invoiceNumber}`, note.reason].filter(Boolean).join(' · '), amount: note.total, id: String(note._id) });
+    const target = note.invoice ? state.filter((row) => String(row._id) === String(note.invoice)) : [];
+    pool = money(pool + apply(target, note.total));
+  }
   for (const receipt of receipts) {
-    credits.push({ date: receipt.receivedAt, type: 'receipt', ref: receipt.number, detail: [methodLabel(receipt.method), receipt.reference].filter(Boolean).join(' · '), amount: receipt.amount, id: String(receipt._id) });
+    // TDS the customer deducted counts as paid: the bill is settled in full.
+    const settles = money(receipt.amount + (receipt.tds || 0));
+    const detail = [methodLabel(receipt.method), receipt.reference, receipt.tds ? `incl. TDS ₹${receipt.tds}${receipt.tdsSection ? ` (${receipt.tdsSection})` : ''}` : ''].filter(Boolean).join(' · ');
+    credits.push({ date: receipt.receivedAt, type: 'receipt', ref: receipt.number, detail, amount: settles, id: String(receipt._id) });
     const target = receipt.invoice ? state.filter((row) => String(row._id) === String(receipt.invoice)) : [];
-    pool = money(pool + apply(target, receipt.amount));
+    pool = money(pool + apply(target, settles));
   }
   for (const order of orders) {
     const paid = money((Number(order.advanceAmount) || 0) + (order.payments || []).filter((p) => !p.voidedAt).reduce((s, p) => s + p.amount, 0));
@@ -696,4 +712,5 @@ module.exports = {
   customerAccount,
   ledger,
   financialYear,
+  buyerOf,
 };

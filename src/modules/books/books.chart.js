@@ -42,6 +42,10 @@ const SYSTEM_ACCOUNTS = [
   { key: 'round_off', name: 'Round off', group: 'indirect_expenses' },
   { key: 'capital', name: 'Capital account', group: 'capital' },
   { key: 'purchases', name: 'Purchases', group: 'purchases' },
+  { key: 'sales_returns', name: 'Sales returns & allowances', group: 'sales' },
+  { key: 'bad_debts', name: 'Bad debts written off', group: 'indirect_expenses' },
+  { key: 'tds_receivable', name: 'TDS receivable (deducted by customers)', group: 'loans_advances' },
+  { key: 'tds_payable', name: 'TDS payable', group: 'duties_taxes' },
 ];
 
 // Common heads, created once so the first expenses can be entered at once.

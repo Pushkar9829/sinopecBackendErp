@@ -71,6 +71,9 @@ const supplierPaymentSchema = new mongoose.Schema(
     bill: { type: ObjectId, ref: 'PurchaseBill', default: null },
     paidAt: { type: Date, required: true },
     amount: { type: Number, required: true, min: 0.01 },
+    // Income tax we deducted (TDS) and owe the government; settles the bill with the money paid.
+    tds: { type: Number, default: 0, min: 0 },
+    tdsSection: { type: String, default: '', trim: true },
     method: { type: String, default: 'bank_transfer' },
     // Cash or bank account it was paid from (books).
     fromAccount: { type: ObjectId, ref: 'BookAccount', default: null },

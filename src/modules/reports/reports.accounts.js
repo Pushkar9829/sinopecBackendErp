@@ -4,6 +4,7 @@ const { businessYmd } = require('../../utils/businessTime');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 const Invoice = require('../billing/invoice.model');
 const Receipt = require('../billing/receipt.model');
+const CreditNote = require('../billing/creditNote.model');
 const billing = require('../billing/billing.service');
 const { parseRange, monthsOf, monthOf, inRange, deltaPct, money, DAY } = require('./reports.range');
 
@@ -97,8 +98,10 @@ function invoiceRow(inv) {
 
 // GSTR-1 style tables from issued sale invoices: B2B (registered buyers, one
 // row per invoice and tax rate), B2C Large and B2C Small (unregistered), and
-// the HSN summary.
-function gstTables(invoices) {
+// the HSN summary. Credit notes go to CDNR (registered buyers) or CDNUR
+// (against a B2C Large invoice); the rest come off B2C Small. All of them
+// come off the HSN summary.
+function gstTables(invoices, notes = []) {
   const b2b = [];
   const b2cl = [];
   const b2cs = new Map();
@@ -144,6 +147,48 @@ function gstTables(invoices) {
       }
     }
   }
+  const cdnr = [];
+  const cdnur = [];
+  for (const note of notes) {
+    const byRate = new Map();
+    for (const line of note.lines || []) {
+      const rate = Number(line.gstPercent) || 0;
+      const r = byRate.get(rate) || { rate, taxable: 0, cgst: 0, sgst: 0, igst: 0 };
+      r.taxable = money(r.taxable + line.taxable);
+      r.cgst = money(r.cgst + line.cgst);
+      r.sgst = money(r.sgst + line.sgst);
+      r.igst = money(r.igst + line.igst);
+      byRate.set(rate, r);
+      const code = String(line.hsnCode || '').trim() || 'Not set';
+      const unit = String(line.unit || '').trim().toUpperCase() || 'NOS';
+      const key = `${code}|${unit}|${rate}`;
+      const h = hsn.get(key) || { hsn: code, description: line.description || '', unit, rate, quantity: 0, value: 0, taxable: 0, igst: 0, cgst: 0, sgst: 0, invoices: new Set() };
+      h.quantity = money(h.quantity - (Number(line.quantity) || 0));
+      h.value = money(h.value - line.amount);
+      h.taxable = money(h.taxable - line.taxable);
+      h.igst = money(h.igst - line.igst);
+      h.cgst = money(h.cgst - line.cgst);
+      h.sgst = money(h.sgst - line.sgst);
+      h.invoices.add(note.number);
+      hsn.set(key, h);
+    }
+    const stateCode = note.buyer?.stateCode || (note.intraState ? note.seller?.stateCode : '') || '';
+    const head = { number: note.number, date: note.date, noteType: 'C', value: money(note.total), placeOfSupply: placeName(stateCode), customer: note.buyer?.companyName || note.buyer?.name || '', invoiceNumber: note.invoiceNumber || '', invoiceDate: note.invoiceDate || null };
+    const gstin = String(note.buyer?.gstin || '').trim().toUpperCase();
+    for (const r of byRate.values()) {
+      if (gstin) cdnr.push({ gstin, ...head, reverseCharge: 'N', supplyType: 'Regular B2B', ...r });
+      else if (!note.intraState && note.invoiceTotal > B2CL_LIMIT) cdnur.push({ urType: 'B2CL', ...head, ...r });
+      else {
+        const key = `${stateCode}|${r.rate}`;
+        const s = b2cs.get(key) || { type: 'OE', placeOfSupply: head.placeOfSupply, rate: r.rate, taxable: 0, igst: 0, cgst: 0, sgst: 0, invoices: 0 };
+        s.taxable = money(s.taxable - r.taxable);
+        s.igst = money(s.igst - r.igst);
+        s.cgst = money(s.cgst - r.cgst);
+        s.sgst = money(s.sgst - r.sgst);
+        b2cs.set(key, s);
+      }
+    }
+  }
   const hsnRows = [...hsn.values()].map(({ invoices: set, ...row }) => ({ ...row, invoices: set.size })).sort((a, b) => a.hsn.localeCompare(b.hsn) || a.rate - b.rate);
   const totals = (rows) => ({ taxable: sumBy(rows, 'taxable'), igst: sumBy(rows, 'igst'), cgst: sumBy(rows, 'cgst'), sgst: sumBy(rows, 'sgst') });
   return {
@@ -151,7 +196,9 @@ function gstTables(invoices) {
     b2cl,
     b2cs: [...b2cs.values()].sort((a, b) => a.placeOfSupply.localeCompare(b.placeOfSupply) || a.rate - b.rate),
     hsn: hsnRows,
-    totals: { b2b: totals(b2b), b2cl: totals(b2cl), b2cs: totals([...b2cs.values()]), hsn: totals(hsnRows) },
+    cdnr: cdnr.sort((a, b) => new Date(a.date) - new Date(b.date)),
+    cdnur,
+    totals: { b2b: totals(b2b), b2cl: totals(b2cl), b2cs: totals([...b2cs.values()]), hsn: totals(hsnRows), cdnr: totals(cdnr), cdnur: totals(cdnur) },
     missingHsn: hsnRows.filter((r) => r.hsn === 'Not set').reduce((s, r) => s + r.invoices, 0),
   };
 }
@@ -160,7 +207,7 @@ async function accountsReport(user, query) {
   if (!canSee(user)) throw new ApiError(403, 'You cannot see the accounts reports');
   const range = parseRange(query);
   const dsoFrom = new Date(Date.now() - DSO_WINDOW_DAYS * DAY);
-  const [inPeriod, previousInvoices, received, previousReceived, receivables, recentBills, overrides] = await Promise.all([
+  const [inPeriod, previousInvoices, received, previousReceived, receivables, recentBills, overrides, notes] = await Promise.all([
     Invoice.find({ kind: 'sale', invoiceDate: { $gte: range.start, $lte: range.end } }).sort({ invoiceDate: 1, number: 1 }).lean(),
     Invoice.find({ kind: 'sale', status: 'issued', invoiceDate: { $gte: range.previous.start, $lte: range.previous.end } }).select('total taxable cgst sgst igst').lean(),
     collections(range),
@@ -175,7 +222,10 @@ async function accountsReport(user, query) {
       .populate('customer', 'code name companyName')
       .sort({ 'creditOverride.at': -1 })
       .lean(),
+    CreditNote.find({ status: 'issued', date: { $gte: range.start, $lte: range.end } }).sort({ date: 1, number: 1 }).populate('invoice', 'total').lean(),
   ]);
+  const creditNotes = notes.filter((n) => n.kind === 'credit_note').map((n) => ({ ...n, invoiceTotal: n.invoice?.total || 0 }));
+  const writeOffs = notes.filter((n) => n.kind === 'write_off');
   const issued = inPeriod.filter((inv) => inv.status === 'issued');
   const cancelled = inPeriod.filter((inv) => inv.status === 'cancelled');
 
@@ -250,12 +300,14 @@ async function accountsReport(user, query) {
       advance: receivables.totals.advance,
       dso: dso(receivables.totals.outstanding, totalRecent),
       creditOverrides: overrides.length,
+      creditNotes: sumBy(creditNotes, 'total'),
+      writtenOff: sumBy(writeOffs, 'total'),
     },
     monthly: [...monthly.values()],
     collectionsByMethod: [...byMethod.values()].sort((a, b) => b.amount - a.amount),
     ageing: receivables.totals.ageing,
     debtors,
-    gst: gstTables(issued),
+    gst: gstTables(issued, creditNotes),
     creditOverrides: overrides.map((o) => ({
       id: String(o._id),
       number: o.number,
@@ -268,6 +320,22 @@ async function accountsReport(user, query) {
       holdReasons: o.creditCheck?.reasons || [],
     })),
     invoiceRegister: inPeriod.map(invoiceRow),
+    creditNoteRegister: notes.map((n) => ({
+      id: String(n._id),
+      kind: n.kind,
+      number: n.number,
+      date: n.date,
+      customer: n.buyer?.companyName || n.buyer?.name || '',
+      customerId: String(n.customer),
+      gstin: n.buyer?.gstin || '',
+      invoiceNumber: n.invoiceNumber || '',
+      taxable: money(n.taxable),
+      cgst: money(n.cgst),
+      sgst: money(n.sgst),
+      igst: money(n.igst),
+      total: money(n.total),
+      reason: n.reason,
+    })),
     receiptRegister: received.map((c) => ({ ...c, date: c.date, day: businessYmd(c.date) })),
   };
 }

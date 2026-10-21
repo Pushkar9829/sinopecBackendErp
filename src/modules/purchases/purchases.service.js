@@ -296,6 +296,9 @@ async function createPayment(user, supplierId, payload = {}) {
   const supplier = await loadSupplier(supplierId);
   const amount = money(payload.amount);
   if (!(amount > 0)) throw new ApiError(400, 'Amount must be more than 0');
+  const tds = money(payload.tds);
+  if (tds < 0) throw new ApiError(400, 'TDS cannot be negative');
+  if (tds > amount) throw new ApiError(400, 'TDS looks too high: it is a small part of the bill (usually 0.1%–10%)');
   const paidAt = parseDay(payload.paidAt || new Date(), 'Payment date');
   notFuture(paidAt, 'The payment date');
   await assertOpenPeriod(paidAt, 'a payment dated then');
@@ -311,6 +314,8 @@ async function createPayment(user, supplierId, payload = {}) {
     bill: bill?._id || null,
     paidAt,
     amount,
+    tds,
+    tdsSection: tds ? str(payload.tdsSection).toUpperCase().slice(0, 20) : '',
     method,
     fromAccount: await payFromAccount(payload.fromAccount, method),
     reference: str(payload.reference),
@@ -426,8 +431,11 @@ async function supplierAccount(supplierId, { asOf = new Date() } = {}) {
     pool = money(pool + apply(n.bill ? state.filter((r) => String(r._id) === String(n.bill)) : [], n.total));
   }
   for (const p of payments) {
-    credits.push({ date: p.paidAt, type: 'payment', ref: p.number, detail: [METHOD_LABEL[p.method] || p.method, p.reference].filter(Boolean).join(' · '), amount: p.amount, id: String(p._id) });
-    pool = money(pool + apply(p.bill ? state.filter((r) => String(r._id) === String(p.bill)) : [], p.amount));
+    // TDS we deducted settles the bill along with the money paid.
+    const settles = money(p.amount + (p.tds || 0));
+    const detail = [METHOD_LABEL[p.method] || p.method, p.reference, p.tds ? `TDS ₹${p.tds}${p.tdsSection ? ` (${p.tdsSection})` : ''} deducted` : ''].filter(Boolean).join(' · ');
+    credits.push({ date: p.paidAt, type: 'payment', ref: p.number, detail, amount: settles, id: String(p._id) });
+    pool = money(pool + apply(p.bill ? state.filter((r) => String(r._id) === String(p.bill)) : [], settles));
   }
   const advance = apply(state, pool);
   const now = asOf.getTime();
