@@ -8,7 +8,7 @@ const InventoryItem = require('../inventory/item.model');
 const companyService = require('../company/company.service');
 const { BookAccount, BooksSettings } = require('../books/books.models');
 const { ensureChart } = require('../books/books.post');
-const { assertOpenPeriod: lockCheck } = require('../books/books.lock');
+const { assertOpenPeriod: lockCheck, assertOpeningsOpen } = require('../books/books.lock');
 const { PurchaseBill, SupplierPayment, DebitNote } = require('./purchase.models');
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -22,7 +22,8 @@ const actor = (user) => user?.fullName || user?.username || '';
 const METHODS = ['bank_transfer', 'upi', 'cheque', 'cash', 'other'];
 const METHOD_LABEL = { bank_transfer: 'Bank transfer', upi: 'UPI', cheque: 'Cheque', cash: 'Cash', other: 'Other' };
 // Accounts a bill line can be booked to.
-const LINE_GROUPS = ['purchases', 'direct_expenses', 'indirect_expenses', 'fixed_assets', 'stock'];
+// Stock is valued by closing stock on the Statements page, so bills go to Purchases instead.
+const LINE_GROUPS = ['purchases', 'direct_expenses', 'indirect_expenses', 'fixed_assets'];
 
 // ---------------------------------------------------------------- access
 
@@ -195,6 +196,7 @@ async function createBill(user, payload = {}) {
 
 async function addOpeningBill(user, supplierId, payload = {}) {
   assert(canCreate(user), 'You cannot enter supplier bills');
+  await assertOpeningsOpen('opening bills');
   const supplier = await loadSupplier(supplierId);
   const number = str(payload.number);
   if (!number) throw new ApiError(400, "Enter the supplier's bill number");
@@ -226,6 +228,7 @@ async function cancelBill(user, id, reason) {
   const bill = mongoose.isValidObjectId(id) ? await PurchaseBill.findById(id) : null;
   if (!bill) throw new ApiError(404, 'Bill not found');
   if (bill.status === 'cancelled') throw new ApiError(400, 'Already cancelled');
+  if (bill.kind === 'opening') await assertOpeningsOpen('opening bills');
   await assertOpenPeriod(bill.billDate, 'this bill');
   const why = str(reason);
   if (why.length < 3) throw new ApiError(400, 'Give a reason for cancelling the bill');

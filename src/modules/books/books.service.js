@@ -5,7 +5,8 @@ const { nextSeq } = require('../../utils/counter');
 const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const Invoice = require('../billing/invoice.model');
 const { PurchaseBill } = require('../purchases/purchase.models');
-const { BookAccount, Voucher, BooksSettings } = require('./books.models');
+const { BookAccount, Voucher, BooksSettings, YearClose } = require('./books.models');
+const { assertOpeningsOpen } = require('./books.lock');
 const { GROUPS, GROUP_BY_ID, natureOf } = require('./books.chart');
 const { ensureChart, syncBooks } = require('./books.post');
 
@@ -115,8 +116,19 @@ async function saveSettings(user, payload = {}) {
   assert(canCorrect(user), 'Only Accounts managers and the owner can change the books settings');
   const s = await settingsDoc();
   const set = {};
-  if (payload.startDate !== undefined) set.startDate = startOfDay(parseDay(payload.startDate, 'Start date'));
-  if (payload.lockDate !== undefined) set.lockDate = str(payload.lockDate) ? endOfBusinessDay(parseDay(payload.lockDate, 'Lock date')) : null;
+  if (payload.startDate !== undefined) {
+    const start = startOfDay(parseDay(payload.startDate, 'Start date'));
+    if (s.lockDate && start.getTime() !== new Date(s.startDate).getTime()) throw new ApiError(400, 'The books are locked; unlock them before changing the start date');
+    set.startDate = start;
+  }
+  if (payload.lockDate !== undefined) {
+    const next = str(payload.lockDate) ? endOfBusinessDay(parseDay(payload.lockDate, 'Lock date')) : null;
+    // A closed year stays locked until the owner reopens it; only the owner moves the lock back.
+    const closed = await YearClose.findOne({}).sort({ fy: -1 }).lean();
+    if (closed && (!next || next < endOfBusinessDay(closed.endDay))) throw new ApiError(400, `${closed.fy} is closed and stays locked to ${closed.endDay}; the owner can reopen it under Statements → year end`);
+    if (!isSuperAdmin(user) && s.lockDate && (!next || next < s.lockDate)) throw new ApiError(403, 'Only the owner can move the lock date back');
+    set.lockDate = next;
+  }
   if (payload.defaultBank !== undefined) {
     const bank = mongoose.isValidObjectId(payload.defaultBank) ? await BookAccount.findById(payload.defaultBank).lean() : null;
     if (!bank || bank.group !== 'bank') throw new ApiError(400, 'Choose a bank account');
@@ -180,6 +192,7 @@ async function updateAccount(user, id, payload = {}) {
   if (payload.openingDr !== undefined || payload.openingCr !== undefined) {
     assert(canCorrect(user), 'Only Accounts managers and the owner can change opening balances');
     if (account.customer || account.supplier) throw new ApiError(400, 'A customer or supplier opening balance comes from their opening bills');
+    if (money(payload.openingDr ?? account.openingDr) !== money(account.openingDr) || money(payload.openingCr ?? account.openingCr) !== money(account.openingCr)) await assertOpeningsOpen();
     account.openingDr = Math.max(0, money(payload.openingDr ?? account.openingDr));
     account.openingCr = Math.max(0, money(payload.openingCr ?? account.openingCr));
   }
@@ -201,6 +214,7 @@ async function deleteAccount(user, id) {
 async function saveOpenings(user, rows = []) {
   assert(canCorrect(user), 'Only Accounts managers and the owner can change opening balances');
   if (!Array.isArray(rows)) throw new ApiError(400, 'Send a list of opening balances');
+  await assertOpeningsOpen();
   for (const row of rows) {
     if (!mongoose.isValidObjectId(row.accountId)) continue;
     const debit = Math.max(0, money(row.debit));

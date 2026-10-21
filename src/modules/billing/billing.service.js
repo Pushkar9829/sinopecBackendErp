@@ -12,7 +12,7 @@ const { stageStats } = require('../production/production.flow');
 const Invoice = require('./invoice.model');
 const Receipt = require('./receipt.model');
 const CreditNote = require('./creditNote.model');
-const { assertOpenPeriod } = require('../books/books.lock');
+const { assertOpenPeriod, assertOpeningsOpen } = require('../books/books.lock');
 
 const DAY = 24 * 60 * 60 * 1000;
 const EPS = 0.005;
@@ -176,7 +176,7 @@ async function createInvoice(user, orderId, payload = {}) {
   const [customer, company] = await Promise.all([loadCustomer(order.customer), companyService.getSettings()]);
   if (!company.gstin) throw new ApiError(400, 'Add your GSTIN in Company details before making invoices');
   const invoiceDate = parseDay(payload.invoiceDate || new Date(), 'Invoice date');
-  if (invoiceDate.getTime() > Date.now() + DAY) throw new ApiError(400, 'Invoice date cannot be in the future');
+  if (invoiceDate.getTime() > endOfBusinessDay(new Date()).getTime()) throw new ApiError(400, 'Invoice date cannot be in the future');
   await assertOpenPeriod(invoiceDate, 'an invoice dated then');
   const buyer = buyerOf(customer, order);
   const intraState = !buyer.stateCode || buyer.stateCode === company.stateCode;
@@ -266,8 +266,10 @@ async function cancelInvoice(user, id, reason) {
   assert(canCorrect(user), 'Only Accounts or the Super Admin can cancel invoices');
   const why = str(reason);
   if (!why) throw new ApiError(400, 'Give a reason for cancelling');
-  const current = mongoose.isValidObjectId(id) ? await Invoice.findById(id).select('invoiceDate kind').lean() : null;
+  const current = mongoose.isValidObjectId(id) ? await Invoice.findById(id).select('invoiceDate kind number').lean() : null;
   if (current?.kind === 'sale') await assertOpenPeriod(current.invoiceDate, 'this invoice');
+  if (current?.kind === 'opening') await assertOpeningsOpen('opening bills');
+  if (current && (await CreditNote.exists({ invoice: current._id, status: 'issued' }))) throw new ApiError(400, `Credit notes or write-offs are made against ${current.number}; cancel them first`);
   const updated = await Invoice.findOneAndUpdate(
     { _id: id, status: 'issued' },
     { $set: { status: 'cancelled', cancelledAt: new Date(), cancelledByName: actor(user), cancelReason: why } },
@@ -300,6 +302,7 @@ async function listInvoices(user, { orderId, customerId } = {}) {
 
 async function addOpeningBill(user, customerId, payload = {}) {
   assert(canCorrect(user) || hasPermission(user, 'accounts:create'), 'Only Accounts or the Super Admin can enter opening balances');
+  await assertOpeningsOpen('opening bills');
   const customer = await loadCustomer(customerId);
   const number = str(payload.number);
   if (!number) throw new ApiError(400, 'Bill number is required');
@@ -356,6 +359,7 @@ async function importOpeningBills(user, rows = [], apply = false) {
     return { line, customer: customer ? `${customer.code} ${customer.name}` : str(row.customer), customerId: customer ? String(customer._id) : '', number: str(row.number), amount: money(row.amount), date: str(row.date), dueDate: str(row.dueDate), problems };
   });
   const bad = report.filter((row) => row.problems.length);
+  if (apply && !bad.length) await assertOpeningsOpen('opening bills');
   if (!apply || bad.length) return { applied: false, rows: report, errors: bad.length, total: money(report.reduce((s, r) => s + r.amount, 0)) };
   let added = 0;
   const skipped = [];
@@ -381,7 +385,7 @@ async function addReceipt(user, customerId, payload = {}) {
   if (tds < 0) throw new ApiError(400, 'TDS cannot be negative');
   if (tds > amount) throw new ApiError(400, 'TDS looks too high: it is a small part of the bill (usually 0.1%–10%)');
   const receivedAt = parseDay(payload.receivedAt || new Date(), 'Received date');
-  if (receivedAt.getTime() > Date.now() + DAY) throw new ApiError(400, 'Received date cannot be in the future');
+  if (receivedAt.getTime() > endOfBusinessDay(new Date()).getTime()) throw new ApiError(400, 'Received date cannot be in the future');
   await assertOpenPeriod(receivedAt, 'a payment dated then');
   const method = str(payload.method) || PAYMENT_METHODS.BANK_TRANSFER;
   if (!Object.values(PAYMENT_METHODS).includes(method)) throw new ApiError(400, 'Invalid payment method');
@@ -390,7 +394,7 @@ async function addReceipt(user, customerId, payload = {}) {
     invoice = await Invoice.findOne({ _id: payload.invoiceId, customer: customer._id, status: 'issued' });
     if (!invoice) throw new ApiError(400, 'That bill is not an open bill of this customer');
   }
-  const year = new Date().getFullYear();
+  const year = businessYmd(receivedAt).slice(0, 4);
   let number;
   for (let tries = 0; tries < 1000; tries += 1) {
     number = `RCPT-${year}-${String(await nextSeq(`receipt:${year}`)).padStart(5, '0')}`;
@@ -440,18 +444,20 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
   const [invoices, receipts, orders, notes] = await Promise.all([
     Invoice.find({ customer: customerId, status: 'issued' }).select('-lines -seller -buyer').sort({ dueDate: 1, invoiceDate: 1, _id: 1 }).lean(),
     Receipt.find({ customer: customerId, voidedAt: null }).sort({ receivedAt: 1, _id: 1 }).lean(),
-    SalesOrder.find({ customer: customerId, status: { $ne: SALES_ORDER_STATUSES.CANCELLED } }).select('number orderDate advanceAmount payments').lean(),
+    SalesOrder.find({ customer: customerId }).select('number status orderDate advanceAmount payments').lean(),
     CreditNote.find({ customer: customerId, status: 'issued' }).select('-lines -buyer -seller').sort({ date: 1, _id: 1 }).lean(),
   ]);
-  const state = invoices.map((inv) => ({ ...inv, paid: 0 }));
+  const state = invoices.map((inv) => ({ ...inv, paid: 0, credited: 0 }));
   const balanceOf = (row) => money(row.total - row.paid);
-  const apply = (rows, amount) => {
+  // `credit`: the amount is a credit note or write-off, not money received.
+  const apply = (rows, amount, credit = false) => {
     let left = amount;
     for (const row of rows) {
       if (left <= EPS) break;
       const take = Math.min(left, balanceOf(row));
       if (take > 0) {
         row.paid = money(row.paid + take);
+        if (credit) row.credited = money(row.credited + take);
         left = money(left - take);
       }
     }
@@ -460,12 +466,13 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
 
   const credits = [];
   let pool = 0;
+  let notePool = 0;
   let orderAdvance = 0;
   // Credit notes and write-offs go to their bill first, like payments.
   for (const note of notes) {
     credits.push({ date: note.date, type: note.kind, ref: note.number, detail: [note.invoiceNumber && `against ${note.invoiceNumber}`, note.reason].filter(Boolean).join(' · '), amount: note.total, id: String(note._id) });
     const target = note.invoice ? state.filter((row) => String(row._id) === String(note.invoice)) : [];
-    pool = money(pool + apply(target, note.total));
+    notePool = money(notePool + apply(target, note.total, true));
   }
   for (const receipt of receipts) {
     // TDS the customer deducted counts as paid: the bill is settled in full.
@@ -476,8 +483,14 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
     pool = money(pool + apply(target, settles));
   }
   for (const order of orders) {
-    const paid = money((Number(order.advanceAmount) || 0) + (order.payments || []).filter((p) => !p.voidedAt).reduce((s, p) => s + p.amount, 0));
-    if (Number(order.advanceAmount) > 0) credits.push({ date: order.orderDate, type: 'advance', ref: order.number, detail: 'Advance entered on the order', amount: money(order.advanceAmount), orderId: String(order._id) });
+    const cancelled = order.status === SALES_ORDER_STATUSES.CANCELLED;
+    // Money taken on a cancelled order stays with the customer as credit.
+    const paid = money((Number(order.advanceAmount) || 0) + (cancelled ? 0 : (order.payments || []).filter((p) => !p.voidedAt).reduce((s, p) => s + p.amount, 0)));
+    if (Number(order.advanceAmount) > 0) credits.push({ date: order.orderDate, type: 'advance', ref: order.number, detail: cancelled ? 'Advance on a cancelled order, kept as credit' : 'Advance entered on the order', amount: money(order.advanceAmount), orderId: String(order._id) });
+    if (cancelled) {
+      pool = money(pool + paid);
+      continue;
+    }
     for (const p of (order.payments || []).filter((x) => !x.voidedAt)) {
       credits.push({ date: p.receivedAt, type: 'order_payment', ref: order.number, detail: [methodLabel(p.method), p.reference].filter(Boolean).join(' · '), amount: p.amount, orderId: String(order._id) });
     }
@@ -486,7 +499,7 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
       orderAdvance = money(orderAdvance + apply(own, paid));
     }
   }
-  const unapplied = apply(state, pool);
+  const unapplied = money(apply(state, notePool, true) + apply(state, pool));
 
   const now = asOf.getTime();
   const rows = state.map((row) => {
@@ -502,9 +515,10 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
       dueDate: row.dueDate,
       total: row.total,
       paid: row.paid,
+      credited: row.credited,
       balance,
       overdueDays,
-      payState: balance <= EPS ? 'paid' : row.paid > EPS ? 'partly_paid' : 'unpaid',
+      payState: balance <= EPS ? (row.credited > EPS && row.paid - row.credited <= EPS ? 'credited' : 'paid') : row.paid > EPS ? 'partly_paid' : 'unpaid',
     };
   });
   const sum = (list, key) => money(list.reduce((s, r) => s + r[key], 0));

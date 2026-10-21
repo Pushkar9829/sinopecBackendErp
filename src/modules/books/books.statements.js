@@ -353,15 +353,19 @@ async function gstr3b(user, query = {}) {
   if (`${month}-31` < ctx.startYmd) throw new ApiError(400, `The books start on ${ctx.startYmd}`);
   const sys = await systemAccounts();
   let carried = { igst: 0, cgst: 0, sgst: 0 };
+  // Credit notes larger than a month's sales lower the next month's tax.
+  let short = { igst: 0, cgst: 0, sgst: 0 };
   let result = null;
   const history = [];
   for (const key of months(ctx.startYmd, month)) {
     const f = await gstMonthFigures(key, sys);
     const credit = { igst: money(carried.igst + Math.max(0, f.itc.igst)), cgst: money(carried.cgst + Math.max(0, f.itc.cgst)), sgst: money(carried.sgst + Math.max(0, f.itc.sgst)) };
-    const liability = { igst: Math.max(0, f.outward.igst), cgst: Math.max(0, f.outward.cgst), sgst: Math.max(0, f.outward.sgst) };
+    const due = { igst: money(f.outward.igst + short.igst), cgst: money(f.outward.cgst + short.cgst), sgst: money(f.outward.sgst + short.sgst) };
+    const liability = { igst: Math.max(0, due.igst), cgst: Math.max(0, due.cgst), sgst: Math.max(0, due.sgst) };
+    short = { igst: Math.min(0, due.igst), cgst: Math.min(0, due.cgst), sgst: Math.min(0, due.sgst) };
     const s = setOff(liability, credit);
     history.push({ month: key, tax: money(liability.igst + liability.cgst + liability.sgst), itc: money(f.itc.igst + f.itc.cgst + f.itc.sgst), cash: money(s.cash.igst + s.cash.cgst + s.cash.sgst), carried: money(s.carried.igst + s.carried.cgst + s.carried.sgst) });
-    if (key === month) result = { ...f, broughtForward: carried, creditAvailable: credit, liability, ...s };
+    if (key === month) result = { ...f, broughtForward: carried, creditAvailable: credit, liability, ...s, negativeCarried: short };
     carried = s.carried;
   }
   return { ...result, history: history.slice(-12).reverse() };
@@ -472,8 +476,12 @@ async function tallyExport(user, query = {}) {
   const used = new Set(vouchers.flatMap((v) => v.lines.map((l) => String(l.account))));
   for (const [id, value] of ctx.openings) if (value) used.add(id);
   const ledgers = [...used].map((id) => byId.get(id)).filter(Boolean);
-  const masters = ledgers.map((a) => {
-    const opening = ctx.openings.get(String(a._id)) || 0;
+  // Opening balance as on the first day exported, so a new Tally company starts right.
+  const before = from > ctx.startYmd ? await movements({ before: sod(from) }) : new Map();
+  for (const [id, m] of before) if (m.debit || m.credit) used.add(id);
+  const masters = [...used].map((id) => byId.get(id)).filter(Boolean).map((a) => {
+    const m = before.get(String(a._id)) || { debit: 0, credit: 0 };
+    const opening = money((ctx.openings.get(String(a._id)) || 0) + m.debit - m.credit);
     return `<TALLYMESSAGE xmlns:UDF="TallyUDF"><LEDGER NAME="${xml(a.name)}" ACTION="Create"><NAME.LIST><NAME>${xml(a.name)}</NAME></NAME.LIST><PARENT>${xml(TALLY_GROUP[a.group] || 'Suspense A/c')}</PARENT><ISBILLWISEON>No</ISBILLWISEON><OPENINGBALANCE>${amt(-opening)}</OPENINGBALANCE></LEDGER></TALLYMESSAGE>`;
   });
   const entries = vouchers.map((v) => {
@@ -492,7 +500,7 @@ async function tallyExport(user, query = {}) {
   return {
     fileName: isMasters ? `tally-ledgers_${to}.xml` : `tally-vouchers_${from}_to_${to}.xml`,
     body: isMasters ? envelope('All Masters', masters) : envelope('Vouchers', entries),
-    ledgers: ledgers.length,
+    ledgers: masters.length,
     vouchers: vouchers.length,
   };
 }

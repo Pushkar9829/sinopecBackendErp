@@ -17,6 +17,8 @@ const env = require('../../config/env');
 const ApiError = require('../../utils/ApiError');
 const { nextSalesOrderNumber } = require('../../utils/counter');
 const { hasPermission } = require('../../utils/permissions');
+const { endOfBusinessDay } = require('../../utils/businessTime');
+const { assertOpenPeriod } = require('../books/books.lock');
 const customerRepo = require('../customer/customer.repo');
 const { snapshotFromCustomer, attachProductsFromOrder } = require('../customer/customer.service');
 const {
@@ -1063,6 +1065,15 @@ async function getOrder(user, id) {
   return present(order, user);
 }
 
+// An advance is money received on the order date: it goes in the books on
+// that day, so the day cannot be in the future or in a locked period.
+async function assertAdvanceDate(date) {
+  if (date.getTime() > endOfBusinessDay(new Date()).getTime()) {
+    throw new ApiError(400, 'An advance cannot be dated in the future. Use today as the order date, or record the money later as a payment');
+  }
+  await assertOpenPeriod(date, 'the advance on this order');
+}
+
 function assertOrderDateWindow(date) {
   if (!date) return;
   const now = Date.now();
@@ -1087,6 +1098,7 @@ async function createOrder(user, payload, options = {}) {
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
   assertOrderDateWindow(orderDate);
+  if (Math.max(0, num(payload.advanceAmount)) > 0) await assertAdvanceDate(orderDate);
   const doc = {
     orderType,
     orderDate,
@@ -1166,9 +1178,18 @@ async function updateOrder(user, id, rawPayload) {
     order.customerSnapshot = snapshot;
   }
 
-  // The advance is in the books on the order date; a locked period keeps it.
-  if (payload.advanceAmount !== undefined && Math.abs(Math.max(0, num(payload.advanceAmount)) - (Number(order.advanceAmount) || 0)) > 0.004) {
-    await require('../books/books.lock').assertOpenPeriod(order.orderDate, 'the advance on this order');
+  // The advance is in the books on the order date (cash or bank by payment
+  // method); any change to it, its date or its method must be in an open period.
+  const oldAdvance = Number(order.advanceAmount) || 0;
+  const newAdvance = payload.advanceAmount !== undefined ? Math.max(0, num(payload.advanceAmount)) : oldAdvance;
+  const newDate = payload.orderDate !== undefined && payload.orderDate !== '' ? parseDate(payload.orderDate, 'Order date', { required: true }) : order.orderDate;
+  const advanceMoves =
+    Math.abs(newAdvance - oldAdvance) > 0.004 ||
+    (newDate && order.orderDate && newDate.getTime() !== new Date(order.orderDate).getTime()) ||
+    (payload.paymentMethod !== undefined && payload.paymentMethod !== order.paymentMethod);
+  if ((oldAdvance > 0 || newAdvance > 0) && advanceMoves) {
+    if (oldAdvance > 0 && order.orderDate) await assertOpenPeriod(order.orderDate, 'the advance on this order');
+    if (newAdvance > 0 && newDate) await assertAdvanceDate(newDate);
   }
   applyHeader(order, payload, snapshot);
   const orderType = order.orderType || ORDER_TYPES.SALES_ORDER;
@@ -1204,6 +1225,10 @@ async function deleteOrder(id) {
   if ((order.payments || []).length) {
     // Even voided payments are part of the record; cancel the order instead.
     throw new ApiError(400, 'This order has payments recorded. Cancel the order instead of deleting it');
+  }
+  if (Number(order.advanceAmount) > 0) {
+    // The advance is in the books; cancelling keeps it as the customer's credit.
+    throw new ApiError(400, 'This order has an advance entered. Set the advance to 0 if no money was received, or cancel the order so the money stays on the customer\'s account');
   }
   if (await require('../inventory/item.repo').countOrderMaterial(order._id)) {
     throw new ApiError(400, 'Customer material in inventory is linked to this order. Unlink it or cancel the order instead');
@@ -1523,10 +1548,10 @@ async function recordPayment(user, id, payload = {}) {
   const method = str(payload.method) || order.paymentMethod || PAYMENT_METHODS.BANK_TRANSFER;
   assertIn(method, PAYMENT_METHODS, 'Invalid payment method');
   const receivedAt = payload.receivedAt ? parseDate(payload.receivedAt, 'Received date') : new Date();
-  if (receivedAt && receivedAt.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
+  if (receivedAt && receivedAt.getTime() > endOfBusinessDay(new Date()).getTime()) {
     throw new ApiError(400, 'Received date cannot be in the future');
   }
-  await require('../books/books.lock').assertOpenPeriod(receivedAt || new Date(), 'a payment dated then');
+  await assertOpenPeriod(receivedAt || new Date(), 'a payment dated then');
   order.payments.push({
     amount,
     method,
@@ -1555,7 +1580,7 @@ async function removePayment(user, id, paymentId, reason) {
   const payment = order.payments.id(paymentId);
   if (!payment) throw new ApiError(404, 'Payment not found');
   if (payment.voidedAt) throw new ApiError(400, 'This payment is already voided');
-  await require('../books/books.lock').assertOpenPeriod(payment.receivedAt, 'this payment');
+  await assertOpenPeriod(payment.receivedAt, 'this payment');
   const why = str(reason);
   if (why.length < 3) throw new ApiError(400, 'Give a reason for voiding this payment (for example "refunded" or "entered twice")');
   payment.voidedAt = new Date();

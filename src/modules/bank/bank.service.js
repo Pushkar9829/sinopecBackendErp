@@ -29,6 +29,8 @@ const lineSchema = new mongoose.Schema(
     // Same line imported twice is skipped.
     fingerprint: { type: String, required: true },
     batch: { type: String, default: '' },
+    // Order of the line in the bank's own statement (oldest first), for lines on the same day.
+    seq: { type: Number, default: 0 },
     status: { type: String, enum: ['unmatched', 'matched', 'ignored'], default: 'unmatched' },
     voucher: { type: mongoose.Schema.Types.ObjectId, ref: 'Voucher', default: null },
     matchedBy: { type: String, default: '' },
@@ -70,7 +72,8 @@ async function moneyAccounts(user) {
   const all = await books.listAccounts(user);
   const rows = all.filter((a) => ['bank', 'cash'].includes(a.group));
   const pending = await StatementLine.aggregate([{ $match: { status: 'unmatched' } }, { $group: { _id: '$account', count: { $sum: 1 } } }]);
-  const last = await StatementLine.aggregate([{ $sort: { date: -1, _id: -1 } }, { $group: { _id: '$account', date: { $first: '$date' }, balance: { $first: '$balance' } } }]);
+  await Promise.all(rows.filter((a) => a.group === 'bank').map((a) => releaseStale(a.id)));
+  const last = await StatementLine.aggregate([{ $sort: { date: -1, batch: -1, seq: -1 } }, { $group: { _id: '$account', date: { $first: '$date' }, balance: { $first: '$balance' } } }]);
   const pendingBy = new Map(pending.map((p) => [String(p._id), p.count]));
   const lastBy = new Map(last.map((l) => [String(l._id), l]));
   return rows.map((a) => ({
@@ -96,15 +99,32 @@ function fingerprint(accountId, l) {
   return crypto.createHash('sha1').update([accountId, businessYmd(l.date), l.withdrawal, l.deposit, l.description.toLowerCase().replace(/\s+/g, ' '), l.reference, l.balance ?? ''].join('|')).digest('hex');
 }
 
+// The running balance tells the order even when every line is on one day:
+// oldest first, each balance is the previous one plus this line.
+function statementOrderIsNewestFirst(lines) {
+  const net = (l) => money(l.deposit - l.withdrawal);
+  for (let i = 1; i < lines.length; i += 1) {
+    const a = lines[i - 1];
+    const b = lines[i];
+    if (a.balance === null || b.balance === null) continue;
+    if (Math.abs(money(a.balance + net(b)) - b.balance) < 0.01) return false;
+    if (Math.abs(money(b.balance + net(a)) - a.balance) < 0.01) return true;
+  }
+  return lines.length > 1 && lines[0].date > lines[lines.length - 1].date;
+}
+
+const valid = (d) => (Number.isNaN(d.getTime()) ? null : d);
+
 function parseDate(value) {
   const text = str(value);
   let m = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00+05:30`);
+  if (m) return valid(new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00+05:30`));
   // Indian banks write day first: 05/10/2026, 05-10-26, 05 Oct 2026.
   m = text.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/);
   if (m) {
     const year = m[3].length === 2 ? `20${m[3]}` : m[3];
-    return new Date(`${year}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}T12:00:00+05:30`);
+    if (Number(m[2]) > 12 || Number(m[1]) > 31) return null; // not day/month/year (e.g. a US date)
+    return valid(new Date(`${year}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}T12:00:00+05:30`));
   }
   m = text.match(/^(\d{1,2})[\s-]([A-Za-z]{3})[A-Za-z]*[\s-,]+(\d{2,4})$/);
   if (m) {
@@ -112,7 +132,7 @@ function parseDate(value) {
     const month = months.indexOf(m[2].toLowerCase()) + 1;
     if (month > 0) {
       const year = m[3].length === 2 ? `20${m[3]}` : m[3];
-      return new Date(`${year}-${String(month).padStart(2, '0')}-${m[1].padStart(2, '0')}T12:00:00+05:30`);
+      return valid(new Date(`${year}-${String(month).padStart(2, '0')}-${m[1].padStart(2, '0')}T12:00:00+05:30`));
     }
   }
   return null;
@@ -142,16 +162,30 @@ async function importStatement(user, accountId, rows = []) {
       else deposit = a;
     }
     if (!withdrawal && !deposit) return null; // opening/closing rows, blank rows
-    if (!date) return problems.push(`Line ${i + 1}: date "${str(r.date)}" not understood`);
+    if (!date) return problems.push(`Line ${i + 1}: date "${str(r.date)}" not understood (use day/month/year)`);
     const line = { account: account._id, date, description: str(r.description).slice(0, 300), reference: str(r.reference).slice(0, 80), withdrawal: money(withdrawal), deposit: money(deposit), balance: str(r.balance) ? money(amountOf(r.balance)) : null, batch };
-    line.fingerprint = fingerprint(String(account._id), line);
     lines.push(line);
     return null;
+  });
+  // Banks list newest first or oldest first; keep the bank's own order.
+  const newestFirst = statementOrderIsNewestFirst(lines);
+  const seen = new Map();
+  lines.forEach((line, i) => {
+    line.seq = newestFirst ? lines.length - i : i + 1;
+    // Two genuinely identical lines in one statement (same day, amount and text) are both kept.
+    const base = fingerprint(String(account._id), line);
+    const n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    line.fingerprint = n > 1 ? `${base}#${n}` : base;
   });
   if (problems.length > 5 && problems.length > rows.length / 2) throw new ApiError(400, `Most dates were not understood. ${problems.slice(0, 3).join('; ')}`);
   let added = 0;
   let duplicates = 0;
   for (const line of lines) {
+    if (await StatementLine.exists({ account: line.account, fingerprint: line.fingerprint })) {
+      duplicates += 1;
+      continue;
+    }
     try {
       await StatementLine.create(line);
       added += 1;
@@ -184,9 +218,22 @@ async function bookEntries(accountId, range = {}) {
 // Pairs each unmatched statement line with one book entry of the same amount
 // and direction, closest date first (within 3 days); a cheque/UTR number in
 // both breaks ties.
+// A line matched to an entry that was later cancelled, or moved to another
+// account, goes back to "to match".
+async function releaseStale(accountId) {
+  const lines = await StatementLine.find({ account: accountId, status: 'matched', voucher: { $ne: null } }, 'voucher').lean();
+  if (!lines.length) return 0;
+  const vouchers = await Voucher.find({ _id: { $in: lines.map((l) => l.voucher) } }, 'status lines.account').lean();
+  const ok = new Set(vouchers.filter((v) => v.status === 'posted' && v.lines.some((l) => String(l.account) === String(accountId))).map((v) => String(v._id)));
+  const stale = lines.filter((l) => !ok.has(String(l.voucher))).map((l) => l._id);
+  if (stale.length) await StatementLine.updateMany({ _id: { $in: stale } }, { $set: { status: 'unmatched', voucher: null, matchedBy: '', matchedAt: null, note: 'Its entry was cancelled or changed; match it again' } });
+  return stale.length;
+}
+
 async function autoMatch(user, accountId) {
   assert(canWork(user), 'You cannot match bank lines');
   const account = await moneyAccount(accountId, { bankOnly: true });
+  await releaseStale(account._id);
   const lines = await StatementLine.find({ account: account._id, status: 'unmatched' }).sort({ date: 1 }).lean();
   if (!lines.length) return { matched: 0 };
   const from = new Date(Math.min(...lines.map((l) => +l.date)) - (MATCH_DAYS + 1) * DAY);
@@ -300,6 +347,7 @@ async function entryFromLine(user, lineId, payload = {}) {
 async function listLines(user, accountId, query = {}) {
   assert(canView(user), 'You cannot see the books');
   const account = await moneyAccount(accountId, { bankOnly: true });
+  await releaseStale(account._id);
   const filter = { account: account._id };
   if (['unmatched', 'matched', 'ignored'].includes(query.status)) filter.status = query.status;
   const range = {};
@@ -310,7 +358,7 @@ async function listLines(user, accountId, query = {}) {
   const page = Math.max(1, Number(query.page) || 1);
   const [total, docs, counts] = await Promise.all([
     StatementLine.countDocuments(filter),
-    StatementLine.find(filter).sort({ date: -1, _id: -1 }).skip((page - 1) * pageSize).limit(pageSize).lean(),
+    StatementLine.find(filter).sort({ date: -1, batch: -1, seq: -1 }).skip((page - 1) * pageSize).limit(pageSize).lean(),
     StatementLine.aggregate([{ $match: { account: account._id } }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
   ]);
   const vouchers = new Map((await Voucher.find({ _id: { $in: docs.map((d) => d.voucher).filter(Boolean) } }, 'number type narration date').lean()).map((v) => [String(v._id), v]));
@@ -333,11 +381,13 @@ async function reconciliation(user, accountId, query = {}) {
   const asOf = endOfBusinessDay(asOfYmd);
   const ledger = await books.ledger(user, String(account._id), { to: asOfYmd, from: '2000-01-01' });
   const bookBalance = ledger.closing;
-  const lines = await StatementLine.find({ account: account._id, date: { $lte: asOf } }).sort({ date: 1, _id: 1 }).lean();
+  await releaseStale(account._id);
+  const lines = await StatementLine.find({ account: account._id, date: { $lte: asOf } }).sort({ date: 1, batch: 1, seq: 1 }).lean();
   const matchedIds = new Set(lines.filter((l) => l.voucher).map((l) => String(l.voucher)));
   const firstStatement = lines[0]?.date || null;
   // Book entries since the statement starts that the bank has not shown yet.
-  const entries = firstStatement ? (await bookEntries(account._id, { from: new Date(+firstStatement - 15 * DAY), to: asOf })).filter((e) => !matchedIds.has(e.id)) : [];
+  // Entries before the first statement line are already inside its balance.
+  const entries = firstStatement ? (await bookEntries(account._id, { from: new Date(`${businessYmd(firstStatement)}T00:00:00+05:30`), to: asOf })).filter((e) => !matchedIds.has(e.id)) : [];
   const notInBank = entries.map((e) => ({ ...e, kind: e.amount > 0 ? 'Deposited, not yet credited by the bank' : 'Paid, not yet debited by the bank (e.g. cheque not cleared)' }));
   const notInBooks = lines.filter((l) => l.status === 'unmatched').map(presentLine);
   const lastWithBalance = [...lines].reverse().find((l) => l.balance !== null && l.balance !== undefined);

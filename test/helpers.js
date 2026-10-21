@@ -57,6 +57,9 @@ let baseUrl;
 async function startApp() {
   await connectDb();
   await mongoose.connection.db.dropDatabase();
+  // Dropping the database also drops the indexes built at start-up; build
+  // them again so unique rules behave as they do on the real database.
+  await Promise.all(Object.values(mongoose.models).map((model) => model.createIndexes()));
   const quiet = console.log;
   console.log = () => {};
   try {

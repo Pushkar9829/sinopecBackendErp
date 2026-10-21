@@ -105,7 +105,7 @@ async function upsert(sourceKey, voucher) {
   try {
     await Voucher.create(next);
   } catch (error) {
-    if (error?.code === 11000) return 'same'; // another sync wrote it first
+    if (error?.code === 11000 && error.keyPattern?.sourceKey) return 'same'; // another sync wrote it first
     throw error;
   }
   return 'created';
@@ -165,7 +165,8 @@ async function postOrderMoney(order, sys, settings) {
       number: `${order.number}/ADV`,
       date: order.orderDate,
       narration: `Advance on order ${order.number}`,
-      status: live && advance > 0 ? 'posted' : 'cancelled',
+      // Cancelling the order does not undo money received: the advance stays as the customer's credit.
+      status: advance > 0 ? 'posted' : 'cancelled',
       sourceRef: order.number,
       sourceLink: `/sales-orders/${order._id}`,
       lines: [
@@ -321,6 +322,14 @@ async function syncBooks({ full = false } = {}) {
       .select('number status customer orderDate advanceAmount paymentMethod payments')
       .lean();
     for (const order of orders) count(await postOrderMoney(order, sys, settings));
+    // An order deleted outright takes its money entries with it.
+    if (!since) {
+      const keys = await Voucher.find({ sourceKey: /^order(adv|pay):/, status: 'posted' }, 'sourceKey').lean();
+      const ids = [...new Set(keys.map((k) => k.sourceKey.split(':')[1]))];
+      const alive = new Set((await SalesOrder.find({ _id: { $in: ids } }, '_id').lean()).map((o) => String(o._id)));
+      const orphans = keys.filter((k) => !alive.has(k.sourceKey.split(':')[1])).map((k) => k._id);
+      if (orphans.length) await Voucher.updateMany({ _id: { $in: orphans } }, { $set: { status: 'cancelled' } });
+    }
     for (const bill of await PurchaseBill.find({ kind: 'purchase', ...changed }).lean()) count(await postPurchaseBill(bill, sys));
     for (const p of await SupplierPayment.find(changed).lean()) count(await postSupplierPayment(p, sys, settings));
     for (const n of await DebitNote.find(changed).lean()) count(await postDebitNote(n, sys));

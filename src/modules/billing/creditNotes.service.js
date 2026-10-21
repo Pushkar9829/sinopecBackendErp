@@ -104,7 +104,11 @@ async function createCreditNote(user, customerId, payload = {}) {
   const priced = priceLines(payload.lines, intraState);
   const total = Math.round(priced.gross);
   const roundOff = money(total - priced.gross);
-  if (invoice && total > invoice.total + EPS) throw new ApiError(400, `The note (₹${total}) is more than bill ${invoice.number} (₹${invoice.total})`);
+  if (invoice) {
+    const earlier = await CreditNote.aggregate([{ $match: { invoice: invoice._id, status: 'issued', kind: 'credit_note' } }, { $group: { _id: null, total: { $sum: '$total' } } }]);
+    const already = money(earlier[0]?.total || 0);
+    if (total + already > invoice.total + EPS) throw new ApiError(400, `Credit notes on ${invoice.number} would come to ₹${money(total + already)}, more than the bill (₹${invoice.total})${already ? `; ₹${already} is already credited` : ''}`);
+  }
   const doc = await CreditNote.create({
     kind: 'credit_note',
     number: await nextNumber('CN', date),

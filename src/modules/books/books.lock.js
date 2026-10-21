@@ -14,4 +14,11 @@ async function assertOpenPeriod(date, what = 'an entry dated then') {
   }
 }
 
-module.exports = { assertOpenPeriod };
+// Opening balances sit before every period, so any lock freezes them.
+async function assertOpeningsOpen(what = 'Opening balances') {
+  await ensureChart();
+  const s = await BooksSettings.findOne({ key: 'default' }).select('lockDate').lean();
+  if (s?.lockDate) throw new ApiError(400, `The books are locked up to ${businessYmd(s.lockDate)}; ${what} cannot change. The owner can unlock the books first if this is a correction.`);
+}
+
+module.exports = { assertOpenPeriod, assertOpeningsOpen };
