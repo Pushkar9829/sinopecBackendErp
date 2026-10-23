@@ -61,27 +61,39 @@ async function salesReport(user, query) {
   if (!canSee(user)) throw new ApiError(403, 'You cannot see the sales reports');
   const range = parseRange(query);
   const now = Date.now();
-  const all = await SalesOrder.find({ status: { $ne: SALES_ORDER_STATUSES.DRAFT } })
-    .select('number status orderType customer customerSnapshot orderDate deliveryDate grandTotal sourceIntake items.product items.productCode items.productType items.material items.size items.thickness items.color items.quantity items.unit items.amount')
-    .lean();
-  const live = all.filter((o) => o.status !== SALES_ORDER_STATUSES.CANCELLED);
+  // Only what the report uses: orders in this period and the one before
+  // (with their lines), orders still open, the last year's orders for
+  // "stopped ordering", and each customer's first and last order date,
+  // worked out by the database instead of reading every order ever.
+  const notDraftOrCancelled = { $nin: [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.CANCELLED] };
+  const head = 'number status orderType customer customerSnapshot orderDate deliveryDate grandTotal sourceIntake';
+  const [inPeriods, openOrders, lastYearOrders, firstLast] = await Promise.all([
+    SalesOrder.find({ status: { $ne: SALES_ORDER_STATUSES.DRAFT }, orderDate: { $gte: range.previous.start, $lte: range.end } })
+      .select(`${head} items.product items.productCode items.productType items.material items.size items.thickness items.color items.quantity items.unit items.amount`)
+      .lean(),
+    SalesOrder.find({ status: { $in: Object.keys(STATUS_LABEL) } }).select(head).lean(),
+    SalesOrder.find({ status: notDraftOrCancelled, orderDate: { $gte: new Date(now - LAPSED_LOOKBACK_DAYS * DAY) } })
+      .select('customer customerSnapshot.code customerSnapshot.name customerSnapshot.companyName orderDate grandTotal')
+      .lean(),
+    SalesOrder.aggregate([
+      { $match: { status: notDraftOrCancelled } },
+      { $sort: { orderDate: 1 } },
+      { $group: { _id: '$customer', first: { $first: '$orderDate' }, last: { $last: '$orderDate' }, snapshot: { $last: '$customerSnapshot' }, orders: { $sum: 1 } } },
+    ]).allowDiskUse(true),
+  ]);
+  const live = inPeriods.filter((o) => o.status !== SALES_ORDER_STATUSES.CANCELLED);
   const booked = live.filter((o) => inRange(o.orderDate, range));
   const previous = live.filter((o) => inRange(o.orderDate, range.previous));
-  const cancelled = all.filter((o) => o.status === SALES_ORDER_STATUSES.CANCELLED && inRange(o.orderDate, range));
+  const cancelled = inPeriods.filter((o) => o.status === SALES_ORDER_STATUSES.CANCELLED && inRange(o.orderDate, range));
 
   // First and last order of each customer, over all time.
   const history = new Map();
-  for (const o of live) {
+  for (const row of firstLast) {
+    const o = { customer: row._id, customerSnapshot: row.snapshot || {} };
     const key = customerKey(o);
-    const h = history.get(key) || { key, id: o.customer ? String(o.customer) : '', name: nameOf(o), code: o.customerSnapshot?.code || '', first: o.orderDate, last: o.orderDate, orders: [] };
-    if (new Date(o.orderDate) < new Date(h.first)) h.first = o.orderDate;
-    if (new Date(o.orderDate) > new Date(h.last)) {
-      h.last = o.orderDate;
-      h.name = nameOf(o);
-    }
-    h.orders.push(o);
-    history.set(key, h);
+    history.set(key, { key, id: row._id ? String(row._id) : '', name: nameOf(o), code: row.snapshot?.code || '', first: row.first, last: row.last, ordersEver: row.orders, lastYear: [] });
   }
+  for (const o of lastYearOrders) history.get(customerKey(o))?.lastYear.push(o);
 
   const monthly = new Map(monthsOf(range.from, range.to).map((m) => [m, { month: m, orders: 0, salesOrders: 0, jobWork: 0, value: 0 }]));
   for (const o of booked) {
@@ -116,17 +128,17 @@ async function salesReport(user, query) {
   const lapsed = [...history.values()]
     .map((h) => {
       const since = Math.floor((now - new Date(h.last).getTime()) / DAY);
-      const lastYear = h.orders.filter((o) => now - new Date(o.orderDate).getTime() <= LAPSED_LOOKBACK_DAYS * DAY);
-      return { key: h.key, id: h.id, name: h.name, code: h.code, lastOrder: h.last, daysSince: since, ordersLastYear: lastYear.length, valueLastYear: money(lastYear.reduce((s, o) => s + (Number(o.grandTotal) || 0), 0)), ordersEver: h.orders.length };
+      const lastYear = h.lastYear;
+      return { key: h.key, id: h.id, name: h.name, code: h.code, lastOrder: h.last, daysSince: since, ordersLastYear: lastYear.length, valueLastYear: money(lastYear.reduce((s, o) => s + (Number(o.grandTotal) || 0), 0)), ordersEver: h.ordersEver };
     })
     .filter((c) => c.daysSince >= LAPSED_DAYS && c.daysSince <= LAPSED_LOOKBACK_DAYS)
     .sort((a, b) => b.valueLastYear - a.valueLastYear);
 
   const pipeline = OPEN_STATUSES.filter((s) => STATUS_LABEL[s]).map((status) => {
-    const rows = live.filter((o) => o.status === status);
+    const rows = openOrders.filter((o) => o.status === status);
     return { status, label: STATUS_LABEL[status], orders: rows.length, value: money(rows.reduce((s, o) => s + (Number(o.grandTotal) || 0), 0)) };
   });
-  const lateOpen = live.filter((o) => STATUS_LABEL[o.status] && o.deliveryDate && new Date(o.deliveryDate).getTime() < now - DAY / 2);
+  const lateOpen = openOrders.filter((o) => STATUS_LABEL[o.status] && o.deliveryDate && new Date(o.deliveryDate).getTime() < now - DAY / 2);
 
   const jobWorkValue = money(booked.filter(isJobWork).reduce((s, o) => s + (Number(o.grandTotal) || 0), 0));
   const prevValue = money(previous.reduce((s, o) => s + (Number(o.grandTotal) || 0), 0));

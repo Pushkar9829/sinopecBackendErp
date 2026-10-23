@@ -47,9 +47,9 @@ const whatsappWebhook = asyncHandler(async (req, res) => {
   res.sendStatus(200);
 });
 
-const gmailStart = asyncHandler(async (_req, res) => {
+const gmailStart = asyncHandler(async (req, res) => {
   try {
-    ok(res, { url: await gmail.startUrl() });
+    ok(res, { url: await gmail.startUrl(req.user) });
   } catch (error) {
     throw new ApiError(400, error.message);
   }
@@ -63,7 +63,7 @@ const gmailDisconnect = asyncHandler(async (_req, res) => {
 const gmailCallback = asyncHandler(async (req, res) => {
   try {
     if (req.query.error) throw new Error(String(req.query.error));
-    await gmail.finishCallback(String(req.query.code || ''), String(req.query.state || ''));
+    await gmail.finishCallback(String(req.query.code || ''), String(req.query.state || ''), gmail.sessionUserId(req));
     return res.redirect(gmail.frontendRedirect('gmail=connected'));
   } catch (error) {
     const message = encodeURIComponent(error.message || 'Gmail connection failed');

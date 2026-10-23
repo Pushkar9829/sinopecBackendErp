@@ -8,16 +8,16 @@ const {
   TASK_STATUSES,
 } = require('../../config/constants');
 const { nextTaskNumber } = require('../../utils/counter');
-const { itemVisibleAtStage, routeStages, stageTarget, stageUnit } = require('../production/production.flow');
+const { itemVisibleAtStage, routeStages, stageName, stageTarget, stageUnit, takesNoStock } = require('../production/production.flow');
 const taskRepo = require('./task.repo');
 
 const STAGE_ROLES = {
   rolling: ROLE_SLUGS.ROLLING_OPERATOR,
   printing: ROLE_SLUGS.PRINTING_OPERATOR,
   cutting: ROLE_SLUGS.CUTTING_OPERATOR,
+  // No operator role records the "other" process: production managers do.
+  other: ROLE_SLUGS.PRODUCTION_MANAGER,
 };
-
-const STAGE_LABELS = { rolling: 'Rolling', printing: 'Printing', cutting: 'Cutting' };
 
 // Created once per order and closed by a person, never by an order status change.
 const STICKY_CATEGORIES = [TASK_CATEGORIES.MATERIAL_RECEIVE, TASK_CATEGORIES.PAYMENT_COLLECT];
@@ -77,11 +77,12 @@ function stageSpecs(order, materialIn) {
     const product = item.product || item.productCode || '';
     stages.forEach((stage, position) => {
       if (!STAGE_ROLES[stage] || !itemVisibleAtStage(item, stage, order.status)) return;
-      if (position === 0 && isJobWork(order) && !materialIn && !(item.stageWork || []).length) return;
+      const waitsForMaterial = !takesNoStock(item.productionRoute, stage);
+      if (position === 0 && waitsForMaterial && isJobWork(order) && !materialIn && !(item.stageWork || []).length) return;
       specs.push({
         key: `${order._id}:${TASK_CATEGORIES.STAGE_WORK}:${item._id}:${stage}`,
         category: TASK_CATEGORIES.STAGE_WORK,
-        title: `${STAGE_LABELS[stage]} - item ${index + 1}${product ? ` (${product})` : ''} - ${order.number}`,
+        title: `${stageName(item, stage)} - item ${index + 1}${product ? ` (${product})` : ''} - ${order.number}`,
         assigneeRole: STAGE_ROLES[stage],
         itemId: String(item._id),
         itemIndex: index,

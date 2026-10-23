@@ -7,11 +7,29 @@ const FLOOR_STAGES = [
   { id: 'rolling', label: 'Rolling', read: 'production:rolling:read', update: 'production:rolling:update' },
   { id: 'printing', label: 'Printing', read: 'production:printing:read', update: 'production:printing:update' },
   { id: 'cutting', label: 'Cutting', read: 'production:cutting:read', update: 'production:cutting:update' },
+  // The "Other process" step (lamination, packing, ...): production managers
+  // and the owner record it; there is no operator role for it.
+  { id: 'other', label: 'Other process', read: 'production:read', update: 'production:update' },
   { id: 'dispatch', label: 'Dispatch', read: 'dispatch:read', update: 'dispatch:update' },
 ];
 
 function isDeliveryStage(stage) {
   return stage === 'dispatch';
+}
+
+// Stages that take nothing from stock: the "other" process records its output
+// without a source lot, and a dispatch with no stage before it (direct
+// dispatch) sends goods that were never made here.
+function takesNoStock(route, stage) {
+  if (stage === 'other') return true;
+  return isDeliveryStage(stage) && !previousStage(route, stage);
+}
+
+// The name shown for a stage on one line: the process typed on the order for
+// "other", the stage label otherwise.
+function stageName(item, stage) {
+  if (stage === 'other') return String(item?.otherProcess || '').trim() || 'Other process';
+  return FLOOR_STAGES.find((row) => row.id === stage)?.label || stage;
 }
 
 function isSuperAdmin(user) {
@@ -105,15 +123,74 @@ function holdingAt(item, stage) {
   return item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
 }
 
+// Reads a field that may not be declared on the order schema yet (it was
+// stored with strict: false): plain and lean objects carry it directly.
+function extraField(doc, key) {
+  if (!doc) return undefined;
+  if (doc[key] !== undefined) return doc[key];
+  return typeof doc.get === 'function' ? doc.get(key) : undefined;
+}
+
+// Stages a production manager closed short ("close stage short"): they count
+// as done with whatever they made, so the next stages can finish.
+function closedStages(item) {
+  const list = extraField(item, 'stageClosed');
+  return Array.isArray(list) ? list : [];
+}
+
+function isStageClosed(item, stage) {
+  return closedStages(item).some((row) => row && row.stage === stage);
+}
+
+// Waste is in the unit of what was used (kg of film at printing, pcs at
+// cutting). Old rows without wasteUnit: a row whose used = made + waste is all
+// in the stage unit, otherwise the waste is in the source's unit.
+function wasteUnitOf(item, row) {
+  const stored = String(extraField(row, 'wasteUnit') || '').trim();
+  if (stored) return stored;
+  const unit = stageUnit(item, row.stage);
+  const input = Number(row.inputQty) || 0;
+  const matching = Math.abs(input - ((Number(row.outputQty) || 0) + (Number(row.wasteQty) || 0))) < EPS;
+  if (matching) return unit;
+  const prev = previousStage(item.productionRoute, row.stage);
+  return prev ? stageUnit(item, prev) : 'kg';
+}
+
+function round3(value) {
+  return Math.round((Number(value) || 0) * 1000) / 1000;
+}
+
+// Waste per unit, never adding kg to pcs. `waste` is the stage's main waste
+// figure (in `wasteUnit`); `wasteText` lists every unit, e.g. "3 kg + 2 pcs".
+function wasteSummary(item, rows) {
+  const byUnit = {};
+  for (const row of rows) {
+    const qty = Number(row.wasteQty) || 0;
+    if (!(qty > 0)) continue;
+    const unit = wasteUnitOf(item, row);
+    byUnit[unit] = round3((byUnit[unit] || 0) + qty);
+  }
+  const units = Object.keys(byUnit);
+  const main = units.length === 1 ? units[0] : units.length ? units.sort((a, b) => byUnit[b] - byUnit[a])[0] : '';
+  return {
+    byUnit,
+    unit: main,
+    qty: main ? byUnit[main] : 0,
+    text: units.map((unit) => `${byUnit[unit]} ${unit}`).join(' + '),
+  };
+}
+
 function stageStats(item, stage) {
   const target = stageTarget(item, stage);
   const input = sumWork(item, stage, 'inputQty');
   const output = sumWork(item, stage, 'outputQty');
-  const waste = sumWork(item, stage, 'wasteQty');
+  const wastes = wasteSummary(item, (item.stageWork || []).filter((row) => row.stage === stage));
   const holding = holdingAt(item, stage);
   const prev = previousStage(item.productionRoute, stage);
+  const closedShort = isStageClosed(item, stage);
 
   let done = target > 0 && output + EPS >= target;
+  if (!done && closedShort && !holding) done = true;
   if (!done && prev) {
     const before = stageStats(item, prev);
     done = before.done && before.output > 0 && input + EPS >= before.output && !holding;
@@ -134,9 +211,13 @@ function stageStats(item, stage) {
     capped: target > 0,
     input,
     output,
-    waste,
+    waste: wastes.qty,
+    wasteUnit: wastes.unit || stageUnit(item, stage),
+    wasteByUnit: wastes.byUnit,
+    wasteText: wastes.text,
     remaining: done ? 0 : Math.max(0, target - output),
     done,
+    closedShort: closedShort && !(target > 0 && output + EPS >= target),
   };
 }
 
@@ -226,6 +307,8 @@ function previousOutput(item, stage) {
     outputQty: stats.output,
     availableQty: availableFromPrevious(item, stage),
     wasteQty: stats.waste,
+    wasteUnit: stats.wasteUnit,
+    wasteText: stats.wasteText,
   };
 }
 
@@ -246,6 +329,9 @@ function registerSpecs(order, item, stage) {
       colorUsed: item.printing?.colors || item.color || '',
       artwork: item.printing?.artwork || item.printing?.requirement || item.printing?.design || '',
     };
+  }
+  if (stage === 'other') {
+    return { process: stageName(item, stage) };
   }
   if (stage === 'cutting') {
     const bag = item.bag || {};
@@ -299,6 +385,15 @@ function stageRequirements(order, item, stage) {
     };
   }
 
+  if (stage === 'other') {
+    return {
+      ...common,
+      process: stageName(item, stage),
+      material: item.material || '',
+      specialRequirements: item.manufacturing?.specialRequirements || '',
+    };
+  }
+
   if (stage === 'cutting') {
     return {
       ...common,
@@ -322,6 +417,8 @@ module.exports = {
   FLOOR_STAGES,
   FLOOR_ORDER_STATUSES,
   isDeliveryStage,
+  takesNoStock,
+  stageName,
   ROUTE_BY_ID,
   isSuperAdmin,
   routeStages,
@@ -334,6 +431,10 @@ module.exports = {
   visibleStages,
   operatorStations,
   stageStats,
+  closedStages,
+  isStageClosed,
+  wasteUnitOf,
+  wasteSummary,
   stageUnit,
   stageTarget,
   availableFromPrevious,

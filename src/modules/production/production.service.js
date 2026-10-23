@@ -1,7 +1,7 @@
 const { INVENTORY_CATEGORIES, DELIVERY_PARTNERS, SALES_ORDER_STATUSES } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
 const { hasPermission, isSuperAdmin } = require('../../utils/permissions');
-const { businessYmd } = require('../../utils/businessTime');
+const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const { afterCommit, inTransaction } = require('../../utils/transaction');
 const itemRepo = require('../inventory/item.repo');
 const stageRepo = require('../inventory/stage.repo');
@@ -14,7 +14,9 @@ const {
   availableFromPrevious,
   canReadStage,
   canWorkStage,
+  closedStages,
   isDeliveryStage,
+  isStageClosed,
   itemVisibleAtStage,
   previousStage,
   registerSpecs,
@@ -24,7 +26,9 @@ const {
   stageTarget,
   stageUnit,
   syncOrderStatus,
+  takesNoStock,
   visibleStages,
+  wasteUnitOf,
 } = require('./production.flow');
 
 function sameUnit(a, b) {
@@ -34,8 +38,48 @@ function sameUnit(a, b) {
 
 // Floor work moves an order up to Delivered at most; Completed is set by the
 // "mark completed" action (advanceOrder), which also stamps completedAt.
+// Once an order is Delivered nothing can be released from the floor, so any
+// material still held at a stage is detached here and must be handed to
+// returnSettledPickups after the order is saved (same transaction).
 function applyOrderStatus(order) {
   order.status = syncOrderStatus(order);
+  return order.status === SALES_ORDER_STATUSES.DELIVERED ? detachOrderPickups(order) : [];
+}
+
+async function returnSettledPickups(order, detached) {
+  for (const { item, held } of detached || []) {
+    try {
+      await restockHeld(order, item, held);
+    } catch (error) {
+      console.error(
+        `STOCK NOT RETURNED on delivery of ${order.number}: ${held.qty} ${held.unit} from lot ${held.lot} (${held.lotName}). Fix inventory by hand.`,
+        error.message
+      );
+      throw new ApiError(500, 'Material held on the floor could not be put back in store. Tell the store manager.');
+    }
+  }
+}
+
+// Work cannot be dated after today (plant time).
+function parseWorkDate(value, fallback) {
+  if (!value) return fallback === undefined ? new Date() : fallback;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) throw new ApiError(400, 'Work date is not valid');
+  if (date.getTime() > endOfBusinessDay(new Date()).getTime()) {
+    throw new ApiError(400, 'Work date cannot be in the future');
+  }
+  return date;
+}
+
+function isProductionManager(user) {
+  return isSuperAdmin(user) || hasPermission(user, 'production:update');
+}
+
+// wasteUnit is not declared on the order's stageWork schema yet, so it is set
+// with strict: false (a plain assignment would be dropped).
+function setWasteUnit(row, unit) {
+  if (!row || typeof row.set !== 'function') return;
+  row.set('wasteUnit', unit || '', { strict: false });
 }
 
 // Task sync and register marks run after the floor action's transaction
@@ -112,7 +156,7 @@ function buildDetails(order, item, stage, raw) {
   return details;
 }
 
-function toPublicWork(row) {
+function toPublicWork(row, item) {
   return {
     stage: row.stage,
     machineId: row.machine ? String(row.machine) : '',
@@ -121,6 +165,7 @@ function toPublicWork(row) {
     inputQty: row.inputQty || 0,
     outputQty: row.outputQty || 0,
     wasteQty: row.wasteQty || 0,
+    wasteUnit: row.wasteQty && item ? wasteUnitOf(item, row) : '',
     workDate: row.workDate || row.completedAt,
     notes: row.notes || '',
     fromStage: row.fromStage || '',
@@ -214,6 +259,7 @@ function loadOrderWipLots(cache, orderId) {
 }
 
 async function listSourceLots(order, item, stage, cache = null) {
+  if (takesNoStock(item.productionRoute, stage)) return [];
   const prev = previousStage(item.productionRoute, stage);
   if (!prev) {
     const rawName = String(item.manufacturing?.rawMaterial || item.material || '').toLowerCase();
@@ -227,7 +273,8 @@ async function listSourceLots(order, item, stage, cache = null) {
       return words.length > 0 && words.every((word) => hay.includes(word));
     };
     const own = inStock.filter(ownLot);
-    const shared = inStock.filter((row) => !ownLot(row) && (!rawName || matches(row)));
+    // A line with no raw material named is offered only its own (customer) lots.
+    const shared = rawName ? inStock.filter((row) => !ownLot(row) && matches(row)) : [];
     return [...own, ...shared].map((lot) => toPublicLot(lot, ''));
   }
 
@@ -268,9 +315,11 @@ async function toJob(order, item, stage, cache = null) {
     availableInput,
     readyQty,
     pickup,
+    noStock: takesNoStock(item.productionRoute, stage),
+    otherProcess: item.otherProcess || '',
     sourceLots,
     requirements: stageRequirements(order, item, stage),
-    history: (item.stageWork || []).filter((row) => row.stage === stage).map(toPublicWork),
+    history: (item.stageWork || []).filter((row) => row.stage === stage).map((row) => toPublicWork(row, item)),
   };
 }
 
@@ -297,7 +346,7 @@ async function listQueue(user, stage) {
     for (const item of order.items || []) {
       if (itemVisibleAtStage(item, requested, order.status)) {
         const job = await toJob(order, item, requested, lotCache);
-        if ((job.readyQty > 0) || job.pickup) jobs.push(job);
+        if ((job.readyQty > 0) || job.pickup || job.noStock) jobs.push(job);
       }
       for (const floor of FLOOR_STAGES) {
         if (canReadStage(user, floor.id) && itemVisibleAtStage(item, floor.id, order.status)) {
@@ -461,6 +510,9 @@ async function pickupLot(user, payload) {
   const { order, item, stage } = await loadFloorItem(user, payload, { mustWork: true });
   const qty = num(payload.qty);
   if (qty <= 0) throw new ApiError(400, 'Enter how much to pick');
+  if (takesNoStock(item.productionRoute, stage)) {
+    throw new ApiError(400, 'This step takes nothing from stock. Enter the work directly.');
+  }
 
   const prev = previousStage(item.productionRoute, stage);
   const lot = await itemRepo.findById(payload.lotId);
@@ -513,13 +565,14 @@ async function pickupLot(user, payload) {
     pickedAt: new Date(),
   };
   item.currentStage = stage;
-  applyOrderStatus(order);
+  const settled = applyOrderStatus(order);
   try {
     await salesOrderRepo.save(order);
   } catch (error) {
     await itemRepo.addQuantity(lot._id, qty).catch(logUndoFailure);
     throw error;
   }
+  await returnSettledPickups(order, settled);
   await syncTasks(order, user);
   return toJob(order, item, stage);
 }
@@ -561,19 +614,17 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     throw new ApiError(400, `Only ${qtyText(stats.remaining)} left to dispatch`);
   }
 
-  const workDate = payload.workDate ? new Date(payload.workDate) : new Date();
-  if (Number.isNaN(workDate.getTime())) {
-    throw new ApiError(400, 'Work date is not valid');
-  }
+  const workDate = parseWorkDate(payload.workDate);
 
-  const unitsDiffer = !sameUnit(lot.unit, stats.unit);
-  const used = unitsDiffer ? num(payload.inputQty) : qty;
+  // Direct dispatch (no lot): the quantity sent is recorded, no stock moves.
+  const unitsDiffer = Boolean(lot) && !sameUnit(lot.unit, stats.unit);
+  const used = !lot ? 0 : unitsDiffer ? num(payload.inputQty) : qty;
   if (unitsDiffer && !(used > 0)) {
     throw new ApiError(400, `Enter how much ${lot.unit} is going out with these ${qty} ${stats.unit}`);
   }
   if (unitsDiffer) assertPlausibleDispatch(user, item, lot, qty, used, stats.unit);
-  await takeFromLot(lot, used);
-  const undo = () => itemRepo.addQuantity(lot._id, used).catch(logUndoFailure);
+  if (lot) await takeFromLot(lot, used);
+  const undo = () => (lot ? itemRepo.addQuantity(lot._id, used).catch(logUndoFailure) : null);
   const workRow = {
     stage,
     machine: null,
@@ -586,25 +637,26 @@ async function sendDelivery(user, { order, item, stage, lot, qty, prev, payload 
     workDate,
     notes: String(payload.notes || '').trim(),
     fromStage: prev || '',
-    pickedLotName: lot.name,
+    pickedLotName: lot?.name || '',
     vehicleNumber,
     handoverPerson,
     deliveryPartner,
     details: buildDetails(order, item, stage, payload.details),
-    sourceLot: lot._id,
+    sourceLot: lot?._id || null,
     completedAt: new Date(),
   };
   item.stageWork = item.stageWork || [];
   item.stageWork.push(workRow);
   const savedRow = item.stageWork[item.stageWork.length - 1];
   item.currentStage = activeStage(item);
-  applyOrderStatus(order);
+  const settled = applyOrderStatus(order);
   try {
     await salesOrderRepo.save(order);
   } catch (error) {
     await undo();
     throw error;
   }
+  await returnSettledPickups(order, settled);
   await markRegister(order, item, savedRow);
   await syncTasks(order, user);
   return toJob(order, item, stage);
@@ -627,6 +679,9 @@ async function releasePickup(user, payload) {
   const pickup = item.stagePickup;
   if (!pickup || pickup.stage !== stage || !(Number(pickup.qty) > 0)) {
     throw new ApiError(400, 'Nothing is marked for working');
+  }
+  if (pickup.pickedBy && String(pickup.pickedBy) !== String(user._id) && !isProductionManager(user)) {
+    throw new ApiError(403, `${pickup.pickedByName || 'Another operator'} holds this lot. Only they or a production manager can return it.`);
   }
   const held = heldFrom(pickup);
   const releasedBy = pickup.pickedBy ? String(pickup.pickedBy) : '';
@@ -672,27 +727,31 @@ async function completeStage(user, payload) {
     throw new ApiError(400, `Only ${qtyText(stats.remaining)} ${stats.unit} left on this stage`);
   }
 
-  const pickup = toPublicPickup(item, stage);
-  if (!pickup) {
+  // The "other" process takes no lot: what it used is only noted (any unit).
+  const noStock = takesNoStock(item.productionRoute, stage);
+  const pickup = noStock ? null : toPublicPickup(item, stage);
+  if (!pickup && !noStock) {
     const prev = previousStage(item.productionRoute, stage);
     throw new ApiError(
       400,
       prev ? `Pick ${stageTitle(prev)} output and mark it for working first` : 'Pick raw material and mark it for working first'
     );
   }
-  if (sameUnit(pickup.unit, stats.unit)) {
-    if (outputQty + wasteQty - inputQty > 1e-6) {
-      throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+  if (!noStock) {
+    if (sameUnit(pickup.unit, stats.unit)) {
+      if (outputQty + wasteQty - inputQty > 1e-6) {
+        throw new ApiError(400, 'Made plus waste cannot be more than what was used');
+      }
+      if (inputQty - (outputQty + wasteQty) > 1e-6) {
+        throw new ApiError(400, 'Used cannot be more than made plus waste');
+      }
     }
-    if (inputQty - (outputQty + wasteQty) > 1e-6) {
-      throw new ApiError(400, 'Used cannot be more than made plus waste');
+    if (inputQty <= 0) {
+      throw new ApiError(400, 'Enter how much of the picked lot this entry used');
     }
-  }
-  if (inputQty <= 0) {
-    throw new ApiError(400, 'Enter how much of the picked lot this entry used');
-  }
-  if (inputQty - pickup.qty > 1e-6) {
-    throw new ApiError(400, `Only ${qtyText(pickup.qty)} is marked for working from ${pickup.lotName}`);
+    if (inputQty - pickup.qty > 1e-6) {
+      throw new ApiError(400, `Only ${qtyText(pickup.qty)} is marked for working from ${pickup.lotName}`);
+    }
   }
 
   // Vehicle / handover fields only apply to dispatch rows, which are not made here.
@@ -700,10 +759,7 @@ async function completeStage(user, payload) {
   const handoverPerson = '';
   const deliveryPartner = '';
 
-  const workDate = payload.workDate ? new Date(payload.workDate) : new Date();
-  if (Number.isNaN(workDate.getTime())) {
-    throw new ApiError(400, 'Work date is not valid');
-  }
+  const workDate = parseWorkDate(payload.workDate);
 
   let machine = null;
   if (payload.machineId) {
@@ -712,74 +768,86 @@ async function completeStage(user, payload) {
     if (!machine) throw new ApiError(400, 'That machine is not assigned to this stage');
     if (machine.isActive === false) throw new ApiError(400, 'That machine is inactive');
   }
+  // Validate the typed details before any lot is created (a standalone mongod
+  // has no transaction to roll back a lot made before a 400).
+  const details = buildDetails(order, item, stage, payload.details);
+  // Waste is in the unit of what was used (kg of film at printing).
+  const wasteUnit = pickup?.unit || stats.unit;
 
-  const sourceLotId = item.stagePickup.lot || null;
-  const leftover = Math.max(0, Number(item.stagePickup.qty) - inputQty);
-  if (leftover > 1e-9) {
-    item.stagePickup.qty = leftover;
-  } else {
-    clearPickup(item);
+  const sourceLotId = noStock ? null : item.stagePickup.lot || null;
+  if (!noStock) {
+    const leftover = Math.max(0, Number(item.stagePickup.qty) - inputQty);
+    if (leftover > 1e-9) {
+      item.stagePickup.qty = leftover;
+    } else {
+      clearPickup(item);
+    }
   }
 
   const createdLots = [];
-  const outputLot = await createEntryLot({
-    order,
-    item,
-    stage,
-    category: INVENTORY_CATEGORIES.OUTPUT,
-    qty: produced,
-    unit: stats.unit,
-    workDate,
-  });
-  if (outputLot) createdLots.push(outputLot);
-  const wasteLot = await createEntryLot({
-    order,
-    item,
-    stage,
-    category: INVENTORY_CATEGORIES.WASTE,
-    qty: wasteQty,
-    unit: sameUnit(pickup.unit, stats.unit) ? stats.unit : pickup.unit || stats.unit,
-    workDate,
-  });
-  if (wasteLot) createdLots.push(wasteLot);
-
-  const workRow = {
-    stage,
-    machine: machine?._id || null,
-    machineName: machine ? `${machine.name}${machine.code ? ` (${machine.code})` : ''}` : '',
-    operator: user._id,
-    operatorName: user.fullName || user.username || '',
-    inputQty,
-    outputQty: produced,
-    wasteQty,
-    workDate,
-    notes: String(payload.notes || '').trim(),
-    fromStage: pickup.fromStage || '',
-    pickedLotName: pickup.lotName || '',
-    vehicleNumber,
-    handoverPerson,
-    deliveryPartner,
-    details: buildDetails(order, item, stage, payload.details),
-    sourceLot: sourceLotId,
-    outputLot: outputLot?._id || null,
-    wasteLot: wasteLot?._id || null,
-    completedAt: new Date(),
-  };
-  if (wasteQty && !workRow.details.wastage) {
-    workRow.details.wastage = String(wasteQty);
-  }
-  item.stageWork = item.stageWork || [];
-  item.stageWork.push(workRow);
-  const savedRow = item.stageWork[item.stageWork.length - 1];
-  item.currentStage = activeStage(item);
-
-  applyOrderStatus(order);
+  let savedRow;
+  let settled;
   try {
+    const outputLot = await createEntryLot({
+      order,
+      item,
+      stage,
+      category: INVENTORY_CATEGORIES.OUTPUT,
+      qty: produced,
+      unit: stats.unit,
+      workDate,
+    });
+    if (outputLot) createdLots.push(outputLot);
+    const wasteLot = await createEntryLot({
+      order,
+      item,
+      stage,
+      category: INVENTORY_CATEGORIES.WASTE,
+      qty: wasteQty,
+      unit: wasteUnit,
+      workDate,
+    });
+    if (wasteLot) createdLots.push(wasteLot);
+
+    const workRow = {
+      stage,
+      machine: machine?._id || null,
+      machineName: machine ? `${machine.name}${machine.code ? ` (${machine.code})` : ''}` : '',
+      operator: user._id,
+      operatorName: user.fullName || user.username || '',
+      inputQty,
+      outputQty: produced,
+      wasteQty,
+      workDate,
+      notes: String(payload.notes || '').trim(),
+      fromStage: pickup?.fromStage || '',
+      pickedLotName: pickup?.lotName || '',
+      vehicleNumber,
+      handoverPerson,
+      deliveryPartner,
+      details,
+      sourceLot: sourceLotId,
+      outputLot: outputLot?._id || null,
+      wasteLot: wasteLot?._id || null,
+      completedAt: new Date(),
+    };
+    if (wasteQty && !workRow.details.wastage) {
+      workRow.details.wastage = String(wasteQty);
+    }
+    item.stageWork = item.stageWork || [];
+    item.stageWork.push(workRow);
+    savedRow = item.stageWork[item.stageWork.length - 1];
+    if (wasteQty > 0) setWasteUnit(savedRow, wasteUnit);
+    item.currentStage = activeStage(item);
+
+    settled = applyOrderStatus(order);
     await salesOrderRepo.save(order);
   } catch (error) {
+    // Nothing was saved: lots made for this entry must not stay behind.
     for (const lot of createdLots) await itemRepo.deleteById(lot._id).catch(() => {});
     throw error;
   }
+  await returnSettledPickups(order, settled);
   await markRegister(order, item, savedRow);
   await syncTasks(order, user);
   return require('../salesOrder/salesOrder.service').getOrder(user, order._id);
@@ -828,6 +896,26 @@ async function enterFromRegister(user, payload) {
   const stats = stageStats(item, stage);
   if (stats.capped && outputQty - stats.remaining > 1e-6) {
     throw new ApiError(400, `Only ${qtyText(stats.remaining)} ${stats.unit} left on this stage`);
+  }
+
+  const noStock = takesNoStock(item.productionRoute, stage);
+  if (isDeliveryStage(stage) && noStock) {
+    return sendDelivery(user, { order, item, stage, lot: null, qty: outputQty, prev: null, payload });
+  }
+  if (noStock) {
+    if (givenInput && num(payload.inputQty) < 0) throw new ApiError(400, 'Quantities cannot be negative');
+    return completeStage(user, {
+      orderId: String(order._id),
+      itemId: String(item._id),
+      stage,
+      machineId: payload.machineId,
+      inputQty: givenInput ? num(payload.inputQty) : 0,
+      outputQty,
+      wasteQty,
+      workDate: payload.workDate,
+      notes: payload.notes,
+      details: payload.details,
+    });
   }
 
   if (isDeliveryStage(stage)) {
@@ -926,21 +1014,48 @@ async function loadEntry(user, payload) {
 const OPERATOR_EDIT_HOURS = Number(process.env.OPERATOR_EDIT_HOURS) || 24;
 
 function isFloorManager(user, stage) {
-  if (isSuperAdmin(user) || hasPermission(user, 'production:update')) return true;
+  if (isProductionManager(user)) return true;
   return isDeliveryStage(stage) && hasPermission(user, 'dispatch:update');
 }
 
 function assertMayChangeEntry(user, order, row) {
-  if (isFloorManager(user, row.stage)) return;
-  if (order.status === SALES_ORDER_STATUSES.DELIVERED) {
+  // A delivered order's entries (dispatch rows included) need a production
+  // manager: dispatch:update alone is not enough once goods have left.
+  if (order.status === SALES_ORDER_STATUSES.DELIVERED && !isProductionManager(user)) {
     throw new ApiError(403, 'This order is delivered. Ask a production manager to change its entries.');
   }
+  if (isFloorManager(user, row.stage)) return;
   if (String(row.operator || '') !== String(user._id)) {
     throw new ApiError(403, 'You can only change entries you made. Ask a production manager.');
   }
   const madeAt = new Date(row.completedAt || row.workDate || 0).getTime();
   if (!madeAt || Date.now() - madeAt > OPERATOR_EDIT_HOURS * 60 * 60 * 1000) {
     throw new ApiError(403, `Entries can be changed for ${OPERATOR_EDIT_HOURS} hours. Ask a production manager.`);
+  }
+}
+
+// Quantity of a line on issued sale invoices of this order.
+async function invoicedQty(order, item) {
+  const Invoice = require('../billing/invoice.model');
+  const invoices = await Invoice.find({ salesOrder: order._id, status: 'issued', kind: 'sale' }).select('lines').lean();
+  let total = 0;
+  for (const invoice of invoices) {
+    for (const line of invoice.lines || []) {
+      if (String(line.itemId) === String(item._id)) total += Number(line.quantity) || 0;
+    }
+  }
+  return total;
+}
+
+// Dispatch rows are what billing invoices against: the dispatched total may
+// never drop below what is already on issued invoices.
+async function assertDispatchCoversInvoices(order, item, newDispatched) {
+  const invoiced = await invoicedQty(order, item);
+  if (invoiced - newDispatched > EPS) {
+    throw new ApiError(
+      400,
+      `${qtyText(invoiced)} ${item.unit || 'pcs'} of this line is already invoiced. Cancel or credit the invoice before reducing the dispatch below that.`
+    );
   }
 }
 
@@ -1019,6 +1134,11 @@ async function deleteEntry(user, payload) {
   const wasteQty = Number(row.wasteQty) || 0;
   const inputQty = Number(row.inputQty) || 0;
   const undo = [];
+  let settled = [];
+
+  if (isDeliveryStage(stage)) {
+    await assertDispatchCoversInvoices(order, item, stageStats(item, stage).output - outputQty);
+  }
 
   try {
     if (!isDeliveryStage(stage)) {
@@ -1035,21 +1155,25 @@ async function deleteEntry(user, payload) {
       }
     }
 
-    const prevStage = previousStage(item.productionRoute, stage);
-    const sourceUnit = prevStage ? stageUnit(item, prevStage) : undefined;
-    undo.push(await restoreSource(order, item, row, inputQty, sourceUnit));
+    // A step that took nothing from stock has nothing to put back.
+    if (!takesNoStock(item.productionRoute, stage)) {
+      const prevStage = previousStage(item.productionRoute, stage);
+      const sourceUnit = prevStage ? stageUnit(item, prevStage) : undefined;
+      undo.push(await restoreSource(order, item, row, inputQty, sourceUnit));
+    }
 
     const outputLotId = row.outputLot;
     const wasteLotId = row.wasteLot;
     item.stageWork.pull(row._id);
     item.currentStage = activeStage(item);
-    applyOrderStatus(order);
+    settled = applyOrderStatus(order);
     await salesOrderRepo.save(order);
   } catch (error) {
     for (const step of undo.reverse()) await Promise.resolve(step()).catch(logUndoFailure);
     throw error;
   }
   // The order is saved; from here on, inventory must not be rolled back.
+  await returnSettledPickups(order, settled);
   await syncTasks(order, user);
   await afterCommit(() => {
     doc.$session(null); // loaded inside the (now finished) transaction
@@ -1079,17 +1203,35 @@ async function updateEntry(user, payload) {
   }
 
   const prevStage = previousStage(item.productionRoute, stage);
-  const sourceLot = await findSourceLot(order, item, row);
+  const noStock = takesNoStock(item.productionRoute, stage);
+  const sourceLot = noStock ? null : await findSourceLot(order, item, row);
   const sourceUnit = sourceLot?.unit || (prevStage ? stageUnit(item, prevStage) : stats.unit);
   const matching = !delivery && sameUnit(sourceUnit, stats.unit);
+  // The unit the row's waste was recorded in; old rows without one get the
+  // unit of what was used.
+  const keptWasteUnit = String((typeof row.get === 'function' ? row.get('wasteUnit') : row.wasteUnit) || '').trim();
+  const rowWasteUnit = keptWasteUnit || (matching ? stats.unit : sourceUnit || stats.unit);
   const givenInput = !(payload.inputQty === undefined || payload.inputQty === null || payload.inputQty === '');
   let inputQty;
-  if (delivery) {
+  if (noStock) {
+    // Nothing was taken from stock: dispatch keeps 0, "other" keeps the noted figure.
+    inputQty = delivery ? 0 : givenInput ? num(payload.inputQty) : oldIn;
+    if (inputQty < 0) throw new ApiError(400, 'Used cannot be negative');
+  } else if (delivery) {
     const deliveryMatching = sameUnit(sourceUnit, stats.unit);
     inputQty = deliveryMatching ? outputQty : givenInput ? num(payload.inputQty) : oldIn;
   } else if (matching) inputQty = outputQty + wasteQty;
   else inputQty = givenInput ? num(payload.inputQty) : oldIn;
-  if (inputQty <= 0) throw new ApiError(400, 'Enter how much was used');
+  if (inputQty <= 0 && !noStock) throw new ApiError(400, 'Enter how much was used');
+
+  if (delivery) {
+    if (outputQty < oldOut - EPS) {
+      await assertDispatchCoversInvoices(order, item, stats.output - oldOut + outputQty);
+    }
+    if (!noStock && !sameUnit(sourceUnit, stats.unit)) {
+      assertPlausibleDispatch(user, item, sourceLot || { unit: sourceUnit }, outputQty, inputQty, stats.unit);
+    }
+  }
 
   let machine = null;
   if (payload.machineId) {
@@ -1101,11 +1243,7 @@ async function updateEntry(user, payload) {
     }
   }
 
-  let workDate = row.workDate;
-  if (payload.workDate) {
-    workDate = new Date(payload.workDate);
-    if (Number.isNaN(workDate.getTime())) throw new ApiError(400, 'Work date is not valid');
-  }
+  const workDate = parseWorkDate(payload.workDate, row.workDate);
 
   if (delivery) {
     const deliveryPartner = String(payload.deliveryPartner ?? row.deliveryPartner ?? '').trim();
@@ -1116,8 +1254,9 @@ async function updateEntry(user, payload) {
 
   const undo = [];
   const created = [];
+  let settled = [];
   try {
-    const dIn = inputQty - oldIn;
+    const dIn = noStock ? 0 : inputQty - oldIn;
     if (dIn > EPS) {
       await takeBack(sourceLot, dIn, `Not enough left on ${row.pickedLotName || 'the material used'} to use ${qtyText(dIn)} more`);
       undo.push(() => itemRepo.addQuantity(sourceLot._id, dIn));
@@ -1161,7 +1300,7 @@ async function updateEntry(user, payload) {
             stage,
             category: INVENTORY_CATEGORIES.WASTE,
             qty: dWaste,
-            unit: matching ? stats.unit : sourceUnit || stats.unit,
+            unit: rowWasteUnit,
             workDate,
           });
           if (wasteLot) created.push(wasteLot);
@@ -1174,6 +1313,7 @@ async function updateEntry(user, payload) {
     row.outputQty = outputQty;
     row.wasteQty = wasteQty;
     row.workDate = workDate;
+    if (!delivery && wasteQty > 0) setWasteUnit(row, rowWasteUnit);
     if (machine) {
       row.machine = machine._id;
       row.machineName = `${machine.name}${machine.code ? ` (${machine.code})` : ''}`;
@@ -1190,19 +1330,59 @@ async function updateEntry(user, payload) {
     }
     item.markModified('stageWork');
     item.currentStage = activeStage(item);
-    applyOrderStatus(order);
+    settled = applyOrderStatus(order);
     await salesOrderRepo.save(order);
   } catch (error) {
     for (const step of undo.reverse()) await Promise.resolve(step()).catch(logUndoFailure);
     for (const lot of created) await itemRepo.deleteById(lot._id).catch(() => {});
     throw error;
   }
+  await returnSettledPickups(order, settled);
   await syncTasks(order, user);
   await afterCommit(() => {
     doc.$session(null); // loaded inside the (now finished) transaction
     return registers.updateEntry(doc, entry, item, row);
   }).catch((error) => console.error('Register entry update failed; rebuilt on next open', error.message));
   return { updated: true };
+}
+
+// A production manager closes a stage that came in under target: it counts as
+// done with what it made, and the next stages close once they have used all
+// of it (see stageStats).
+async function closeStageShort(user, payload) {
+  if (!isProductionManager(user)) {
+    throw new ApiError(403, 'Only a production manager can close a stage short');
+  }
+  const { order, item, stage } = await loadFloorItem(user, payload, { mustWork: true });
+  if (isDeliveryStage(stage)) {
+    throw new ApiError(400, 'Dispatch cannot be closed short. Close the last making stage instead.');
+  }
+  const reason = String(payload.reason || '').trim().slice(0, 500);
+  if (reason.length < 3) throw new ApiError(400, 'Enter why this stage is being closed short');
+  const stats = stageStats(item, stage);
+  if (isStageClosed(item, stage) || stats.done) throw new ApiError(400, `${stageTitle(stage)} is already done on this line`);
+  if (!(stats.output > 0)) throw new ApiError(400, `Nothing has been made at ${stageTitle(stage)} yet`);
+  if (toPublicPickup(item, stage)) {
+    throw new ApiError(400, 'Finish or return the lot marked for working at this stage first');
+  }
+  const prev = previousStage(item.productionRoute, stage);
+  if (prev && !stageStats(item, prev).done) {
+    throw new ApiError(400, `${stageTitle(prev)} is not done yet. Close it first.`);
+  }
+
+  const closed = [
+    ...closedStages(item).map((row) => (row && typeof row.toObject === 'function' ? row.toObject() : row)),
+    { stage, by: user._id, byName: user.fullName || user.username || '', at: new Date(), reason },
+  ];
+  // stageClosed is not declared on the order item schema yet; strict: false
+  // stores it either way (a plain assignment works once it is declared).
+  item.set('stageClosed', closed, { strict: false });
+  item.currentStage = activeStage(item);
+  const settled = applyOrderStatus(order);
+  await salesOrderRepo.save(order);
+  await returnSettledPickups(order, settled);
+  await syncTasks(order, user);
+  return toJob(order, item, stage);
 }
 
 async function stageMachines(user, stage) {
@@ -1250,6 +1430,7 @@ module.exports = {
   enterFromRegister: floorAction(enterFromRegister),
   updateEntry: floorAction(updateEntry),
   deleteEntry: floorAction(deleteEntry),
+  closeStageShort: floorAction(closeStageShort),
   stageMachines,
   createLotCache,
   detachOrderPickups,

@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const ApiError = require('../../utils/ApiError');
 const { SALES_ORDER_STATUSES } = require('../../config/constants');
 const SalesOrder = require('../salesOrder/salesOrder.model');
-const { FLOOR_STAGES, FLOOR_ORDER_STATUSES, isSuperAdmin, routeStages, canReadStage, visibleStages, stageStats, activeStage, stageRequirements } = require('./production.flow');
+const { FLOOR_STAGES, FLOOR_ORDER_STATUSES, isSuperAdmin, routeStages, canReadStage, visibleStages, stageStats, activeStage, stageName, stageRequirements, operatorStations, wasteUnitOf } = require('./production.flow');
 
 // Printable sheets for the floor: the job sheet of one order (one page per
 // stage, with the specs that stage needs and blank rows to write the shift's
@@ -50,6 +50,9 @@ function specRows(order, item, stage) {
   } else if (stage === 'printing') {
     const p = req.printing || {};
     rows.push(['Colours', [p.colorCount && `${p.colorCount} colour(s)`, p.colors].filter(Boolean).join(': ')], ['Impressions', p.impressions], ['Design', p.design], ['Artwork', p.artwork], ['Printing notes', p.requirement || p.specialRequirements]);
+  } else if (stage === 'other') {
+    rows.unshift(['Process', req.process]);
+    rows.push(['Material', req.material]);
   } else if (stage === 'cutting') {
     const bag = req.bag || {};
     const holes = req.holes || {};
@@ -74,24 +77,34 @@ function lineFor(order, item, stage) {
     itemId: String(item._id),
     product: item.product || item.productCode || '',
     productCode: item.productCode || '',
+    // The process name on an "Other process" line (e.g. Lamination).
+    process: stage === 'other' ? stageName(item, stage) : '',
     unit: stats.unit,
     target: r2(stats.target),
     done: r2(stats.output),
+    // Waste stays in its own unit (kg of film at printing): never added to pcs.
     waste: r2(stats.waste),
+    wasteUnit: stats.wasteUnit,
+    wasteText: stats.wasteText,
+    closedShort: Boolean(stats.closedShort),
     remaining: r2(stats.remaining),
     finished: stats.done,
     specs: specRows(order, item, stage),
     images: stage === 'printing' || stage === 'cutting' ? imagesOf(item) : [],
     entries: (item.stageWork || [])
       .filter((w) => w.stage === stage)
-      .map((w) => ({ date: w.workDate || w.completedAt, operator: w.operatorName || '', machine: w.machineName || '', input: r2(w.inputQty), output: r2(w.outputQty), waste: r2(w.wasteQty), vehicle: w.vehicleNumber || '' })),
+      .map((w) => ({ date: w.workDate || w.completedAt, operator: w.operatorName || '', machine: w.machineName || '', input: r2(w.inputQty), output: r2(w.outputQty), waste: r2(w.wasteQty), wasteUnit: w.wasteQty ? wasteUnitOf(item, w) : '', vehicle: w.vehicleNumber || '' })),
   };
 }
 
 async function jobSheet(user, orderId, { stage } = {}) {
   if (!mongoose.isValidObjectId(orderId)) throw new ApiError(404, 'Order not found');
   const order = await SalesOrder.findById(orderId).lean();
+  // Floor operators see only orders on the floor (the same list as the floor
+  // queue), never order remarks; office users any order past draft.
+  const operator = operatorStations(user).length > 0;
   if (!order || order.status === SALES_ORDER_STATUSES.DRAFT) throw new ApiError(404, 'Order not found');
+  if (operator && !FLOOR_ORDER_STATUSES.includes(order.status)) throw new ApiError(404, 'Order not found');
   const onRoute = new Set((order.items || []).flatMap((item) => routeStages(item.productionRoute)));
   const wanted = FLOOR_STAGES.map((s) => s.id).filter((s) => onRoute.has(s) && canReadStage(user, s) && (!stage || s === stage));
   if (!wanted.length) throw new ApiError(stage && onRoute.has(stage) ? 403 : 404, stage ? 'No job sheet for this stage' : 'You cannot see any stage of this order');
@@ -106,7 +119,7 @@ async function jobSheet(user, orderId, { stage } = {}) {
       deliveryDate: order.deliveryDate,
       customer: customerFor(user, order),
       productionInstructions: order.productionInstructions || '',
-      remarks: order.remarks || '',
+      remarks: operator ? '' : order.remarks || '',
     },
     stages: wanted.map((s) => ({
       stage: s,
@@ -122,7 +135,8 @@ async function jobSheet(user, orderId, { stage } = {}) {
 async function stageSheet(user, stage) {
   if (!FLOOR_STAGES.some((s) => s.id === stage)) throw new ApiError(400, 'Unknown stage');
   if (!canReadStage(user, stage)) throw new ApiError(403, 'You cannot see this stage');
-  const orders = await SalesOrder.find({ status: { $in: [SALES_ORDER_STATUSES.APPROVED, ...FLOOR_ORDER_STATUSES] } }).lean();
+  // Same orders as the floor queue: approved but not yet planned is not work.
+  const orders = await SalesOrder.find({ status: { $in: FLOOR_ORDER_STATUSES } }).lean();
   const lines = [];
   for (const order of orders) {
     for (const item of order.items || []) {

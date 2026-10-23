@@ -24,6 +24,10 @@ const TEXT_FIELDS = [
 ];
 
 const GSTIN = /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+// GST allows invoice numbers of up to 16 characters; ours are
+// PREFIX/26-27/0001, so the prefix gets what is left after "/26-27/0001".
+const INVOICE_NUMBER_MAX = 16;
+const INVOICE_PREFIX_MAX = INVOICE_NUMBER_MAX - '/26-27/0001'.length;
 
 async function loadSettings() {
   let doc = await CompanySettings.findOne({ key: 'default' });
@@ -69,7 +73,9 @@ async function saveSettings(payload = {}) {
   }
   if (doc.gstin && !GSTIN.test(doc.gstin.toUpperCase())) throw new ApiError(400, 'GSTIN is not in the right format (15 characters, e.g. 07ABCDE1234F1Z5)');
   if (doc.bankIfsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(doc.bankIfsc.toUpperCase())) throw new ApiError(400, 'IFSC is not in the right format (e.g. HDFC0001234)');
-  if (!/^[A-Za-z0-9/-]{0,8}$/.test(doc.invoicePrefix || '')) throw new ApiError(400, 'Invoice prefix can be up to 8 letters, digits, / or -');
+  if (!new RegExp(`^[A-Za-z0-9/-]{0,${INVOICE_PREFIX_MAX}}$`).test(doc.invoicePrefix || '')) {
+    throw new ApiError(400, `Invoice prefix can be up to ${INVOICE_PREFIX_MAX} letters, digits, / or - (GST allows invoice numbers of up to ${INVOICE_NUMBER_MAX} characters, e.g. ${doc.invoicePrefix ? String(doc.invoicePrefix).slice(0, INVOICE_PREFIX_MAX) : 'SP'}/26-27/0001)`);
+  }
   if (!/^[A-Za-z0-9/-]{0,8}$/.test(doc.proformaPrefix || '')) throw new ApiError(400, 'Proforma prefix can be up to 8 letters, digits, / or -');
   if (payload.defaultCreditDays !== undefined) doc.defaultCreditDays = wholeNumber(payload.defaultCreditDays, 'Default credit days', 0, 365);
   if (payload.overdueHoldDays !== undefined) doc.overdueHoldDays = wholeNumber(payload.overdueHoldDays, 'Overdue days before credit hold', 0, 365);
@@ -84,4 +90,4 @@ async function defaultCreditDays() {
   return (await loadSettings()).defaultCreditDays ?? 30;
 }
 
-module.exports = { getSettings, saveSettings, defaultCreditDays };
+module.exports = { getSettings, saveSettings, defaultCreditDays, INVOICE_NUMBER_MAX };

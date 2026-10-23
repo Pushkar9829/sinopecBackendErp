@@ -48,13 +48,15 @@ function loginUsername(req) {
 
 const FIFTEEN_MINUTES = 15 * 60 * 1000;
 
-// Failed logins per username (from any IP) and per IP (any username).
+// Failed logins per username from one IP, and per IP (any username). The
+// username bucket is keyed on the IP too, so someone guessing from elsewhere
+// cannot lock the real user out of their own account.
 const loginLimiters = [
   rateLimit({
     windowMs: FIFTEEN_MINUTES,
     max: 10,
     skipSuccessful: true,
-    key: (req) => `user:${loginUsername(req)}`,
+    key: (req) => `user:${loginUsername(req)}|${clientIp(req)}`,
     message: 'Too many failed sign-in attempts for this user. Try again in 15 minutes.',
   }),
   rateLimit({
@@ -66,10 +68,17 @@ const loginLimiters = [
   }),
 ];
 
+// Sign-out writes an audit row each time; keep it from being spammed.
+const logoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  key: (req) => `logout:${clientIp(req)}`,
+});
+
 const refreshLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
   key: (req) => `refresh:${clientIp(req)}`,
 });
 
-module.exports = { rateLimit, loginLimiters, refreshLimiter };
+module.exports = { rateLimit, loginLimiters, refreshLimiter, logoutLimiter };

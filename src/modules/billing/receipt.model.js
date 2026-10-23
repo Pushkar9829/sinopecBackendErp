@@ -14,6 +14,8 @@ const receiptSchema = new mongoose.Schema(
     tds: { type: Number, default: 0, min: 0 },
     tdsSection: { type: String, default: '', trim: true },
     method: { type: String, default: 'bank_transfer' },
+    // Cash or bank account the money went into, fixed when recorded.
+    depositTo: { type: mongoose.Schema.Types.ObjectId, ref: 'BookAccount', default: null },
     reference: { type: String, default: '', trim: true },
     note: { type: String, default: '', trim: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -26,6 +28,8 @@ const receiptSchema = new mongoose.Schema(
 );
 
 receiptSchema.index({ customer: 1, voidedAt: 1, receivedAt: 1 });
+// The books sync picks up changed documents by updatedAt.
+receiptSchema.index({ updatedAt: 1 });
 
 receiptSchema.set('toJSON', {
   transform(_doc, ret) {

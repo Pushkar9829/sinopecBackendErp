@@ -1,4 +1,65 @@
+const dns = require('dns');
+const net = require('net');
+const env = require('../../../config/env');
 const { INSTRUCTIONS, parseJson } = require('./prompt');
+
+function isPrivateAddress(address) {
+  let ip = String(address || '').toLowerCase().replace(/^\[|\]$/g, '');
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (mapped) ip = mapped[1];
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return (
+      a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224
+    );
+  }
+  if (net.isIPv6(ip)) {
+    return ip === '::' || ip === '::1' || ip.startsWith('::ffff:') || /^f[cd]/.test(ip) || /^fe[89ab]/.test(ip) || /^ff/.test(ip);
+  }
+  return false;
+}
+
+// The saved API key is sent to this address, and the server calls it, so on
+// a production server it must be https on a public host. An on-premise
+// model server can be allowed with OPENAI_ALLOW_PRIVATE_URL=1.
+function allowPrivate(options) {
+  if (options.allowPrivate !== undefined) return options.allowPrivate;
+  return !env.isProd || process.env.OPENAI_ALLOW_PRIVATE_URL === '1';
+}
+
+function checkBaseUrl(value, options = {}) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return 'The open-model server address is not a valid URL';
+  }
+  if (url.username || url.password) return 'Put the API key in its own field, not in the server address';
+  if (allowPrivate(options)) {
+    return ['http:', 'https:'].includes(url.protocol) ? '' : 'The open-model server address must start with https://';
+  }
+  if (url.protocol !== 'https:') return 'The open-model server address must start with https://';
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || isPrivateAddress(host)) {
+    return 'The open-model server must be on a public address';
+  }
+  return '';
+}
+
+// Checked again just before each call: the name may now resolve to a private address.
+async function assertPublicHost(base) {
+  if (allowPrivate({})) return;
+  const problem = checkBaseUrl(base);
+  if (problem) throw Object.assign(new Error(problem), { config: true });
+  const { hostname } = new URL(base);
+  const addresses = await dns.promises.lookup(hostname.replace(/^\[|\]$/g, ''), { all: true }).catch(() => []);
+  if (!addresses.length || addresses.some((entry) => isPrivateAddress(entry.address))) {
+    throw Object.assign(new Error('The open-model server must be on a public address'), { config: true });
+  }
+}
 
 // Any server speaking the OpenAI chat-completions API: a self-hosted open
 // model (Ollama, vLLM, LM Studio) or a hosted one. Scanned PDFs without a
@@ -8,6 +69,7 @@ async function read(settings, input) {
   if (!base || !settings.openaiModel) {
     throw Object.assign(new Error('Set the server address and model for the open-model reader'), { config: true });
   }
+  await assertPublicHost(base);
   const content = [{ type: 'text', text: [INSTRUCTIONS, ...input.texts].join('\n\n') }];
   for (const file of input.files) {
     if (file.mimeType.startsWith('image/')) {
@@ -27,6 +89,8 @@ async function read(settings, input) {
       messages: [{ role: 'user', content }],
     }),
     signal: AbortSignal.timeout(180000),
+    // A redirect could carry the key to another (private) host.
+    redirect: 'error',
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -47,4 +111,4 @@ async function read(settings, input) {
   };
 }
 
-module.exports = { name: 'openai', read, supportsPdf: false };
+module.exports = { name: 'openai', read, supportsPdf: false, checkBaseUrl, isPrivateAddress };

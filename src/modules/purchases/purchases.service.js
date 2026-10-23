@@ -140,6 +140,16 @@ async function priceLines(raw, intraState, { forNote = false } = {}) {
   return { lines, taxable: sum('taxable'), cgst: sum('cgst'), sgst: sum('sgst'), igst: sum('igst'), gross: sum('amount') };
 }
 
+// An unregistered supplier cannot charge GST we can claim back: such lines
+// are entered at 0% (any tax they charged is part of the cost).
+function assertNoGstWithoutGstin(supplier, lines) {
+  if (str(supplier.gstNumber)) return;
+  const taxed = (Array.isArray(lines) ? lines : []).findIndex((l) => (Number(l?.gstPercent) || 0) > 0);
+  if (taxed >= 0) {
+    throw new ApiError(400, `${supplier.name} has no GSTIN, so GST on this bill cannot be claimed as input credit. Enter line ${taxed + 1} (and every line) at 0% GST, with any tax charged included in the amount, or add the supplier's GSTIN first`);
+  }
+}
+
 // ---------------------------------------------------------------- bills
 
 function presentBill(b) {
@@ -156,6 +166,7 @@ async function createBill(user, payload = {}) {
   const supplierBillNo = str(payload.supplierBillNo);
   if (!supplierBillNo) throw new ApiError(400, "Enter the supplier's bill number");
   if (await PurchaseBill.exists({ supplier: supplier._id, supplierBillNo, status: 'issued' })) throw new ApiError(409, `Bill ${supplierBillNo} from ${supplier.name} is already entered`);
+  assertNoGstWithoutGstin(supplier, payload.lines);
   const { company, intraState } = await taxPlace(supplier);
   const priced = await priceLines(payload.lines, intraState);
   // The bill's own total may round differently; accept up to ₹5 of difference.
@@ -232,6 +243,10 @@ async function cancelBill(user, id, reason) {
   await assertOpenPeriod(bill.billDate, 'this bill');
   const why = str(reason);
   if (why.length < 3) throw new ApiError(400, 'Give a reason for cancelling the bill');
+  // As with sale invoices: what was made against the bill goes first.
+  const label = bill.supplierBillNo || bill.number;
+  if (await DebitNote.exists({ bill: bill._id, status: 'issued' })) throw new ApiError(400, `Debit notes are made against bill ${label}; cancel them first`);
+  if (await SupplierPayment.exists({ bill: bill._id, voidedAt: null })) throw new ApiError(400, `Payments are recorded against bill ${label}; void them first`);
   bill.status = 'cancelled';
   bill.cancelledAt = new Date();
   bill.cancelledByName = actor(user);
@@ -359,13 +374,19 @@ async function createDebitNote(user, supplierId, payload = {}) {
     bill = mongoose.isValidObjectId(payload.billId) ? await PurchaseBill.findOne({ _id: payload.billId, supplier: supplier._id, status: 'issued' }).lean() : null;
     if (!bill) throw new ApiError(400, 'That bill is not an open bill of this supplier');
   }
+  // A note against a bill that carried GST reverses that GST; otherwise the
+  // supplier needs a GSTIN for the note to carry any.
+  if (!bill || !(bill.cgst || bill.sgst || bill.igst)) assertNoGstWithoutGstin(supplier, payload.lines);
   const intraState = bill ? bill.intraState : (await taxPlace(supplier)).intraState;
   const priced = await priceLines(payload.lines, intraState, { forNote: true });
   const total = money(Math.round(priced.gross * 100) / 100);
   if (bill) {
-    const account = await supplierAccount(supplier._id);
-    const row = account.bills.find((b) => b.id === String(bill._id));
-    if (total > (row?.total || 0) + EPS) throw new ApiError(400, `The note (₹${total}) is more than bill ${bill.supplierBillNo || bill.number} (₹${row?.total})`);
+    // Earlier debit notes on the same bill count towards the limit.
+    const earlier = await DebitNote.aggregate([{ $match: { bill: bill._id, status: 'issued' } }, { $group: { _id: null, total: { $sum: '$total' } } }]);
+    const already = money(earlier[0]?.total || 0);
+    if (total + already > (bill.total || 0) + EPS) {
+      throw new ApiError(400, `Debit notes on bill ${bill.supplierBillNo || bill.number} would come to ₹${money(total + already)}, more than the bill (₹${bill.total})${already ? `; ₹${already} is already noted` : ''}`);
+    }
   }
   const doc = await DebitNote.create({
     number: await nextNumber('DN', date, DebitNote),
@@ -408,11 +429,31 @@ async function cancelDebitNote(user, id, reason) {
 // pays the bills that fell due first.
 async function supplierAccount(supplierId, { asOf = new Date() } = {}) {
   const id = new mongoose.Types.ObjectId(String(supplierId));
+  const docs = await supplierDocs({ supplier: id });
+  return supplierAccountFrom(docs.get(String(id)), { asOf });
+}
+
+// Bills, payments and debit notes read once for many suppliers, grouped by supplier.
+async function supplierDocs(match = {}) {
   const [bills, payments, notes] = await Promise.all([
-    PurchaseBill.find({ supplier: id, status: 'issued' }).select('-lines').sort({ dueDate: 1, billDate: 1, _id: 1 }).lean(),
-    SupplierPayment.find({ supplier: id, voidedAt: null }).sort({ paidAt: 1, _id: 1 }).lean(),
-    DebitNote.find({ supplier: id, status: 'issued' }).select('-lines').sort({ date: 1, _id: 1 }).lean(),
+    PurchaseBill.find({ ...match, status: 'issued' }).select('-lines').sort({ dueDate: 1, billDate: 1, _id: 1 }).lean(),
+    SupplierPayment.find({ ...match, voidedAt: null }).sort({ paidAt: 1, _id: 1 }).lean(),
+    DebitNote.find({ ...match, status: 'issued' }).select('-lines').sort({ date: 1, _id: 1 }).lean(),
   ]);
+  const bySupplier = new Map();
+  const bucket = (sid) => {
+    const key = String(sid);
+    if (!bySupplier.has(key)) bySupplier.set(key, { bills: [], payments: [], notes: [] });
+    return bySupplier.get(key);
+  };
+  for (const row of bills) bucket(row.supplier).bills.push(row);
+  for (const row of payments) bucket(row.supplier).payments.push(row);
+  for (const row of notes) bucket(row.supplier).notes.push(row);
+  return bySupplier;
+}
+
+// The account worked out from already-loaded documents.
+function supplierAccountFrom({ bills = [], payments = [], notes = [] } = {}, { asOf = new Date() } = {}) {
   const state = bills.map((b) => ({ ...b, paid: 0 }));
   const balanceOf = (row) => money(row.total - row.paid);
   const apply = (rows, amount) => {
@@ -517,9 +558,11 @@ async function payables(user) {
   assert(canView(user), 'You cannot see purchases');
   const ids = new Set([...(await PurchaseBill.distinct('supplier', { status: 'issued' })).map(String), ...(await SupplierPayment.distinct('supplier', { voidedAt: null })).map(String)]);
   const suppliers = await Supplier.find({ _id: { $in: [...ids] } }).select('code name mobile creditDays').lean();
+  const docs = await supplierDocs({ supplier: { $in: suppliers.map((s) => s._id) } });
+  const now = new Date();
   const rows = [];
   for (const s of suppliers) {
-    const account = await supplierAccount(s._id);
+    const account = supplierAccountFrom(docs.get(String(s._id)), { asOf: now });
     rows.push({
       id: String(s._id),
       code: s.code,

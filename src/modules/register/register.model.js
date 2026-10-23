@@ -18,6 +18,8 @@ const entrySchema = new mongoose.Schema(
     inputQty: { type: Number, default: 0, min: 0 },
     outputQty: { type: Number, default: 0, min: 0 },
     wasteQty: { type: Number, default: 0, min: 0 },
+    // kg or pcs: waste is in the unit of what was used, not always `unit`.
+    wasteUnit: { type: String, default: '', trim: true },
     workDate: { type: Date, default: Date.now },
     notes: { type: String, default: '', trim: true },
     machineName: { type: String, default: '', trim: true },

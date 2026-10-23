@@ -7,6 +7,7 @@ const {
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken,
+  verifyAccessToken,
   hashToken,
   parseDurationMs,
   setAuthCookies,
@@ -19,6 +20,7 @@ function tokenPayload(user) {
   return {
     sub: String(user._id),
     role: user.role?.slug,
+    tv: user.tokenVersion || 0,
   };
 }
 
@@ -77,11 +79,42 @@ async function login(res, username, password) {
   return withTokens(user, tokens);
 }
 
+function readAccessTokenFrom(req) {
+  const header = req.headers.authorization;
+  if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) return header.slice(7).trim();
+  return req.cookies?.[COOKIES.ACCESS] || null;
+}
+
+// Signing out ends this browser's access token now, not when it expires.
+async function revokeAccessToken(req) {
+  const token = readAccessTokenFrom(req);
+  if (!token) return;
+  try {
+    const payload = verifyAccessToken(token);
+    if (payload.jti && payload.exp) await authRepo.revokeAccessJti(payload.jti, new Date(payload.exp * 1000));
+  } catch {
+    // Expired or invalid: nothing to end.
+  }
+}
+
 async function logout(req, res) {
   const refreshToken = readRefreshCookie(req);
   if (refreshToken) {
     await authRepo.revokeByHash(hashToken(refreshToken));
   }
+  await revokeAccessToken(req);
+  clearAuthCookies(res);
+}
+
+// Ends every session of the user: refresh tokens are revoked and the token
+// version bump makes all access tokens already handed out stop working.
+async function endAllSessions(userId) {
+  await authRepo.revokeAllForUser(userId);
+  await userRepo.bumpTokenVersion(userId);
+}
+
+async function logoutAll(req, res) {
+  await endAllSessions(req.user._id);
   clearAuthCookies(res);
 }
 
@@ -112,7 +145,7 @@ async function refresh(req, res) {
     if (stored) {
       // An old, already-rotated token came back: assume it was stolen and
       // end every session for this user.
-      await authRepo.revokeAllForUser(stored.user);
+      await endAllSessions(stored.user);
     }
     clearAuthCookies(res);
     throw new ApiError(401, 'Refresh token has been revoked');
@@ -135,6 +168,9 @@ function me(user) {
 module.exports = {
   login,
   logout,
+  logoutAll,
+  endAllSessions,
+  issueSession,
   refresh,
   me,
 };

@@ -1,4 +1,6 @@
+const mongoose = require('mongoose');
 const { SALES_ORDER_STATUSES } = require('../../config/constants');
+const ApiError = require('../../utils/ApiError');
 const Customer = require('../customer/customer.model');
 const SalesOrder = require('../salesOrder/salesOrder.model');
 const Invoice = require('../billing/invoice.model');
@@ -82,7 +84,31 @@ function moneyAccount(sys, settings, method) {
   return method === 'cash' ? sys.cash : settings.defaultBank || sys.bank;
 }
 
-// Writes (or updates) the voucher for one source document.
+// The cash or bank account money went into, fixed when it is recorded: the
+// one chosen, else cash for cash and today's default bank for the rest.
+async function depositAccount(chosen, method) {
+  await ensureChart();
+  if (chosen !== undefined && chosen !== null && String(chosen).trim() !== '') {
+    const a = mongoose.isValidObjectId(chosen) ? await BookAccount.findById(chosen).select('group isActive').lean() : null;
+    if (!a || !['bank', 'cash'].includes(a.group) || a.isActive === false) throw new ApiError(400, 'Deposit to an active cash or bank account');
+    return a._id;
+  }
+  const settings = await BooksSettings.findOne({ key: 'default' }).select('defaultBank').lean();
+  return moneyAccount(await systemAccounts(), settings || {}, method);
+}
+
+// Older documents carry no account: settle it once, and keep it on the
+// document, so changing the default bank later never moves them. Written
+// without touching updatedAt (the sync's own change marker).
+async function storedAccount(Model, filter, field, current, fallback) {
+  if (current) return current;
+  await Model.updateOne(filter, { $set: { [field]: fallback } }, { timestamps: false, strict: false });
+  return fallback;
+}
+
+// Writes (or updates) the voucher for one source document. Nothing dated on
+// or before the lock date changes: a closed period stays as it was filed.
+let lockDate = null; // set by syncBooks for the run
 async function upsert(sourceKey, voucher) {
   const lines = voucher.lines.filter((l) => l.debit > 0.004 || l.credit > 0.004).map((l) => ({ ...l, debit: money(l.debit), credit: money(l.credit) }));
   const dr = money(lines.reduce((s, l) => s + l.debit, 0));
@@ -90,15 +116,14 @@ async function upsert(sourceKey, voucher) {
   if (Math.abs(dr - cr) > 0.01) throw new Error(`Voucher for ${sourceKey} does not balance (${dr} / ${cr})`);
   const existing = await Voucher.findOne({ sourceKey }).lean();
   if (!existing && voucher.status === 'cancelled') return 'skipped';
+  if (lockDate && ((existing && new Date(existing.date) <= lockDate) || new Date(voucher.date) <= lockDate)) {
+    // Unchanged vouchers are not "locked out", only ones that would move.
+    if (existing && sameVoucher(existing, { ...voucher, lines })) return 'same';
+    return 'locked';
+  }
   const next = { ...voucher, lines, total: dr, auto: true, sourceKey };
   if (existing) {
-    const same =
-      existing.status === next.status &&
-      existing.number === next.number &&
-      new Date(existing.date).getTime() === new Date(next.date).getTime() &&
-      existing.narration === next.narration &&
-      JSON.stringify(existing.lines.map((l) => [String(l.account), l.debit, l.credit])) === JSON.stringify(lines.map((l) => [String(l.account), l.debit, l.credit]));
-    if (same) return 'same';
+    if (sameVoucher(existing, next)) return 'same';
     await Voucher.updateOne({ _id: existing._id }, { $set: next });
     return 'updated';
   }
@@ -109,6 +134,16 @@ async function upsert(sourceKey, voucher) {
     throw error;
   }
   return 'created';
+}
+
+function sameVoucher(existing, next) {
+  return (
+    existing.status === next.status &&
+    existing.number === next.number &&
+    new Date(existing.date).getTime() === new Date(next.date).getTime() &&
+    existing.narration === next.narration &&
+    JSON.stringify(existing.lines.map((l) => [String(l.account), l.debit, l.credit])) === JSON.stringify(next.lines.map((l) => [String(l.account), l.debit, l.credit]))
+  );
 }
 
 async function postInvoice(inv, sys) {
@@ -136,6 +171,7 @@ async function postInvoice(inv, sys) {
 
 async function postReceipt(r, sys, settings) {
   const party = await customerAccount(r.customer);
+  const into = await storedAccount(Receipt, { _id: r._id }, 'depositTo', r.depositTo, moneyAccount(sys, settings, r.method));
   return upsert(`receipt:${r._id}`, {
     type: 'receipt',
     number: r.number,
@@ -145,7 +181,7 @@ async function postReceipt(r, sys, settings) {
     sourceRef: r.number,
     sourceLink: `/customers/${r.customer}/account`,
     lines: [
-      { account: moneyAccount(sys, settings, r.method), debit: r.amount, credit: 0 },
+      { account: into, debit: r.amount, credit: 0 },
       { account: sys.tds_receivable, debit: r.tds || 0, credit: 0 },
       { account: party, debit: 0, credit: money(r.amount + (r.tds || 0)) },
     ],
@@ -159,6 +195,7 @@ async function postOrderMoney(order, sys, settings) {
   const live = order.status !== SALES_ORDER_STATUSES.CANCELLED;
   const results = [];
   const advance = money(order.advanceAmount);
+  const advanceInto = advance > 0 ? await storedAccount(SalesOrder, { _id: order._id }, 'advanceDepositTo', order.advanceDepositTo, moneyAccount(sys, settings, order.paymentMethod)) : sys.bank;
   results.push(
     await upsert(`orderadv:${order._id}`, {
       type: 'receipt',
@@ -170,12 +207,13 @@ async function postOrderMoney(order, sys, settings) {
       sourceRef: order.number,
       sourceLink: `/sales-orders/${order._id}`,
       lines: [
-        { account: moneyAccount(sys, settings, order.paymentMethod), debit: advance, credit: 0 },
+        { account: advanceInto, debit: advance, credit: 0 },
         { account: party, debit: 0, credit: advance },
       ],
     })
   );
   for (const [index, p] of (order.payments || []).entries()) {
+    const into = await storedAccount(SalesOrder, { _id: order._id, 'payments._id': p._id }, 'payments.$.depositTo', p.depositTo, moneyAccount(sys, settings, p.method));
     results.push(
       await upsert(`orderpay:${order._id}:${p._id}`, {
         type: 'receipt',
@@ -186,7 +224,7 @@ async function postOrderMoney(order, sys, settings) {
         sourceRef: order.number,
         sourceLink: `/sales-orders/${order._id}`,
         lines: [
-          { account: moneyAccount(sys, settings, p.method), debit: p.amount, credit: 0 },
+          { account: into, debit: p.amount, credit: 0 },
           { account: party, debit: 0, credit: p.amount },
         ],
       })
@@ -194,8 +232,12 @@ async function postOrderMoney(order, sys, settings) {
   }
   // A payment taken off the order altogether (not just voided) leaves the books too.
   const keep = new Set((order.payments || []).map((p) => `orderpay:${order._id}:${p._id}`));
-  const gone = await Voucher.find({ sourceKey: new RegExp(`^orderpay:${order._id}:`), status: 'posted' }, 'sourceKey').lean();
+  const gone = await Voucher.find({ sourceKey: new RegExp(`^orderpay:${order._id}:`), status: 'posted' }, 'sourceKey date').lean();
   for (const v of gone.filter((x) => !keep.has(x.sourceKey))) {
+    if (lockDate && new Date(v.date) <= lockDate) {
+      results.push('locked');
+      continue;
+    }
     await Voucher.updateOne({ _id: v._id }, { $set: { status: 'cancelled' } });
     results.push('updated');
   }
@@ -228,6 +270,7 @@ async function postPurchaseBill(bill, sys) {
 
 async function postSupplierPayment(p, sys, settings) {
   const party = await supplierAccount(p.supplier);
+  const from = await storedAccount(SupplierPayment, { _id: p._id }, 'fromAccount', p.fromAccount, moneyAccount(sys, settings, p.method));
   return upsert(`spay:${p._id}`, {
     type: 'payment',
     number: p.number,
@@ -238,7 +281,7 @@ async function postSupplierPayment(p, sys, settings) {
     sourceLink: `/suppliers/${p.supplier}/account`,
     lines: [
       { account: party, debit: money(p.amount + (p.tds || 0)), credit: 0 },
-      { account: p.fromAccount || moneyAccount(sys, settings, p.method), debit: 0, credit: p.amount },
+      { account: from, debit: 0, credit: p.amount },
       { account: sys.tds_payable, debit: 0, credit: p.tds || 0 },
     ],
   });
@@ -299,41 +342,69 @@ async function postCreditNote(n, sys) {
 }
 
 let running = null;
+let runningFull = false;
+let queuedFull = null;
 // Brings the books up to date with billing. `full` re-checks every document.
 async function syncBooks({ full = false } = {}) {
-  if (running) return running;
+  if (running) {
+    if (!full || runningFull) return running;
+    // A full re-check asked for during a quick run: do it right after, rather
+    // than answering with the quick run's result.
+    if (!queuedFull) {
+      queuedFull = running
+        .catch(() => {})
+        .then(() => {
+          queuedFull = null;
+          return syncBooks({ full: true });
+        });
+    }
+    return queuedFull;
+  }
+  runningFull = full;
   running = (async () => {
     await ensureChart();
     const sys = await systemAccounts();
     const settings = await BooksSettings.findOne({ key: 'default' }).lean();
+    lockDate = settings.lockDate ? new Date(settings.lockDate) : null;
     const startedAt = new Date();
     const since = full || !settings.syncedUntil ? null : new Date(new Date(settings.syncedUntil).getTime() - OVERLAP_MS);
     const changed = since ? { updatedAt: { $gte: since } } : {};
-    const counts = { created: 0, updated: 0, same: 0, skipped: 0 };
+    const counts = { created: 0, updated: 0, same: 0, skipped: 0, locked: 0, failed: 0 };
     const count = (r) => (Array.isArray(r) ? r : [r]).forEach((x) => (counts[x] = (counts[x] || 0) + 1));
+    // One bad document must not stop the rest from reaching the books.
+    const each = async (docs, label, post) => {
+      for (const doc of docs) {
+        try {
+          count(await post(doc));
+        } catch (error) {
+          counts.failed += 1;
+          console.error(`Books: posting ${label} ${doc.number || doc._id} failed:`, error.message);
+        }
+      }
+    };
 
-    for (const inv of await Invoice.find({ kind: 'sale', ...changed }).select('-lines -seller -buyer').lean()) count(await postInvoice(inv, sys));
-    for (const r of await Receipt.find(changed).lean()) count(await postReceipt(r, sys, settings));
+    await each(await Invoice.find({ kind: 'sale', ...changed }).select('-lines -seller -buyer').lean(), 'invoice', (inv) => postInvoice(inv, sys));
+    await each(await Receipt.find(changed).lean(), 'receipt', (r) => postReceipt(r, sys, settings));
     // Any changed order (its advance may have gone to zero); on a full run, every
     // order with money on it or with a voucher already in the books.
     const posted = full || !since ? (await Voucher.distinct('sourceKey', { sourceKey: /^order(adv|pay):/ })).map((k) => k.split(':')[1]) : [];
     const orderFilter = since ? changed : { $or: [{ advanceAmount: { $gt: 0 } }, { 'payments.0': { $exists: true } }, { _id: { $in: [...new Set(posted)] } }] };
     const orders = await SalesOrder.find(orderFilter)
-      .select('number status customer orderDate advanceAmount paymentMethod payments')
+      .select('number status customer orderDate advanceAmount advanceDepositTo paymentMethod payments')
       .lean();
-    for (const order of orders) count(await postOrderMoney(order, sys, settings));
+    await each(orders, 'order', (order) => postOrderMoney(order, sys, settings));
     // An order deleted outright takes its money entries with it.
     if (!since) {
-      const keys = await Voucher.find({ sourceKey: /^order(adv|pay):/, status: 'posted' }, 'sourceKey').lean();
+      const keys = await Voucher.find({ sourceKey: /^order(adv|pay):/, status: 'posted' }, 'sourceKey date').lean();
       const ids = [...new Set(keys.map((k) => k.sourceKey.split(':')[1]))];
       const alive = new Set((await SalesOrder.find({ _id: { $in: ids } }, '_id').lean()).map((o) => String(o._id)));
-      const orphans = keys.filter((k) => !alive.has(k.sourceKey.split(':')[1])).map((k) => k._id);
+      const orphans = keys.filter((k) => !alive.has(k.sourceKey.split(':')[1]) && !(lockDate && new Date(k.date) <= lockDate)).map((k) => k._id);
       if (orphans.length) await Voucher.updateMany({ _id: { $in: orphans } }, { $set: { status: 'cancelled' } });
     }
-    for (const bill of await PurchaseBill.find({ kind: 'purchase', ...changed }).lean()) count(await postPurchaseBill(bill, sys));
-    for (const p of await SupplierPayment.find(changed).lean()) count(await postSupplierPayment(p, sys, settings));
-    for (const n of await DebitNote.find(changed).lean()) count(await postDebitNote(n, sys));
-    for (const n of await CreditNote.find(changed).select('-lines -buyer -seller').lean()) count(await postCreditNote(n, sys));
+    await each(await PurchaseBill.find({ kind: 'purchase', ...changed }).lean(), 'purchase bill', (bill) => postPurchaseBill(bill, sys));
+    await each(await SupplierPayment.find(changed).lean(), 'supplier payment', (p) => postSupplierPayment(p, sys, settings));
+    await each(await DebitNote.find(changed).lean(), 'debit note', (n) => postDebitNote(n, sys));
+    await each(await CreditNote.find(changed).select('-lines -buyer -seller').lean(), 'credit note', (n) => postCreditNote(n, sys));
     // Customer renames reach their account names on the next lookup.
     customerAccountIds.clear();
     supplierAccountIds.clear();
@@ -341,8 +412,9 @@ async function syncBooks({ full = false } = {}) {
     return counts;
   })().finally(() => {
     running = null;
+    runningFull = false;
   });
   return running;
 }
 
-module.exports = { ensureChart, systemAccounts, customerAccount, supplierAccount, syncBooks };
+module.exports = { ensureChart, systemAccounts, customerAccount, supplierAccount, syncBooks, depositAccount };

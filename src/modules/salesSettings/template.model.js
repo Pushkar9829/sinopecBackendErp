@@ -27,6 +27,8 @@ const templateSchema = new mongoose.Schema(
       required: true,
       enum: Object.values(PRODUCTION_ROUTES),
     },
+    // Process name on an "Other process → Dispatch" line, e.g. Lamination.
+    otherProcess: { type: String, default: '', trim: true, maxlength: 60 },
     manufacturing: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     roll: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     bag: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },

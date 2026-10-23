@@ -79,6 +79,7 @@ function specOf(source, item, label, strong) {
     product: item.product || item.name || '',
     productCode: item.productCode || item.code || '',
     productionRoute: item.productionRoute,
+    otherProcess: item.otherProcess || '',
     size: item.size || '',
     material: item.material || '',
     width: item.width || '',
@@ -93,7 +94,7 @@ async function suggestProducts(customerId, lines) {
   const customer = customerId ? await Customer.findById(customerId).select('products').lean() : null;
   const own = customer?.products || [];
   const templates = await ProductTemplate.find({ isActive: { $ne: false } })
-    .select('name code product productCode productionRoute size material width length unit')
+    .select('name code product productCode productionRoute otherProcess size material width length unit')
     .limit(1000)
     .lean();
   return (lines || []).map((line) => {
@@ -115,4 +116,21 @@ async function suggestProducts(customerId, lines) {
   });
 }
 
-module.exports = { matchCustomer, suggestProducts };
+// A customer that already has this GST number or mobile, so creating one from
+// a draft (or retrying after an error) never makes a duplicate.
+async function findExistingCustomer({ gstNumber, mobile } = {}) {
+  const gst = normalizeGst(gstNumber);
+  if (gst.length === 15) {
+    const byGst = await Customer.findOne({ gstNumber: new RegExp(`^\\s*${escapeRegex(gst)}\\s*$`, 'i') }).select('_id').lean();
+    if (byGst) return String(byGst._id);
+  }
+  const phone = normalizePhone(mobile);
+  if (phone.length === 10) {
+    const loose = phone.split('').join('[^0-9]*');
+    const byMobile = await Customer.findOne({ mobile: new RegExp(`${loose}\\s*$`) }).select('_id').lean();
+    if (byMobile) return String(byMobile._id);
+  }
+  return null;
+}
+
+module.exports = { matchCustomer, suggestProducts, findExistingCustomer };

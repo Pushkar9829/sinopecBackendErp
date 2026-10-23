@@ -197,6 +197,17 @@ async function updateItem(id, payload, user = null) {
   if (payload.supplierId !== undefined) Object.assign(updates, await resolveSupplier(category, payload.supplierId));
   else if (category !== INVENTORY_CATEGORIES.RAW) Object.assign(updates, { supplier: null, supplierName: '' });
 
+  const unitChanged = updates.unit !== undefined && updates.unit.toLowerCase() !== String(item.unit || '').trim().toLowerCase();
+  if (unitChanged || category !== item.category) {
+    const using = await orderUsingLot(item);
+    if (using) {
+      throw new ApiError(
+        400,
+        `${using.number} is using this lot on the floor, so its ${unitChanged ? 'unit' : 'category'} cannot change. Add a new lot instead.`
+      );
+    }
+  }
+
   const stageId = payload.stageId !== undefined ? payload.stageId : item.stage?._id || item.stage;
   updates.stage = await assertStage(category, stageId);
   updates.unitPrice = normalizePrice(
@@ -236,9 +247,10 @@ async function updateItem(id, payload, user = null) {
   return toPublicItem(updated);
 }
 
-async function assertNotInUse(item) {
+// An open order holding this lot in a pickup or with floor entries made from/into it.
+function orderUsingLot(item) {
   const SalesOrder = require('../salesOrder/salesOrder.model');
-  const using = await SalesOrder.findOne({
+  return SalesOrder.findOne({
     status: { $nin: [SALES_ORDER_STATUSES.CANCELLED, SALES_ORDER_STATUSES.COMPLETED] },
     $or: [
       { 'items.stagePickup.lot': item._id },
@@ -247,6 +259,10 @@ async function assertNotInUse(item) {
       { 'items.stageWork.wasteLot': item._id },
     ],
   }).select('number');
+}
+
+async function assertNotInUse(item) {
+  const using = await orderUsingLot(item);
   if (using) {
     throw new ApiError(400, `${using.number} has taken material from this lot. Set it inactive instead of deleting it.`);
   }

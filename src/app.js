@@ -71,13 +71,27 @@ const largeJson = jsonParser('8mb');
 const smallJson = jsonParser('1mb');
 app.use((req, res, next) => (LARGE_BODY_ROUTES.test(req.originalUrl.split('?')[0]) ? largeJson : smallJson)(req, res, next));
 app.use(cookieParser());
-// Order attachments (POs, artwork, documents) live under sales-orders/ and
-// are only served by the authenticated download routes.
-app.use('/uploads/sales-orders', (req, res) => res.status(404).end());
-// Customer messages' files: only through /api/intake/:id/files/:fileId.
-app.use('/uploads/intake', (req, res) => res.status(404).end());
+// Only the public folders are served from disk. Order attachments
+// (sales-orders/) and customer messages' files (intake/) go through the
+// authenticated download routes. Checked on the decoded path, so %2D or %5C
+// tricks cannot reach a private folder.
+const PUBLIC_UPLOAD_FOLDERS = new Set(['products', 'artwork', 'misc']);
+function publicUploadsOnly(req, res, next) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(req.path);
+  } catch {
+    return res.status(404).end();
+  }
+  const parts = decoded.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (parts.length < 2 || parts.some((part) => part === '.' || part === '..') || !PUBLIC_UPLOAD_FOLDERS.has(parts[0])) {
+    return res.status(404).end();
+  }
+  next();
+}
 app.use(
   '/uploads',
+  publicUploadsOnly,
   express.static(env.uploadsDir, {
     dotfiles: 'deny',
     index: false,

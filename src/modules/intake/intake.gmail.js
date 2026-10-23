@@ -1,8 +1,12 @@
+const crypto = require('crypto');
 const path = require('path');
 const { google } = require('googleapis');
 const jwt = require('jsonwebtoken');
 const env = require('../../config/env');
+const { COOKIES } = require('../../config/constants');
+const { verifyAccessToken } = require('../../utils/tokens');
 const upload = require('../../middlewares/upload');
+const { hasPermission } = require('../../utils/permissions');
 const { uploadBuffer } = require('../../utils/storage');
 const jobs = require('../../utils/jobQueue');
 const Intake = require('./intake.model');
@@ -40,12 +44,32 @@ function connected(settings) {
   return Boolean(settings.gmailRefreshToken && settings.gmailClientId && settings.gmailClientSecret);
 }
 
-async function startUrl() {
+// The OAuth state is tied to the person who started the connection, with its
+// own audience so it can never be used as (or confused with) an access token.
+// Signed with a key derived from the access secret, so a state can't pass as
+// an access token either.
+const STATE_AUDIENCE = 'sinopec:gmail-oauth';
+const stateSecret = () => crypto.createHmac('sha256', env.jwtAccessSecret).update(STATE_AUDIENCE).digest('hex');
+
+function sessionUserId(req) {
+  try {
+    const token = req.cookies?.[COOKIES.ACCESS];
+    return token ? String(verifyAccessToken(token).sub || '') : '';
+  } catch {
+    return '';
+  }
+}
+
+async function startUrl(user) {
   const settings = await getSettings();
   if (!settings.gmailClientId || !settings.gmailClientSecret) {
     throw new Error('Save the Gmail client id and secret first');
   }
-  const state = jwt.sign({ purpose: 'gmail' }, env.jwtAccessSecret, { expiresIn: '15m' });
+  if (!user?._id) throw new Error('Sign in again to connect Gmail');
+  const state = jwt.sign({ purpose: 'gmail', sub: String(user._id) }, stateSecret(), {
+    expiresIn: '15m',
+    audience: STATE_AUDIENCE,
+  });
   return oauthClient(settings).generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -55,14 +79,23 @@ async function startUrl() {
   });
 }
 
-async function finishCallback(code, state) {
+// sessionUserId: the signed-in user of the browser that came back from
+// Google, when its session cookie is still readable.
+async function finishCallback(code, state, sessionUserId = '') {
   let payload;
   try {
-    payload = jwt.verify(state, env.jwtAccessSecret);
+    payload = jwt.verify(state, stateSecret(), { audience: STATE_AUDIENCE });
   } catch {
     throw new Error('Gmail connection expired. Start it again from setup.');
   }
-  if (payload.purpose !== 'gmail') throw new Error('Gmail connection was not recognised');
+  if (payload.purpose !== 'gmail' || !payload.sub) throw new Error('Gmail connection was not recognised');
+  if (sessionUserId && String(sessionUserId) !== String(payload.sub)) {
+    throw new Error('Gmail connection was started by another user. Start it again from setup.');
+  }
+  const starter = await require('../user/user.repo').findByIdWithRole(payload.sub);
+  if (!starter || !starter.isActive || !hasPermission(starter, 'intake:settings')) {
+    throw new Error('Gmail connection was not recognised');
+  }
   const settings = await getSettings();
   const client = oauthClient(settings);
   const { tokens } = await client.getToken(code);
@@ -356,6 +389,7 @@ function frontendRedirect(query) {
 
 module.exports = {
   startUrl,
+  sessionUserId,
   finishCallback,
   disconnect,
   sync,

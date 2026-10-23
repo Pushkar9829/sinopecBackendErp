@@ -1,4 +1,5 @@
 const { COOKIES } = require('../config/constants');
+const authRepo = require('../modules/auth/auth.repo');
 const userRepo = require('../modules/user/user.repo');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
@@ -28,6 +29,14 @@ const authenticate = asyncHandler(async (req, res, next) => {
   const user = await userRepo.findByIdWithRole(payload.sub);
   if (!user || !user.isActive) {
     throw new ApiError(401, 'Account is inactive or no longer exists');
+  }
+  // Tokens from before a password change / sign-out-everywhere, or from a
+  // browser that signed out, no longer count.
+  if ((payload.tv || 0) !== (user.tokenVersion || 0)) {
+    throw new ApiError(401, 'Session has ended. Sign in again.');
+  }
+  if (payload.jti && (await authRepo.isAccessJtiRevoked(payload.jti))) {
+    throw new ApiError(401, 'Session has ended. Sign in again.');
   }
 
   req.user = user;

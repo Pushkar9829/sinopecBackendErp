@@ -32,6 +32,7 @@ jobSchema.index({ finishedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
 const Job = mongoose.models.Job || mongoose.model('Job', jobSchema);
 
 const LOCK_MS = 5 * 60 * 1000;
+let heartbeatMs = 60 * 1000;
 const handlers = new Map();
 let timer = null;
 let ticking = false;
@@ -110,12 +111,15 @@ async function finish(job, error) {
     return;
   }
   if (!error) {
-    const fresh = await Job.findById(job._id).select('rerun');
-    if (fresh?.rerun) {
+    // One atomic step: a rerun asked for between reading the flag and marking
+    // the job done would otherwise be lost.
+    const done = await Job.updateOne(
+      { _id: job._id, rerun: { $ne: true } },
+      { $set: { ...base, status: 'done', finishedAt: new Date() }, $unset: { activeKey: 1 } }
+    );
+    if (!done.matchedCount) {
       await Job.updateOne({ _id: job._id }, { $set: { ...base, status: 'pending', rerun: false, attempts: 0, runAt: new Date() } });
-      return;
     }
-    await Job.updateOne({ _id: job._id }, { $set: { ...base, status: 'done', finishedAt: new Date() }, $unset: { activeKey: 1 } });
     return;
   }
   const message = String(error.message || error).slice(0, 1000);
@@ -132,8 +136,21 @@ async function finish(job, error) {
   );
 }
 
+// Long jobs keep their lock fresh, so another instance never claims a job
+// that is still running just because it took longer than LOCK_MS.
+function startHeartbeat(job) {
+  const timer = setInterval(() => {
+    Job.updateOne({ _id: job._id, status: 'running' }, { $set: { lockedUntil: new Date(Date.now() + LOCK_MS) } }).catch((error) =>
+      console.error(`Job ${job.type} lock renewal failed:`, error.message)
+    );
+  }, heartbeatMs);
+  timer.unref?.();
+  return timer;
+}
+
 async function runJob(entry, job) {
   entry.running += 1;
+  const heartbeat = startHeartbeat(job);
   try {
     await entry.handler(job.payload || {}, job);
     await finish(job, null);
@@ -141,6 +158,7 @@ async function runJob(entry, job) {
     if (!(error instanceof JobDeferred)) console.error(`Job ${job.type} failed:`, error.message);
     await finish(job, error).catch((e) => console.error('Job bookkeeping failed:', e.message));
   } finally {
+    clearInterval(heartbeat);
     entry.running -= 1;
   }
 }
@@ -194,4 +212,9 @@ function stop() {
   timer = null;
 }
 
-module.exports = { Job, JobDeferred, register, enqueue, ensureRecurring, tick, drain, start, stop };
+// Tests only: renew locks faster than once a minute.
+function setHeartbeatMs(ms) {
+  heartbeatMs = ms;
+}
+
+module.exports = { Job, JobDeferred, register, enqueue, ensureRecurring, tick, drain, start, stop, setHeartbeatMs };

@@ -194,6 +194,7 @@ const DEFAULT_STAGES = [
   { slug: 'rolling', name: 'Rolling' },
   { slug: 'printing', name: 'Printing' },
   { slug: 'cutting', name: 'Cutting' },
+  { slug: 'other', name: 'Other process' },
   { slug: 'packing', name: 'Packing' },
   { slug: 'dispatch', name: 'Dispatch' },
 ];
@@ -206,6 +207,8 @@ const PRODUCTION_ROUTES = {
   PRINT_DISPATCH: 'print_dispatch',
   PRINT_CUT_DISPATCH: 'print_cut_dispatch',
   CUT_DISPATCH: 'cut_dispatch',
+  OTHER_DISPATCH: 'other_dispatch',
+  DIRECT_DISPATCH: 'direct_dispatch',
 };
 
 const PRODUCTION_ROUTE_LIST = [
@@ -251,7 +254,26 @@ const PRODUCTION_ROUTE_LIST = [
     stages: ['cutting', 'dispatch'],
     orderType: 'job_work',
   },
+  // The two below fit both order types (orderType 'any'). "Other process" is a
+  // making step named on the order line (item.otherProcess, e.g. Lamination);
+  // "Direct dispatch" sends ready or trading goods with no making and no stock.
+  {
+    id: PRODUCTION_ROUTES.OTHER_DISPATCH,
+    label: 'Other process → Dispatch',
+    stages: ['other', 'dispatch'],
+    orderType: 'any',
+  },
+  {
+    id: PRODUCTION_ROUTES.DIRECT_DISPATCH,
+    label: 'Direct dispatch',
+    stages: ['dispatch'],
+    orderType: 'any',
+  },
 ];
+
+function routeFitsOrderType(route, orderType) {
+  return Boolean(route) && (route.orderType === 'any' || route.orderType === orderType);
+}
 
 const SALES_ORDER_STATUSES = {
   DRAFT: 'draft',
@@ -441,7 +463,20 @@ const DEMO_USERS = [
   },
 ];
 
+// GST state codes (first two digits of a GSTIN).
+const GST_STATES = {
+  '01': 'Jammu & Kashmir', '02': 'Himachal Pradesh', '03': 'Punjab', '04': 'Chandigarh', '05': 'Uttarakhand', '06': 'Haryana',
+  '07': 'Delhi', '08': 'Rajasthan', '09': 'Uttar Pradesh', '10': 'Bihar', '11': 'Sikkim', '12': 'Arunachal Pradesh', '13': 'Nagaland',
+  '14': 'Manipur', '15': 'Mizoram', '16': 'Tripura', '17': 'Meghalaya', '18': 'Assam', '19': 'West Bengal', '20': 'Jharkhand',
+  '21': 'Odisha', '22': 'Chhattisgarh', '23': 'Madhya Pradesh', '24': 'Gujarat', '26': 'Dadra & Nagar Haveli and Daman & Diu',
+  '27': 'Maharashtra', '29': 'Karnataka', '30': 'Goa', '31': 'Lakshadweep', '32': 'Kerala', '33': 'Tamil Nadu', '34': 'Puducherry',
+  '35': 'Andaman & Nicobar Islands', '36': 'Telangana', '37': 'Andhra Pradesh', '38': 'Ladakh', '97': 'Other Territory',
+};
+const STATE_CODES = new Set(Object.keys(GST_STATES));
+
 module.exports = {
+  GST_STATES,
+  STATE_CODES,
   COOKIES,
   ROLE_SLUGS,
   ROLES,
@@ -456,6 +491,7 @@ module.exports = {
   DEFAULT_STAGES,
   PRODUCTION_ROUTES,
   PRODUCTION_ROUTE_LIST,
+  routeFitsOrderType,
   DELIVERY_PARTNERS,
   SALES_ORDER_STATUSES,
   SALES_ORDER_STATUS_FLOW,

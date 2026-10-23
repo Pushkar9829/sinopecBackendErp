@@ -30,18 +30,19 @@ function canSee(user) {
 const sumBy = (rows, key) => money(rows.reduce((s, r) => s + (Number(r[key]) || 0), 0));
 
 // Money received in a period from every source: receipts on the customer
-// account, payments recorded on orders, and advances entered on orders.
+// account, payments recorded on orders, and advances entered on orders (an
+// advance on an order cancelled later was still received; it stays as the
+// customer's credit). TDS the customer deducted is shown apart: no money came in.
 async function collections(range) {
   const [receipts, orders] = await Promise.all([
     Receipt.find({ voidedAt: null, receivedAt: { $gte: range.start, $lte: range.end } }).populate('customer', 'code name companyName').lean(),
     SalesOrder.find({
-      status: { $ne: 'cancelled' },
       $or: [
         { 'payments.receivedAt': { $gte: range.start, $lte: range.end } },
         { advanceAmount: { $gt: 0 }, orderDate: { $gte: range.start, $lte: range.end } },
       ],
     })
-      .select('number orderDate advanceAmount payments customer customerSnapshot')
+      .select('number status orderDate advanceAmount payments customer customerSnapshot')
       .populate('customer', 'code name companyName')
       .lean(),
   ]);
@@ -57,15 +58,16 @@ async function collections(range) {
     methodLabel: METHOD_LABEL[r.method] || r.method || '',
     reference: r.reference || '',
     amount: money(r.amount),
+    tds: money(r.tds || 0),
   }));
   for (const order of orders) {
     const base = { customer: nameOf(order.customer, order.customerSnapshot), customerCode: order.customer?.code || '', customerId: order.customer?._id ? String(order.customer._id) : '' };
     if (Number(order.advanceAmount) > 0 && inRange(order.orderDate, range)) {
-      rows.push({ ...base, date: order.orderDate, number: order.number, source: 'Order advance', method: 'advance', methodLabel: METHOD_LABEL.advance, reference: '', amount: money(order.advanceAmount) });
+      rows.push({ ...base, date: order.orderDate, number: order.number, source: order.status === 'cancelled' ? 'Order advance (order cancelled)' : 'Order advance', method: 'advance', methodLabel: METHOD_LABEL.advance, reference: '', amount: money(order.advanceAmount), tds: 0 });
     }
     for (const p of order.payments || []) {
       if (p.voidedAt || !inRange(p.receivedAt, range)) continue;
-      rows.push({ ...base, date: p.receivedAt, number: order.number, source: 'Order payment', method: p.method, methodLabel: METHOD_LABEL[p.method] || p.method || '', reference: p.reference || '', amount: money(p.amount) });
+      rows.push({ ...base, date: p.receivedAt, number: order.number, source: 'Order payment', method: p.method, methodLabel: METHOD_LABEL[p.method] || p.method || '', reference: p.reference || '', amount: money(p.amount), tds: 0 });
     }
   }
   return rows.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -289,6 +291,8 @@ async function accountsReport(user, query) {
       billedDelta: deltaPct(billed, prevBilled),
       collected,
       collectedDelta: deltaPct(collected, prevCollected),
+      // Settled by TDS certificates, not money: not part of `collected`.
+      tdsDeducted: sumBy(received, 'tds'),
       taxable: sumBy(issued, 'taxable'),
       tax,
       invoices: issued.length,

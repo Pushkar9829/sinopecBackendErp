@@ -66,6 +66,9 @@ const invoiceSchema = new mongoose.Schema(
     roundOff: { type: Number, default: 0 },
     total: { type: Number, required: true, min: 0 },
     notes: { type: String, default: '', trim: true },
+    // The owner billed more than was dispatched (e.g. goods held for the customer), and why.
+    billAhead: { type: Boolean, default: false },
+    billAheadReason: { type: String, default: '', trim: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdByName: { type: String, default: '' },
     cancelledAt: { type: Date, default: null },
@@ -81,6 +84,8 @@ invoiceSchema.index({ customer: 1, kind: 1, number: 1 }, { unique: true, partial
 invoiceSchema.index({ customer: 1, status: 1, dueDate: 1 });
 invoiceSchema.index({ salesOrder: 1, status: 1 });
 invoiceSchema.index({ invoiceDate: -1 });
+// The books sync picks up changed documents by updatedAt.
+invoiceSchema.index({ updatedAt: 1 });
 
 invoiceSchema.set('toJSON', {
   transform(_doc, ret) {

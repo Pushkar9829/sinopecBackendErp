@@ -35,6 +35,8 @@ const lineItemSchema = new mongoose.Schema(
       required: true,
       enum: Object.values(PRODUCTION_ROUTES),
     },
+    // Process name on an "Other process → Dispatch" line, e.g. Lamination.
+    otherProcess: { type: String, default: '', trim: true, maxlength: 60 },
     manufacturing: {
       rawMaterial: { type: String, default: '', trim: true },
       materialType: { type: String, default: '', trim: true },
@@ -116,6 +118,7 @@ const lineItemSchema = new mongoose.Schema(
       pickedByName: { type: String, default: '', trim: true },
       pickedAt: { type: Date, default: null },
     },
+    stageClosed: { type: [{ stage: { type: String, required: true, trim: true }, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, byName: { type: String, default: '', trim: true }, at: { type: Date, default: Date.now }, reason: { type: String, default: '', trim: true } }], default: [] },
     stageWork: {
       type: [
         {
@@ -127,6 +130,7 @@ const lineItemSchema = new mongoose.Schema(
           inputQty: { type: Number, default: 0, min: 0 },
           outputQty: { type: Number, default: 0, min: 0 },
           wasteQty: { type: Number, default: 0, min: 0 },
+          wasteUnit: { type: String, default: '', trim: true },
           workDate: { type: Date, default: Date.now },
           notes: { type: String, default: '', trim: true },
           fromStage: { type: String, default: '', trim: true },
@@ -154,6 +158,8 @@ const paymentSchema = new mongoose.Schema(
     reference: { type: String, default: '', trim: true },
     note: { type: String, default: '', trim: true },
     receivedAt: { type: Date, default: Date.now },
+    // Cash or bank account the money went into, fixed when recorded.
+    depositTo: { type: mongoose.Schema.Types.ObjectId, ref: 'BookAccount', default: null },
     by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     byName: { type: String, default: '' },
     // Removing a payment voids it (kept for the books) instead of deleting it.
@@ -193,6 +199,7 @@ const customerSnapshotSchema = new mongoose.Schema(
     mobile: { type: String, default: '' },
     email: { type: String, default: '' },
     gstNumber: { type: String, default: '' },
+    stateCode: { type: String, default: '' },
     billingAddress: { type: String, default: '' },
     shippingAddress: { type: String, default: '' },
     priceCategory: { type: String, default: '' },
@@ -238,6 +245,8 @@ const salesOrderSchema = new mongoose.Schema(
     },
     creditDays: { type: Number, default: 0, min: 0 },
     advanceAmount: { type: Number, default: 0, min: 0 },
+    // Cash or bank account the advance went into, fixed when entered.
+    advanceDepositTo: { type: mongoose.Schema.Types.ObjectId, ref: 'BookAccount', default: null },
     remainingAmount: { type: Number, default: 0, min: 0 },
     paidAmount: { type: Number, default: 0, min: 0 },
     payments: { type: [paymentSchema], default: [] },
@@ -281,6 +290,8 @@ salesOrderSchema.index({ createdAt: -1 });
 salesOrderSchema.index({ 'items.stageWork.workDate': 1 });
 salesOrderSchema.index({ 'items.stagePickup.lot': 1 }, { sparse: true });
 salesOrderSchema.index({ 'items.stageWork.sourceLot': 1 }, { sparse: true });
+// The books sync picks up changed orders by updatedAt.
+salesOrderSchema.index({ updatedAt: 1 });
 
 salesOrderSchema.set('toJSON', {
   transform(doc, ret) {

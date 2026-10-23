@@ -15,6 +15,7 @@ const ok = (res, data, status = 200) => res.status(status).json({ success: true,
 router.get('/orders/:orderId/invoice-draft', authenticate, validate([id('orderId')]), asyncHandler(async (req, res) => ok(res, await billing.invoiceDraft(req.user, req.params.orderId))));
 router.post('/orders/:orderId/invoices', authenticate, validate([id('orderId')]), asyncHandler(async (req, res) => ok(res, await billing.createInvoice(req.user, req.params.orderId, req.body || {}), 201)));
 
+router.get('/deposit-accounts', authenticate, asyncHandler(async (req, res) => ok(res, await billing.depositOptions(req.user))));
 router.get('/receivables', authenticate, asyncHandler(async (req, res) => ok(res, await billing.receivables(req.user))));
 router.get('/invoices', authenticate, asyncHandler(async (req, res) => ok(res, await billing.listInvoices(req.user, { orderId: req.query.order, customerId: req.query.customer }))));
 router.get('/invoices/:id', authenticate, validate([id('id')]), asyncHandler(async (req, res) => ok(res, await billing.getInvoice(req.user, req.params.id))));

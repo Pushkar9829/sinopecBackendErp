@@ -3,15 +3,19 @@ const ApiError = require('../../utils/ApiError');
 const { hasPermission } = require('../../utils/permissions');
 const salesOrderRepo = require('../salesOrder/salesOrder.repo');
 const {
+  FLOOR_ORDER_STATUSES,
   FLOOR_STAGES,
   canReadStage,
   canWorkStage,
   itemVisibleAtStage,
   registerSpecs,
   routeStages,
+  stageName,
   stageStats,
   stageUnit,
+  takesNoStock,
   visibleStages,
+  wasteUnitOf,
 } = require('../production/production.flow');
 const repo = require('./register.repo');
 
@@ -102,6 +106,7 @@ function entryFromWork(item, row) {
     inputQty: Number(row.inputQty) || 0,
     outputQty: Number(row.outputQty) || 0,
     wasteQty: Number(row.wasteQty) || 0,
+    wasteUnit: Number(row.wasteQty) > 0 ? wasteUnitOf(item, row) : '',
     workDate: row.workDate || row.completedAt || new Date(),
     notes: row.notes || '',
     machineName: row.machineName || '',
@@ -127,6 +132,7 @@ function toPublicEntry(row) {
     inputQty: row.inputQty || 0,
     outputQty: row.outputQty || 0,
     wasteQty: row.wasteQty || 0,
+    wasteUnit: row.wasteQty ? row.wasteUnit || row.unit || 'pcs' : '',
     workDate: row.workDate,
     notes: row.notes || '',
     machineName: row.machineName || '',
@@ -263,6 +269,7 @@ const SYNCED_FIELDS = [
   'inputQty',
   'outputQty',
   'wasteQty',
+  'wasteUnit',
   'workDate',
   'notes',
   'machineName',
@@ -302,21 +309,37 @@ async function recordMark(order, item, workRow) {
 function lineView(user, order, item, stage, doc) {
   const stats = stageStats(item, stage);
   const ready = itemVisibleAtStage(item, stage, order.status);
+  const noStock = takesNoStock(item.productionRoute, stage);
+  const process = stage === 'other' ? stageName(item, stage) : '';
   const entries = (doc.entries || [])
     .filter((row) => row.stage === stage && String(row.itemId) === String(item._id))
-    .map(toPublicEntry)
+    .map((row) => ({ ...toPublicEntry(row), noStock, process }))
     .sort((a, b) => new Date(a.workDate || a.markedAt) - new Date(b.workDate || b.markedAt));
   return {
     itemId: String(item._id),
     product: item.product || '',
     productCode: item.productCode || '',
+    // The process name on an "Other process" line; such steps take no stock.
+    process,
+    noStock,
     quantity: stats.target,
     unit: stats.unit,
     output: stats.output,
+    waste: stats.waste,
+    wasteUnit: stats.wasteUnit,
+    wasteText: stats.wasteText,
     remaining: stats.remaining,
     done: stats.done,
+    closedShort: Boolean(stats.closedShort),
     ready,
     canMark: ready && canWorkStage(user, stage),
+    // A production manager may close a making stage that came in under target.
+    canCloseShort:
+      stage !== 'dispatch' &&
+      !stats.done &&
+      stats.output > 0 &&
+      FLOOR_ORDER_STATUSES.includes(order.status) &&
+      (user?.role?.slug === ROLE_SLUGS.SUPER_ADMIN || hasPermission(user, 'production:update')),
     jobId: `${order._id}:${item._id}:${stage}`,
     specs: registerSpecs(order, item, stage),
     jobFields: stage === 'dispatch' ? [] : require('../task/task.jobsheet').stageJob(order, item, stage).fields,
@@ -423,7 +446,7 @@ async function getByOrder(user, orderId) {
         line.ready && item
           ? await require('../production/production.service').sourceLots(order, item, stage.id, lotCache)
           : [];
-      const hasMaterial = inHand || lots.some((lot) => Number(lot.quantity) > 0);
+      const hasMaterial = inHand || line.noStock || lots.some((lot) => Number(lot.quantity) > 0);
       line.canEnter = Boolean(line.canMark && hasMaterial);
       line.blockedReason = line.canMark && !hasMaterial ? 'Nothing in store' : '';
     }
@@ -454,7 +477,7 @@ async function getStage(user, stage, query = {}) {
         ? await require('../production/production.service').sourceLots(order, item, stage, lotCache)
         : [];
       const inHand = item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
-      const hasMaterial = inHand || sourceLots.some((lot) => Number(lot.quantity) > 0);
+      const hasMaterial = inHand || line.noStock || sourceLots.some((lot) => Number(lot.quantity) > 0);
       if (line.ready && hasMaterial) {
         open.push({
           orderId: String(order._id),

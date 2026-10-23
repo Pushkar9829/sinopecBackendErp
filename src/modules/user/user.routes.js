@@ -51,6 +51,7 @@ router.patch(
       .optional()
       .isLength({ min: 8 })
       .withMessage('Password must be at least 8 characters'),
+    body('currentPassword').optional().isString().withMessage('Current password must be text'),
     body('fullName').optional().trim().notEmpty().withMessage('Full name cannot be empty'),
     body('roleId').optional().isMongoId().withMessage('Invalid roleId'),
     body('isActive').optional().isBoolean().withMessage('isActive must be a boolean').bail().toBoolean(true),

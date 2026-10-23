@@ -11,6 +11,11 @@ const logout = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Logged out' });
 });
 
+const logoutAll = asyncHandler(async (req, res) => {
+  await authService.logoutAll(req, res);
+  res.json({ success: true, message: 'Signed out everywhere' });
+});
+
 const refresh = asyncHandler(async (req, res) => {
   const user = await authService.refresh(req, res);
   res.json({ success: true, data: user });
@@ -23,6 +28,7 @@ const me = asyncHandler(async (req, res) => {
 module.exports = {
   login,
   logout,
+  logoutAll,
   refresh,
   me,
 };

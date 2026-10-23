@@ -2,11 +2,18 @@ const ApiError = require('../../utils/ApiError');
 const { hasPermission, isSuperAdmin } = require('../../utils/permissions');
 const { SALES_ORDER_STATUSES } = require('../../config/constants');
 const SalesOrder = require('../salesOrder/salesOrder.model');
-const { routeStages, previousStage, stageStats, activeStage } = require('../production/production.flow');
+const { routeStages, previousStage, stageName, stageStats, activeStage } = require('../production/production.flow');
 const { parseRange, monthsOf, monthOf, inRange, DAY } = require('./reports.range');
 
-const STAGE_LABEL = { rolling: 'Rolling', printing: 'Printing', cutting: 'Cutting', dispatch: 'Dispatch' };
-const MAKE_STAGES = ['rolling', 'printing', 'cutting'];
+const STAGE_LABEL = { rolling: 'Rolling', printing: 'Printing', cutting: 'Cutting', other: 'Other process', dispatch: 'Dispatch' };
+const FILM_STAGES = ['rolling', 'printing', 'cutting'];
+
+// "Other process" rows appear only when some line in the report goes through it,
+// so reports of film-only work look exactly as before.
+function makeStagesFor(orders) {
+  const hasOther = orders.some((order) => (order.items || []).some((item) => routeStages(item.productionRoute).includes('other')));
+  return hasOther ? [...FILM_STAGES, 'other'] : FILM_STAGES;
+}
 const OPEN_FOR_FLOOR = [
   SALES_ORDER_STATUSES.APPROVED,
   SALES_ORDER_STATUSES.PRODUCTION_PLANNED,
@@ -54,6 +61,8 @@ async function productionReport(user, query) {
       .select('number orderType status approvedAt orderDate deliveryDate customerSnapshot items')
       .lean(),
   ]);
+
+  const MAKE_STAGES = makeStagesFor([...worked, ...open]);
 
   // ---- output and waste, by month x stage and by material
   const months = monthsOf(range.from, range.to);
@@ -170,7 +179,7 @@ async function productionReport(user, query) {
         customer: customerOf(user, order),
         product: item.product || item.productCode || '',
         stage,
-        stageLabel: STAGE_LABEL[stage] || stage,
+        stageLabel: stage === 'other' ? stageName(item, stage) : STAGE_LABEL[stage] || stage,
         started: here.length > 0,
         remaining: r2(stats.remaining),
         unit: stats.unit,

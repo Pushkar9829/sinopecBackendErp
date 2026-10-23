@@ -5,7 +5,7 @@ const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const { hasPermission, isSuperAdmin } = require('../../utils/permissions');
 const Customer = require('../customer/customer.model');
 const companyService = require('../company/company.service');
-const { assertOpenPeriod } = require('../books/books.lock');
+const { assertOpenPeriod, assertAfterStart } = require('../books/books.lock');
 const Invoice = require('./invoice.model');
 const CreditNote = require('./creditNote.model');
 const billing = require('./billing.service');
@@ -95,6 +95,7 @@ async function createCreditNote(user, customerId, payload = {}) {
   const customer = await loadCustomer(customerId);
   const date = parseDay(payload.date || new Date(), 'Date');
   await assertOpenPeriod(date, 'a credit note dated then');
+  await assertAfterStart(date, 'a credit note');
   const reason = str(payload.reason);
   if (reason.length < 3) throw new ApiError(400, 'Give the reason (goods returned, rate difference…)');
   const invoice = await openInvoice(customer._id, payload.invoiceId);
@@ -136,6 +137,7 @@ async function writeOff(user, customerId, payload = {}) {
   const customer = await loadCustomer(customerId);
   const date = parseDay(payload.date || new Date(), 'Date');
   await assertOpenPeriod(date, 'a write-off dated then');
+  await assertAfterStart(date, 'a write-off');
   const reason = str(payload.reason);
   if (reason.length < 3) throw new ApiError(400, 'Give the reason for writing it off');
   const amount = money(payload.amount);

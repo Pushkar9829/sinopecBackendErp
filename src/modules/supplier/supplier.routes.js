@@ -9,7 +9,8 @@ const supplierService = require('./supplier.service');
 const router = express.Router();
 const idParam = param('id').isMongoId().withMessage('Invalid id');
 // Suppliers belong to the store: whoever manages stock manages them.
-const canRead = authorize.any('inventory:read', 'production:read', 'sales:read');
+// Accounts reads them too (purchase bills, payments).
+const canRead = authorize.any('inventory:read', 'production:read', 'sales:read', 'accounts:read');
 
 router.get(
   '/',

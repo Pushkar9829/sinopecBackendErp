@@ -12,7 +12,9 @@ const { stageStats } = require('../production/production.flow');
 const Invoice = require('./invoice.model');
 const Receipt = require('./receipt.model');
 const CreditNote = require('./creditNote.model');
-const { assertOpenPeriod, assertOpeningsOpen } = require('../books/books.lock');
+const { assertOpenPeriod, assertOpeningsOpen, assertAfterStart } = require('../books/books.lock');
+const { depositAccount, ensureChart } = require('../books/books.post');
+const { BookAccount, BooksSettings } = require('../books/books.models');
 
 const DAY = 24 * 60 * 60 * 1000;
 const EPS = 0.005;
@@ -77,19 +79,36 @@ async function loadCustomer(id) {
   return customer;
 }
 
+// The buyer's state: from the GSTIN when there is one, else the state set on
+// the customer (unregistered buyers in another state pay IGST too).
 function buyerOf(customer, order) {
   const gstin = str(order?.customerSnapshot?.gstNumber || customer.gstNumber).toUpperCase();
+  const typed = str(order?.customerSnapshot?.stateCode) || str(customer.stateCode);
   return {
     code: customer.code,
     name: customer.name,
     companyName: customer.companyName || '',
     gstin,
-    stateCode: /^\d{2}/.test(gstin) ? gstin.slice(0, 2) : '',
+    stateCode: /^\d{2}/.test(gstin) ? gstin.slice(0, 2) : /^\d{2}$/.test(typed) ? typed : '',
     address: str(order?.billingAddress || customer.billingAddress),
     shippingAddress: str(order?.shippingAddress || customer.shippingAddress),
     mobile: customer.mobile || '',
     email: customer.email || '',
   };
+}
+
+// No known buyer state: treated as a sale inside the state.
+function intraStateOf(buyer, company) {
+  return !buyer.stateCode || !company.stateCode || buyer.stateCode === company.stateCode;
+}
+
+// Order discount spread over lines by value, as on the order itself.
+function discountShares(order) {
+  const items = order.items || [];
+  const lineValues = items.map((item) => Math.max(0, item.quantity * item.rate - (item.discount || 0)));
+  const subtotal = lineValues.reduce((sum, value) => sum + value, 0);
+  const orderDiscount = Math.min(Math.max(0, Number(order.discount) || 0), subtotal);
+  return items.map((_, index) => (subtotal > 0 ? (orderDiscount * lineValues[index]) / subtotal : 0));
 }
 
 // Credit orders use their own credit days; advance and cash-on-delivery are due at once.
@@ -124,10 +143,16 @@ async function invoiceDraft(user, orderId) {
   const order = await loadOrder(orderId);
   const [customer, company, invoiced] = await Promise.all([loadCustomer(order.customer), companyService.getSettings(), invoicedByItem(order._id)]);
   const buyer = buyerOf(customer, order);
-  const intraState = !buyer.stateCode || !company.stateCode || buyer.stateCode === company.stateCode;
-  const lines = (order.items || []).map((item) => {
+  const intraState = intraStateOf(buyer, company);
+  const shares = discountShares(order);
+  const lines = (order.items || []).map((item, index) => {
     const dispatched = stageStats(item, 'dispatch').output || 0;
     const done = invoiced.get(String(item._id)) || 0;
+    const ordered = Number(item.quantity) || 0;
+    // Line discount plus its share of the order discount, for the whole
+    // ordered quantity; billed in proportion, exactly as priceLine does.
+    const discount = (Number(item.discount) || 0) + shares[index];
+    const perUnit = ordered > 0 ? Math.max(0, (Number(item.rate) || 0) - discount / ordered) : Number(item.rate) || 0;
     return {
       itemId: String(item._id),
       product: item.product,
@@ -137,15 +162,21 @@ async function invoiceDraft(user, orderId) {
       ordered: item.quantity,
       dispatched: money(dispatched),
       invoiced: money(done),
-      available: money(Math.max(0, item.quantity - done)),
+      // Billing follows dispatch; only the owner may bill the rest of the order ahead.
+      available: money(Math.max(0, dispatched - done)),
+      aheadAvailable: money(Math.max(0, Math.max(item.quantity, dispatched) - done)),
       suggested: money(Math.max(0, Math.min(item.quantity, dispatched) - done)),
       rate: item.rate,
+      discount,
+      netRate: money(perUnit),
+      taxablePerUnit: money(perUnit),
       gstPercent: item.taxPercent || 0,
     };
   });
   return {
     order: { id: String(order._id), number: order.number, status: order.status, orderType: order.orderType },
     canInvoice: !NOT_INVOICEABLE.includes(order.status),
+    canBillAhead: isSuperAdmin(user),
     buyer,
     seller: company,
     intraState,
@@ -178,28 +209,43 @@ async function createInvoice(user, orderId, payload = {}) {
   const invoiceDate = parseDay(payload.invoiceDate || new Date(), 'Invoice date');
   if (invoiceDate.getTime() > endOfBusinessDay(new Date()).getTime()) throw new ApiError(400, 'Invoice date cannot be in the future');
   await assertOpenPeriod(invoiceDate, 'an invoice dated then');
+  await assertAfterStart(invoiceDate, 'an invoice', 'enter older unpaid bills as opening bills');
+  // Bills follow dispatch. The owner alone may bill goods not yet sent (held
+  // for the customer, say), with the reason kept on the invoice.
+  const billAhead = payload.billAhead === true || payload.billAhead === 'true';
+  const aheadReason = str(payload.billAheadReason);
+  if (billAhead && !isSuperAdmin(user)) throw new ApiError(403, 'Only the Super Admin can bill ahead of dispatch');
+  if (billAhead && aheadReason.length < 3) throw new ApiError(400, 'Give a reason for billing ahead of dispatch');
   const buyer = buyerOf(customer, order);
-  const intraState = !buyer.stateCode || buyer.stateCode === company.stateCode;
+  const intraState = intraStateOf(buyer, company);
   const wanted = new Map((Array.isArray(payload.lines) ? payload.lines : []).map((line) => [String(line.itemId), Number(line.quantity) || 0]));
-
-  // Order discount spread over lines by value, as on the order itself.
   const items = order.items || [];
-  const lineValues = items.map((item) => Math.max(0, item.quantity * item.rate - (item.discount || 0)));
-  const subtotal = lineValues.reduce((sum, value) => sum + value, 0);
-  const orderDiscount = Math.min(Math.max(0, Number(order.discount) || 0), subtotal);
+  const shares = discountShares(order);
 
   // One transaction (when MongoDB supports it): two people billing the same
   // dispatch at once can't both take the last quantity.
   return inTransaction(async () => {
     const invoiced = await invoicedByItem(order._id);
     const lines = [];
+    let ahead = false;
     items.forEach((item, index) => {
       const quantity = wanted.get(String(item._id)) || 0;
       if (quantity <= 0) return;
-      const left = item.quantity - (invoiced.get(String(item._id)) || 0);
-      if (quantity > left + 1e-6) throw new ApiError(400, `${item.product || `Line ${index + 1}`}: only ${money(left)} ${item.unit} left to invoice`);
+      const done = invoiced.get(String(item._id)) || 0;
+      const dispatched = stageStats(item, 'dispatch').output || 0;
+      const name = item.product || `Line ${index + 1}`;
+      if (billAhead) {
+        const left = Math.max(item.quantity, dispatched) - done;
+        if (quantity > left + 1e-6) throw new ApiError(400, `${name}: only ${money(left)} ${item.unit} left to invoice on the order`);
+      } else {
+        const left = dispatched - done;
+        if (quantity > left + 1e-6) {
+          throw new ApiError(400, `${name}: only ${money(Math.max(0, left))} ${item.unit} dispatched and not yet invoiced (dispatched ${money(dispatched)}, invoiced ${money(done)})`);
+        }
+      }
+      if (quantity > dispatched - done + 1e-6) ahead = true;
       const gstPercent = Number(item.taxPercent) || 0;
-      const share = subtotal > 0 ? (orderDiscount * lineValues[index]) / subtotal : 0;
+      const share = shares[index];
       lines.push({
         itemId: item._id,
         product: item.product,
@@ -225,6 +271,9 @@ async function createInvoice(user, orderId, payload = {}) {
     for (let tries = 0; tries < 1000; tries += 1) {
       number = `${prefix}/${fy}/${String(await nextSeq(`invoice:${fy}`)).padStart(4, '0')}`;
       if (!(await Invoice.exists({ kind: 'sale', number }))) break;
+    }
+    if (number.length > companyService.INVOICE_NUMBER_MAX) {
+      throw new ApiError(400, `Invoice number ${number} is longer than the ${companyService.INVOICE_NUMBER_MAX} characters GST allows; shorten the invoice prefix in Company details`);
     }
     const [doc] = await Invoice.create(
       [
@@ -253,6 +302,8 @@ async function createInvoice(user, orderId, payload = {}) {
           roundOff: money(total - exact),
           total,
           notes: str(payload.notes),
+          billAhead: ahead,
+          billAheadReason: ahead ? aheadReason : '',
           createdBy: user._id,
           createdByName: actor(user),
         },
@@ -387,8 +438,10 @@ async function addReceipt(user, customerId, payload = {}) {
   const receivedAt = parseDay(payload.receivedAt || new Date(), 'Received date');
   if (receivedAt.getTime() > endOfBusinessDay(new Date()).getTime()) throw new ApiError(400, 'Received date cannot be in the future');
   await assertOpenPeriod(receivedAt, 'a payment dated then');
+  await assertAfterStart(receivedAt, 'a payment', 'enter money received earlier in the opening balances');
   const method = str(payload.method) || PAYMENT_METHODS.BANK_TRANSFER;
   if (!Object.values(PAYMENT_METHODS).includes(method)) throw new ApiError(400, 'Invalid payment method');
+  const depositTo = await depositAccount(payload.depositTo, method);
   let invoice = null;
   if (payload.invoiceId) {
     invoice = await Invoice.findOne({ _id: payload.invoiceId, customer: customer._id, status: 'issued' });
@@ -409,12 +462,30 @@ async function addReceipt(user, customerId, payload = {}) {
     tds,
     tdsSection: tds ? str(payload.tdsSection).toUpperCase().slice(0, 20) : '',
     method,
+    depositTo,
     reference: str(payload.reference),
     note: str(payload.note),
     createdBy: user._id,
     createdByName: actor(user),
   });
   return doc.toJSON();
+}
+
+// Cash and bank accounts money can go into, for the "Deposited to" choice
+// on payment forms (people who record payments may not see the books).
+async function depositOptions(user) {
+  assert(canReceive(user), 'You cannot record payments');
+  await ensureChart();
+  const [accounts, settings] = await Promise.all([
+    BookAccount.find({ group: { $in: ['bank', 'cash'] }, isActive: { $ne: false } }).select('name group key').sort({ group: 1, name: 1 }).lean(),
+    BooksSettings.findOne({ key: 'default' }).select('defaultBank').lean(),
+  ]);
+  const cash = accounts.find((a) => a.key === 'cash') || accounts.find((a) => a.group === 'cash');
+  return {
+    accounts: accounts.map((a) => ({ id: String(a._id), name: a.name, group: a.group })),
+    cash: cash ? String(cash._id) : null,
+    defaultBank: settings?.defaultBank ? String(settings.defaultBank) : null,
+  };
 }
 
 async function voidReceipt(user, id, reason) {
@@ -441,12 +512,38 @@ async function voidReceipt(user, id, reason) {
 // bills that fell due first. Nothing is stored, so voids and cancellations can
 // never leave a stale balance behind.
 async function customerAccount(customerId, { asOf = new Date() } = {}) {
+  const docs = await accountDocs({ customer: customerId });
+  return accountFrom(docs.get(String(customerId)), { asOf });
+}
+
+// The four collections an account is made of, read once for many customers
+// (`match` narrows them, e.g. { customer: { $in: ids } }) and grouped by customer.
+async function accountDocs(match = {}) {
   const [invoices, receipts, orders, notes] = await Promise.all([
-    Invoice.find({ customer: customerId, status: 'issued' }).select('-lines -seller -buyer').sort({ dueDate: 1, invoiceDate: 1, _id: 1 }).lean(),
-    Receipt.find({ customer: customerId, voidedAt: null }).sort({ receivedAt: 1, _id: 1 }).lean(),
-    SalesOrder.find({ customer: customerId }).select('number status orderDate advanceAmount payments').lean(),
-    CreditNote.find({ customer: customerId, status: 'issued' }).select('-lines -buyer -seller').sort({ date: 1, _id: 1 }).lean(),
+    Invoice.find({ ...match, status: 'issued' }).select('-lines -seller -buyer').sort({ dueDate: 1, invoiceDate: 1, _id: 1 }).lean(),
+    Receipt.find({ ...match, voidedAt: null }).sort({ receivedAt: 1, _id: 1 }).lean(),
+    SalesOrder.find(match).select('customer number status orderDate advanceAmount payments').lean(),
+    CreditNote.find({ ...match, status: 'issued' }).select('-lines -buyer -seller').sort({ date: 1, _id: 1 }).lean(),
   ]);
+  const byCustomer = new Map();
+  const bucket = (id) => {
+    const key = String(id);
+    if (!byCustomer.has(key)) byCustomer.set(key, { invoices: [], receipts: [], orders: [], notes: [] });
+    return byCustomer.get(key);
+  };
+  for (const row of invoices) bucket(row.customer).invoices.push(row);
+  for (const row of receipts) bucket(row.customer).receipts.push(row);
+  for (const row of orders) bucket(row.customer).orders.push(row);
+  for (const row of notes) bucket(row.customer).notes.push(row);
+  return byCustomer;
+}
+
+// Orders where no more billing is expected: money left on them is the
+// customer's to use against any bill.
+const ORDER_CLOSED = [SALES_ORDER_STATUSES.DELIVERED, SALES_ORDER_STATUSES.COMPLETED];
+
+// The account worked out from already-loaded documents (sorted as accountDocs sorts them).
+function accountFrom({ invoices = [], receipts = [], orders = [], notes = [] } = {}, { asOf = new Date() } = {}) {
   const state = invoices.map((inv) => ({ ...inv, paid: 0, credited: 0 }));
   const balanceOf = (row) => money(row.total - row.paid);
   // `credit`: the amount is a credit note or write-off, not money received.
@@ -496,7 +593,9 @@ async function customerAccount(customerId, { asOf = new Date() } = {}) {
     }
     if (paid > 0) {
       const own = state.filter((row) => String(row.salesOrder || '') === String(order._id));
-      orderAdvance = money(orderAdvance + apply(own, paid));
+      const left = apply(own, paid);
+      if (ORDER_CLOSED.includes(order.status)) pool = money(pool + left);
+      else orderAdvance = money(orderAdvance + left);
     }
   }
   const unapplied = money(apply(state, notePool, true) + apply(state, pool));
@@ -627,14 +726,18 @@ async function creditCheck(customerId, { orderId = null, orderTotal = 0 } = {}) 
 
 async function receivables(user) {
   assert(canView(user), 'You cannot see customer accounts');
+  // Anyone billed, or who has paid us: on account, or on an order.
   const ids = new Set([
     ...(await Invoice.distinct('customer', { status: 'issued' })).map(String),
     ...(await Receipt.distinct('customer', { voidedAt: null })).map(String),
+    ...(await SalesOrder.distinct('customer', { $or: [{ advanceAmount: { $gt: 0 } }, { payments: { $elemMatch: { voidedAt: null } } }] })).map(String),
   ]);
   const customers = await Customer.find({ _id: { $in: [...ids] } }).select('code name companyName creditLimit creditDays mobile').lean();
+  const docs = await accountDocs({ customer: { $in: customers.map((c) => c._id) } });
+  const now = new Date();
   const rows = [];
   for (const c of customers) {
-    const account = await customerAccount(c._id);
+    const account = accountFrom(docs.get(String(c._id)), { asOf: now });
     rows.push({
       id: String(c._id),
       code: c.code,
@@ -662,15 +765,20 @@ async function syncOverdueTasks() {
   const Task = require('../task/task.model');
   const { TASK_CATEGORIES, TASK_OPEN_STATUSES, TASK_STATUSES, ROLE_SLUGS } = require('../../config/constants');
   const { nextTaskNumber } = require('../../utils/counter');
+  // Only customers with a bill past due could owe anything overdue; their
+  // accounts are read in one go, not one customer at a time.
   const customerIds = (await Invoice.distinct('customer', { status: 'issued', dueDate: { $lt: new Date() } })).map(String);
   const openTasks = await Task.find({ category: TASK_CATEGORIES.PAYMENT_OVERDUE, status: { $in: TASK_OPEN_STATUSES } });
   const byCustomer = new Map(openTasks.map((t) => [String(t.customer), t]));
   const stillOverdue = new Set();
+  const docs = await accountDocs({ customer: { $in: customerIds.map((id) => new mongoose.Types.ObjectId(id)) } });
+  const names = new Map((await Customer.find({ _id: { $in: customerIds } }).select('name companyName').lean()).map((c) => [String(c._id), c]));
+  const now = new Date();
   for (const id of customerIds) {
-    const account = await customerAccount(id);
+    const account = accountFrom(docs.get(id), { asOf: now });
     if (!(account.summary.overdue > EPS)) continue;
     stillOverdue.add(id);
-    const customer = await Customer.findById(id).select('name companyName').lean();
+    const customer = names.get(id);
     const late = account.invoices.filter((i) => i.overdueDays > 0 && i.balance > EPS);
     const title = `Collect ${inr(account.summary.overdue)} overdue from ${customer?.companyName || customer?.name}`;
     const description = late.map((i) => `${i.number}: ${inr(i.balance)}, ${i.overdueDays} days late`).join('\n');
@@ -729,8 +837,11 @@ module.exports = {
   addOpeningBill,
   importOpeningBills,
   addReceipt,
+  depositOptions,
   voidReceipt,
   customerAccount,
+  accountDocs,
+  accountFrom,
   ledger,
   financialYear,
   buyerOf,

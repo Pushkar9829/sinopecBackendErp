@@ -3,6 +3,7 @@ const { ROLE_SLUGS } = require('../../config/constants');
 const ApiError = require('../../utils/ApiError');
 const { permissionsBeyond, toBool, toPublicUser } = require('../../utils/permissions');
 const authRepo = require('../auth/auth.repo');
+const authService = require('../auth/auth.service');
 const roleRepo = require('../role/role.repo');
 const userRepo = require('./user.repo');
 
@@ -46,12 +47,13 @@ async function listUsers() {
   return users.map(toPublicUser);
 }
 
+// People who can be assigned to stages and work. Floor roles read this, so it
+// leaves out Super Admin accounts and sign-in names.
 async function listDirectory() {
   const users = await userRepo.findAllWithRole();
-  return users.map((user) => ({
+  return users.filter((user) => user.role?.slug !== ROLE_SLUGS.SUPER_ADMIN).map((user) => ({
     id: String(user._id),
     fullName: user.fullName,
-    username: user.username,
     isActive: user.isActive,
     role: user.role
       ? {
@@ -136,11 +138,19 @@ async function updateUser(actor, userId, rawPayload) {
     updates.isActive = payload.isActive;
   }
 
+  const self = String(actor._id) === String(user._id);
   if (payload.password) {
+    // Your own password needs the current one, so a borrowed signed-in
+    // browser can't be used to take the account over.
+    if (self) {
+      const current = typeof payload.currentPassword === 'string' ? payload.currentPassword : '';
+      if (!current || !(await bcrypt.compare(current, user.passwordHash || ''))) {
+        throw new ApiError(400, 'Current password is wrong');
+      }
+    }
     updates.passwordHash = await bcrypt.hash(payload.password, 10);
   }
 
-  const self = String(actor._id) === String(user._id);
   if (self && payload.isActive === false) {
     throw new ApiError(400, 'You cannot deactivate your own account');
   }
@@ -164,7 +174,7 @@ async function updateUser(actor, userId, rawPayload) {
     }
   }
   if (payload.password) {
-    await authRepo.revokeAllForUser(user._id);
+    await authService.endAllSessions(user._id);
   }
   if (payload.isActive === false && user.isActive !== false) {
     await releaseTasks(user);

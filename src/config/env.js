@@ -37,6 +37,11 @@ const clientOrigins = String(
   .map(normalizeOrigin)
   .filter(Boolean);
 
+// Anything other than an explicit development/test machine runs as production
+// (secure cookies, no localhost CORS, no error details), so a server started
+// without NODE_ENV fails safe.
+const nodeEnv = ['development', 'test'].includes(process.env.NODE_ENV) ? process.env.NODE_ENV : 'production';
+
 const env = {
   port: Number(process.env.PORT) || 5000,
   mongoUri: process.env.MONGO_URI,
@@ -48,8 +53,8 @@ const env = {
   clientOrigins,
   superAdminUsername: process.env.SUPERADMIN_USERNAME,
   superAdminPassword: process.env.SUPERADMIN_PASSWORD,
-  nodeEnv: process.env.NODE_ENV || 'development',
-  isProd: process.env.NODE_ENV === 'production',
+  nodeEnv,
+  isProd: nodeEnv === 'production',
   uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, '../../uploads'),
   s3: {
     // With access keys, or with none on a server that has an IAM role

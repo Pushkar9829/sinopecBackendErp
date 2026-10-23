@@ -10,6 +10,7 @@ const {
   PRODUCTION_ROUTE_LIST,
   PRODUCTION_ROUTES,
   ROLE_SLUGS,
+  routeFitsOrderType,
   SALES_ORDER_STATUS_FLOW,
   SALES_ORDER_STATUSES,
 } = require('../../config/constants');
@@ -18,7 +19,8 @@ const ApiError = require('../../utils/ApiError');
 const { nextSalesOrderNumber } = require('../../utils/counter');
 const { hasPermission } = require('../../utils/permissions');
 const { endOfBusinessDay } = require('../../utils/businessTime');
-const { assertOpenPeriod } = require('../books/books.lock');
+const { assertOpenPeriod, assertAfterStart } = require('../books/books.lock');
+const { depositAccount } = require('../books/books.post');
 const customerRepo = require('../customer/customer.repo');
 const { snapshotFromCustomer, attachProductsFromOrder } = require('../customer/customer.service');
 const {
@@ -29,6 +31,7 @@ const {
   routeStages,
   stageRequirements,
   stageStats,
+  syncOrderStatus,
 } = require('../production/production.flow');
 const { uploadBuffer, deleteStoredObject, readStoredObject } = require('../../utils/storage');
 const { storeListPhotos } = require('../../utils/inlineImages');
@@ -125,6 +128,7 @@ function toPublicWork(row) {
     inputQty: row.inputQty || 0,
     outputQty: row.outputQty || 0,
     wasteQty: row.wasteQty || 0,
+    wasteUnit: row.wasteUnit || '',
     workDate: row.workDate || row.completedAt,
     notes: row.notes || '',
     fromStage: row.fromStage || '',
@@ -225,6 +229,7 @@ function toPublicItem(item) {
     hsnCode: item.hsnCode || '',
     amount: item.amount || 0,
     productionRoute: item.productionRoute,
+    otherProcess: item.otherProcess || '',
     manufacturing: {
       rawMaterial: item.manufacturing?.rawMaterial || '',
       materialType: item.manufacturing?.materialType || '',
@@ -279,6 +284,7 @@ function toPublicItem(item) {
     currentStage: item.currentStage || '',
     nextStage: item.currentStage && item.currentStage !== 'completed' ? nextStage(item.productionRoute, item.currentStage) : '',
     stageWork: (item.stageWork || []).map(toPublicWork),
+    stageClosed: (item.stageClosed || []).map((row) => ({ stage: row.stage, byName: row.byName || '', at: row.at, reason: row.reason || '' })),
   };
 }
 
@@ -321,6 +327,7 @@ function toPublicOrder(order) {
     paymentMethod: order.paymentMethod,
     creditDays: order.creditDays || 0,
     advanceAmount: order.advanceAmount || 0,
+    advanceDepositTo: order.advanceDepositTo ? String(order.advanceDepositTo) : null,
     remainingAmount: order.remainingAmount || 0,
     paidAmount: order.paidAmount || 0,
     payments: (order.payments || []).map((payment) => ({
@@ -330,6 +337,7 @@ function toPublicOrder(order) {
       reference: payment.reference || '',
       note: payment.note || '',
       receivedAt: payment.receivedAt,
+      depositTo: payment.depositTo ? String(payment.depositTo) : null,
       byName: payment.byName || '',
       voidedAt: payment.voidedAt || null,
       voidedByName: payment.voidedByName || '',
@@ -391,6 +399,7 @@ function stripCommercial(order) {
   delete next.tax;
   delete next.grandTotal;
   delete next.advanceAmount;
+  delete next.advanceDepositTo;
   delete next.remainingAmount;
   delete next.paidAmount;
   delete next.payments;
@@ -543,11 +552,23 @@ function clearUnusedStages(item) {
   }
 }
 
+// The process name an "Other process" line goes through (e.g. Lamination).
+const OTHER_PROCESS_MAX = 60;
+
+function otherProcessFor(raw, productionRoute) {
+  if (productionRoute !== PRODUCTION_ROUTES.OTHER_DISPATCH) return '';
+  const name = str(raw.otherProcess).replace(/\s+/g, ' ');
+  if (!name) throw new ApiError(400, `Enter the process name for ${str(raw.product) || 'the Other process line'}`);
+  if (name.length > OTHER_PROCESS_MAX) throw new ApiError(400, `Keep the process name to ${OTHER_PROCESS_MAX} characters`);
+  return name;
+}
+
 function normalizeItem(raw = {}) {
   const productionRoute = str(raw.productionRoute);
   if (!ROUTE_IDS.includes(productionRoute)) {
     throw new ApiError(400, 'Each line item needs a valid production route');
   }
+  const otherProcess = otherProcessFor(raw, productionRoute);
 
   const manufacturing = normalizeGroup(raw.manufacturing, [
     'rawMaterial',
@@ -616,6 +637,7 @@ function normalizeItem(raw = {}) {
     taxPercent: num(raw.taxPercent),
     hsnCode: str(raw.hsnCode).toUpperCase().replace(/\s+/g, ''),
     productionRoute,
+    otherProcess,
     manufacturing,
     roll,
     bag,
@@ -650,12 +672,12 @@ function normalizeItems(rawItems, orderType = ORDER_TYPES.SALES_ORDER) {
     !str(raw?.product) && !str(raw?.productCode) && !(num(raw?.quantity) > 0) && !(raw?.stageWork || []).length;
   return rawItems.filter((raw) => !blank(raw)).map((raw) => {
     const item = normalizeItem(raw);
-    if (ROUTE_BY_ID.get(item.productionRoute)?.orderType !== orderType) {
+    if (!routeFitsOrderType(ROUTE_BY_ID.get(item.productionRoute), orderType)) {
       throw new ApiError(
         400,
         orderType === ORDER_TYPES.JOB_WORK
-          ? `${item.product || 'A product'} needs a job work route: Printing → Dispatch, Printing → Cutting → Dispatch, or Cutting → Dispatch`
-          : `${item.product || 'A product'} needs a sales order route that starts at Rolling`
+          ? `${item.product || 'A product'} needs a job work route: Printing → Dispatch, Printing → Cutting → Dispatch, Cutting → Dispatch, Other process → Dispatch, or Direct dispatch`
+          : `${item.product || 'A product'} needs a sales order route that starts at Rolling, Other process → Dispatch, or Direct dispatch`
       );
     }
     const key = item._id ? String(item._id) : '';
@@ -811,6 +833,15 @@ async function presentAfterSync(order, user, taskOptions) {
   return present(loaded, user);
 }
 
+// A billed order is fixed: cancelling, deleting or reopening it would leave
+// an invoice (and its GST) for an order that no longer says the same thing.
+async function assertNotInvoiced(order, action) {
+  const Invoice = require('../billing/invoice.model');
+  if (await Invoice.exists({ salesOrder: order._id, status: 'issued' })) {
+    throw new ApiError(400, `This order has an issued invoice, so it cannot be ${action}. Cancel the invoice first, or issue a credit note against it instead of changing the order`);
+  }
+}
+
 function requireDraft(order) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft orders can be edited');
@@ -849,7 +880,7 @@ const LIST_PROJECTION = {
   'items.stageWork.wasteQty': 1,
 };
 
-const STAGE_SEARCH_LABELS = { rolling: 'rolling', printing: 'printing', cutting: 'cutting', dispatch: 'dispatch' };
+const STAGE_SEARCH_LABELS = { rolling: 'rolling', printing: 'printing', cutting: 'cutting', other: 'other process', dispatch: 'dispatch' };
 const TYPE_SEARCH_LABELS = { [ORDER_TYPES.SALES_ORDER]: 'sales order', [ORDER_TYPES.JOB_WORK]: 'job work' };
 
 function escapeRegex(text) {
@@ -916,7 +947,7 @@ function activeStagesOf(order) {
     const current = routeStages(item.productionRoute).find((stage) => !stageStats(item, stage).done);
     if (current) seen.add(current);
   }
-  return ['rolling', 'printing', 'cutting', 'dispatch'].filter((stage) => seen.has(stage));
+  return ['rolling', 'printing', 'cutting', 'other', 'dispatch'].filter((stage) => seen.has(stage));
 }
 
 function toListRow(order, user) {
@@ -1098,7 +1129,8 @@ async function createOrder(user, payload, options = {}) {
 
   const orderDate = parseDate(payload.orderDate || new Date(), 'Order date', { required: true });
   assertOrderDateWindow(orderDate);
-  if (Math.max(0, num(payload.advanceAmount)) > 0) await assertAdvanceDate(orderDate);
+  const advanceIn = Math.max(0, num(payload.advanceAmount));
+  if (advanceIn > 0) await assertAdvanceDate(orderDate);
   const doc = {
     orderType,
     orderDate,
@@ -1112,7 +1144,8 @@ async function createOrder(user, payload, options = {}) {
     paymentTerms: payload.paymentTerms || PAYMENT_TERMS.CREDIT,
     paymentMethod: payload.paymentMethod || PAYMENT_METHODS.BANK_TRANSFER,
     creditDays: await creditDaysFor(payload.creditDays, customer),
-    advanceAmount: Math.max(0, num(payload.advanceAmount)),
+    advanceAmount: advanceIn,
+    advanceDepositTo: advanceIn > 0 ? await depositAccount(payload.advanceDepositTo, payload.paymentMethod || PAYMENT_METHODS.BANK_TRANSFER) : null,
     paymentRemarks: str(payload.paymentRemarks),
     billingAddress: str(payload.billingAddress) || snapshot.billingAddress,
     shippingAddress: str(payload.shippingAddress) || snapshot.shippingAddress,
@@ -1141,7 +1174,7 @@ async function createOrder(user, payload, options = {}) {
   return present(loaded, user);
 }
 
-const COMMERCIAL_HEADER_FIELDS = ['discount', 'advanceAmount', 'paymentTerms', 'paymentMethod', 'creditDays', 'paymentRemarks'];
+const COMMERCIAL_HEADER_FIELDS = ['discount', 'advanceAmount', 'advanceDepositTo', 'paymentTerms', 'paymentMethod', 'creditDays', 'paymentRemarks'];
 
 // A user who can't see prices gets an order without them, so whatever they
 // send back for those fields is blank, not a change. Keep the stored values.
@@ -1186,12 +1219,15 @@ async function updateOrder(user, id, rawPayload) {
   const advanceMoves =
     Math.abs(newAdvance - oldAdvance) > 0.004 ||
     (newDate && order.orderDate && newDate.getTime() !== new Date(order.orderDate).getTime()) ||
-    (payload.paymentMethod !== undefined && payload.paymentMethod !== order.paymentMethod);
+    (payload.paymentMethod !== undefined && payload.paymentMethod !== order.paymentMethod) ||
+    (payload.advanceDepositTo !== undefined && String(payload.advanceDepositTo || '') !== String(order.advanceDepositTo || ''));
   if ((oldAdvance > 0 || newAdvance > 0) && advanceMoves) {
     if (oldAdvance > 0 && order.orderDate) await assertOpenPeriod(order.orderDate, 'the advance on this order');
     if (newAdvance > 0 && newDate) await assertAdvanceDate(newDate);
   }
   applyHeader(order, payload, snapshot);
+  if (!(newAdvance > 0)) order.advanceDepositTo = null;
+  else if (advanceMoves || !order.advanceDepositTo) order.advanceDepositTo = await depositAccount(payload.advanceDepositTo, order.paymentMethod);
   const orderType = order.orderType || ORDER_TYPES.SALES_ORDER;
   if (payload.items !== undefined) await storeListPhotos(payload.items);
   const items =
@@ -1222,6 +1258,7 @@ async function deleteOrder(id) {
   if (order.status !== SALES_ORDER_STATUSES.DRAFT) {
     throw new ApiError(400, 'Only draft orders can be deleted');
   }
+  await assertNotInvoiced(order, 'deleted');
   if ((order.payments || []).length) {
     // Even voided payments are part of the record; cancel the order instead.
     throw new ApiError(400, 'This order has payments recorded. Cancel the order instead of deleting it');
@@ -1271,11 +1308,19 @@ async function approveOrder(user, id, payload = {}) {
     throw new ApiError(400, 'Only submitted orders can be approved');
   }
   // Checked again now: payments or new bills may have changed things since submit.
+  // A check that could not run needs the same reason as a hold.
   const check = await creditCheckFor(order);
-  order.creditCheck = check;
-  if (check?.status === 'hold') {
+  if (check) order.creditCheck = check;
+  if (!check || check.status === 'hold') {
     const reason = str(payload.creditOverrideReason);
-    if (!reason) throw new ApiError(409, `Credit hold: ${check.reasons.join('; ')}. Give a reason to approve anyway.`);
+    if (!reason) {
+      // Kept on the order, so the screen shows why it was refused.
+      if (check) await salesOrderRepo.save(order);
+      throw new ApiError(
+        409,
+        check ? `Credit hold: ${check.reasons.join('; ')}. Give a reason to approve anyway.` : 'The credit check could not be run just now. Give a reason to approve anyway, or try again.'
+      );
+    }
     order.creditOverride = { byName: user.fullName || user.username || '', by: user._id, reason, at: new Date() };
   }
   order.status = SALES_ORDER_STATUSES.APPROVED;
@@ -1295,6 +1340,7 @@ async function returnToDraft(user, id, reason) {
   if (!isSuperAdmin(user) && !hasPermission(user, 'sales:update')) {
     throw new ApiError(403, 'You cannot send this order back to draft');
   }
+  await assertNotInvoiced(order, 'sent back to draft');
   order.status = SALES_ORDER_STATUSES.DRAFT;
   order.submittedAt = null;
   order.approvedAt = null;
@@ -1324,7 +1370,9 @@ async function planProduction(user, id) {
       pickedAt: null,
     };
   }
-  order.status = SALES_ORDER_STATUSES.PRODUCTION_PLANNED;
+  // An order of direct-dispatch lines only has nothing to make: it is ready to send.
+  const ready = syncOrderStatus(order) === SALES_ORDER_STATUSES.READY_FOR_DISPATCH;
+  order.status = ready ? SALES_ORDER_STATUSES.READY_FOR_DISPATCH : SALES_ORDER_STATUSES.PRODUCTION_PLANNED;
   order.productionPlannedAt = new Date();
   await salesOrderRepo.save(order);
   await require('../register/register.service').openForOrder(order);
@@ -1366,6 +1414,7 @@ async function cancelOrder(user, id, reason) {
       'This order has payments recorded. Refund them and remove the payments before cancelling, so the money is accounted for'
     );
   }
+  await assertNotInvoiced(order, 'cancelled');
 
   const early = [SALES_ORDER_STATUSES.DRAFT, SALES_ORDER_STATUSES.SUBMITTED, SALES_ORDER_STATUSES.APPROVED].includes(order.status);
   const salesCan = hasPermission(user, 'sales:update');
@@ -1552,9 +1601,11 @@ async function recordPayment(user, id, payload = {}) {
     throw new ApiError(400, 'Received date cannot be in the future');
   }
   await assertOpenPeriod(receivedAt || new Date(), 'a payment dated then');
+  await assertAfterStart(receivedAt, 'a payment', 'enter money received earlier in the opening balances');
   order.payments.push({
     amount,
     method,
+    depositTo: await depositAccount(payload.depositTo, method),
     reference: str(payload.reference),
     note: str(payload.note),
     receivedAt: receivedAt || new Date(),

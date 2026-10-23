@@ -29,6 +29,10 @@ function updateById(id, data) {
   return User.findByIdAndUpdate(id, { $set: data }, { new: true }).populate(rolePopulate);
 }
 
+function bumpTokenVersion(id) {
+  return User.findByIdAndUpdate(id, { $inc: { tokenVersion: 1 } }, { new: true }).populate(rolePopulate);
+}
+
 function deleteById(id) {
   return User.findByIdAndDelete(id);
 }
@@ -53,6 +57,7 @@ module.exports = {
   findByIds,
   create,
   updateById,
+  bumpTokenVersion,
   deleteById,
   countByRole,
   countActiveByRole,

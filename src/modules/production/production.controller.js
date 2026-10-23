@@ -36,6 +36,11 @@ const deleteEntry = asyncHandler(async (req, res) => {
   res.json({ success: true, data });
 });
 
+const closeStageShort = asyncHandler(async (req, res) => {
+  const data = await productionService.closeStageShort(req.user, req.body);
+  res.json({ success: true, data });
+});
+
 const stageMachines = asyncHandler(async (req, res) => {
   const data = await productionService.stageMachines(req.user, req.params.stage);
   res.json({ success: true, data });
@@ -49,5 +54,6 @@ module.exports = {
   enterFromRegister,
   updateEntry,
   deleteEntry,
+  closeStageShort,
   stageMachines,
 };

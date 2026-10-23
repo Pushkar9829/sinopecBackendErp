@@ -451,7 +451,9 @@ async function getAnalytics(user, query) {
 
   const byDateMap = new Map(eachDate(from, to).map((date) => [date, { date, ...emptyBucket() }]));
   for (const row of details) if (byDateMap.has(row.date)) addTo(byDateMap.get(row.date), row);
-  const byStage = STAGE_IDS.filter((id) => id !== 'dispatch' && (!filters.stage || id === filters.stage)).map((id) => {
+  // "Other process" is listed only when there is work on it in the period.
+  const hasOther = filters.stage === 'other' || details.some((row) => row.stage === 'other');
+  const byStage = STAGE_IDS.filter((id) => id !== 'dispatch' && (id !== 'other' || hasOther) && (!filters.stage || id === filters.stage)).map((id) => {
     const bucket = { id, label: stageLabel(id), ...emptyBucket() };
     for (const row of details) if (row.stage === id) addTo(bucket, row);
     return withRates(bucket);

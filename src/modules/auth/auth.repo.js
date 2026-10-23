@@ -1,4 +1,5 @@
 const RefreshToken = require('./refreshToken.model');
+const RevokedAccessToken = require('./revokedAccessToken.model');
 
 function create(data) {
   return RefreshToken.create(data);
@@ -41,8 +42,18 @@ function revokeAllForUser(userId) {
   );
 }
 
+function revokeAccessJti(jti, expiresAt) {
+  return RevokedAccessToken.updateOne({ jti }, { $setOnInsert: { jti, expiresAt } }, { upsert: true });
+}
+
+function isAccessJtiRevoked(jti) {
+  return RevokedAccessToken.exists({ jti });
+}
+
 module.exports = {
   create,
+  revokeAccessJti,
+  isAccessJtiRevoked,
   findValidByHash,
   claimByHash,
   findByHash,

@@ -4,6 +4,7 @@ const { storeListPhotos } = require('../../utils/inlineImages');
 const { nextCustomerCode } = require('../../utils/counter');
 const customerRepo = require('./customer.repo');
 const SalesOrder = require('../salesOrder/salesOrder.model');
+const { STATE_CODES } = require('../../config/constants');
 
 function productKey(item) {
   const code = String(item?.productCode || '')
@@ -49,6 +50,7 @@ function toPublicProduct(product) {
     taxPercent: spec.taxPercent,
     hsnCode: spec.hsnCode || '',
     productionRoute: spec.productionRoute,
+    otherProcess: spec.otherProcess || '',
     manufacturing: spec.manufacturing,
     roll: spec.roll,
     bag: spec.bag,
@@ -61,14 +63,26 @@ function toPublicProduct(product) {
   };
 }
 
-function normalizeCustomerProducts(list) {
+// A saved product that today's rules reject (an old route name, an oversized
+// photo...) must not block the whole customer save: it is kept exactly as it
+// was stored (and still shows "needs review"). New products must be valid.
+function normalizeCustomerProducts(list, { stored = [] } = {}) {
   if (!Array.isArray(list)) return [];
   const { normalizeItem } = require('../salesOrder/salesOrder.service');
   const products = [];
   for (const raw of list) {
     const name = String(raw?.product || '').trim();
     if (!name) continue;
-    const spec = normalizeItem(raw);
+    let spec;
+    try {
+      spec = normalizeItem(raw);
+    } catch (error) {
+      const before = stored.find((p) => String(p._id) === String(raw?._id || raw?.id || ''));
+      if (!before) throw error;
+      console.error(`Customer product "${name}" kept unchanged: ${error.message}`);
+      products.push(before.toObject ? before.toObject() : before);
+      continue;
+    }
     delete spec.currentStage;
     delete spec.stageWork;
     delete spec.amount;
@@ -87,6 +101,7 @@ function toPublicCustomer(customer) {
     mobile: customer.mobile || '',
     email: customer.email || '',
     gstNumber: customer.gstNumber || '',
+    stateCode: customer.stateCode || '',
     billingAddress: customer.billingAddress || '',
     shippingAddress: customer.shippingAddress || '',
     priceCategory: customer.priceCategory || '',
@@ -108,6 +123,7 @@ function snapshotFromCustomer(customer) {
     mobile: customer.mobile || '',
     email: customer.email || '',
     gstNumber: customer.gstNumber || '',
+    stateCode: customer.stateCode || '',
     billingAddress: customer.billingAddress || '',
     shippingAddress: customer.shippingAddress || '',
     priceCategory: customer.priceCategory || '',
@@ -126,6 +142,14 @@ function optionalAmount(value, label) {
   return parsed;
 }
 
+// Optional two-digit GST state code (e.g. "27" for Maharashtra).
+function stateCodeOf(value) {
+  const code = trim(value);
+  if (!code) return '';
+  if (!/^\d{2}$/.test(code) || !STATE_CODES.has(code)) throw new ApiError(400, 'State must be a valid two-digit GST state code');
+  return code;
+}
+
 function payloadFromBody(payload) {
   const creditDays = optionalAmount(payload.creditDays, 'Credit days');
   if (creditDays !== null && (creditDays > 365 || !Number.isInteger(creditDays))) throw new ApiError(400, 'Credit days must be a whole number up to 365');
@@ -138,6 +162,7 @@ function payloadFromBody(payload) {
     mobile: trim(payload.mobile),
     email: trim(payload.email),
     gstNumber: trim(payload.gstNumber),
+    stateCode: stateCodeOf(payload.stateCode),
     billingAddress: trim(payload.billingAddress),
     shippingAddress: trim(payload.shippingAddress),
     priceCategory: trim(payload.priceCategory),
@@ -195,14 +220,17 @@ async function updateCustomer(id, payload, { checkFields = false } = {}) {
   if (!data.name) {
     throw new ApiError(400, 'Customer name is required');
   }
-  if (checkFields) await require('../formFields/formFields.service').assertComplete('customer', data, 'This customer');
+  // Switching a customer on or off is not an edit of their details: older
+  // records missing a now-mandatory field can still be toggled.
+  const onlyActive = Object.keys(payload || {}).every((key) => key === 'isActive');
+  if (checkFields && !onlyActive) await require('../formFields/formFields.service').assertComplete('customer', data, 'This customer');
   if (payload.isActive !== undefined) data.isActive = toBool(payload.isActive);
   if (payload.products !== undefined && payload.products !== null) {
     if (!Array.isArray(payload.products)) {
       throw new ApiError(400, 'Products must be a list');
     }
     await storeListPhotos(payload.products);
-    data.products = normalizeCustomerProducts(payload.products);
+    data.products = normalizeCustomerProducts(payload.products, { stored: customer.products || [] });
   }
 
   const updated = await customerRepo.updateById(id, data);

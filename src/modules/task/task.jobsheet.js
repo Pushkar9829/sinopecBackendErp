@@ -49,6 +49,15 @@ function stageFields(order, item, stage) {
       field('special', 'Special requirements', m.specialRequirements || print.specialRequirements, { long: true }),
     ];
   }
+  if (stage === 'other') {
+    return [
+      field('process', 'Process', req.process, { long: true }),
+      field('size', 'Size', item.size),
+      field('material', 'Material', item.material || m.rawMaterial),
+      field('colour', 'Colour', item.color || m.color),
+      field('special', 'Special requirements', m.specialRequirements, { long: true }),
+    ];
+  }
   if (stage === 'cutting') {
     return [
       field('bagSize', 'Bag size', bag.size || join(bag.width, bag.length) || item.size),

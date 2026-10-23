@@ -2,7 +2,7 @@ const { body } = require('express-validator');
 const express = require('express');
 const authenticate = require('../../middlewares/authenticate');
 const validate = require('../../middlewares/validate');
-const { loginLimiters, refreshLimiter } = require('../../middlewares/rateLimit');
+const { loginLimiters, refreshLimiter, logoutLimiter } = require('../../middlewares/rateLimit');
 const authController = require('./auth.controller');
 
 const router = express.Router();
@@ -17,7 +17,8 @@ router.post(
   authController.login
 );
 
-router.post('/logout', authController.logout);
+router.post('/logout', logoutLimiter, authController.logout);
+router.post('/logout-all', authenticate, authController.logoutAll);
 router.post('/refresh', refreshLimiter, authController.refresh);
 router.get('/me', authenticate, authController.me);
 

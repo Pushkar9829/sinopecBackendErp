@@ -134,9 +134,12 @@ async function saveSettings(user, payload = {}) {
     if (!bank || bank.group !== 'bank') throw new ApiError(400, 'Choose a bank account');
     set.defaultBank = bank._id;
   }
+  // Bring the books up to date first: older receipts get their account fixed
+  // (the bank in use until now), and nothing waiting is left out of a period
+  // about to be locked. A new default bank only applies to money received after.
+  const bankChanges = set.defaultBank && String(set.defaultBank) !== String(s.defaultBank || '');
+  if (bankChanges || set.lockDate) await syncBooks({ full: true });
   await BooksSettings.updateOne({ _id: s._id }, { $set: set });
-  // Receipts move to the new bank account on the next full sync.
-  if (set.defaultBank) await syncBooks({ full: true });
   return getSettings(user);
 }
 

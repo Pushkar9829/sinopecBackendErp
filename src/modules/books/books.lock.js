@@ -21,4 +21,12 @@ async function assertOpeningsOpen(what = 'Opening balances') {
   if (s?.lockDate) throw new ApiError(400, `The books are locked up to ${businessYmd(s.lockDate)}; ${what} cannot change. The owner can unlock the books first if this is a correction.`);
 }
 
-module.exports = { assertOpenPeriod, assertOpeningsOpen };
+// Documents dated before the books start belong in the opening balances.
+async function assertAfterStart(date, what = 'this entry', hint = '') {
+  if (!date) return;
+  await ensureChart();
+  const s = await BooksSettings.findOne({ key: 'default' }).select('startDate').lean();
+  if (s?.startDate && new Date(date) < s.startDate) throw new ApiError(400, `The books start on ${businessYmd(s.startDate)}; ${what} cannot be dated earlier${hint ? ` (${hint})` : ''}`);
+}
+
+module.exports = { assertOpenPeriod, assertOpeningsOpen, assertAfterStart };

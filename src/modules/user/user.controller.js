@@ -1,4 +1,6 @@
 const asyncHandler = require('../../utils/asyncHandler');
+const authService = require('../auth/auth.service');
+const userRepo = require('./user.repo');
 const userService = require('./user.service');
 
 const list = asyncHandler(async (req, res) => {
@@ -18,6 +20,10 @@ const create = asyncHandler(async (req, res) => {
 
 const update = asyncHandler(async (req, res) => {
   const user = await userService.updateUser(req.user, req.params.id, req.body);
+  // Changing your own password ends every session; keep this browser signed in.
+  if (req.body?.password && String(req.user._id) === String(req.params.id)) {
+    await authService.issueSession(res, await userRepo.findByIdWithRole(req.params.id));
+  }
   res.json({ success: true, data: user });
 });
 

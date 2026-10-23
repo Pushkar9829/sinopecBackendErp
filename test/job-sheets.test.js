@@ -48,7 +48,7 @@ test('stage work list: every line whose current stage it is, urgent first', asyn
   const res = await owner.get('/api/production/stage-sheet/rolling');
   assert.equal(res.status, 200, JSON.stringify(res.data));
   const sheet = res.data.data;
-  const orders = await db.collection('salesorders').find({ status: { $in: ['approved', 'production_planned', 'in_production', 'ready_for_packing', 'packed', 'ready_for_dispatch', 'dispatched'] } }).toArray();
+  const orders = await db.collection('salesorders').find({ status: { $in: ['production_planned', 'in_production', 'ready_for_packing', 'packed', 'ready_for_dispatch', 'dispatched'] } }).toArray();
   const expected = orders.flatMap((o) => o.items.filter((i) => routeStages(i.productionRoute).includes('rolling') && activeStage(i) === 'rolling'));
   assert.equal(sheet.lines.length, expected.length);
   const rank = { urgent: 0, high: 1, normal: 2 };

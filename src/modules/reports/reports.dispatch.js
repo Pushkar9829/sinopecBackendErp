@@ -3,7 +3,7 @@ const { hasPermission } = require('../../utils/permissions');
 const { businessYmd, endOfBusinessDay } = require('../../utils/businessTime');
 const { SALES_ORDER_STATUSES } = require('../../config/constants');
 const SalesOrder = require('../salesOrder/salesOrder.model');
-const { activeStage } = require('../production/production.flow');
+const { activeStage, stageName } = require('../production/production.flow');
 const { customerOf, STAGE_LABEL } = require('./reports.production');
 const { parseRange, monthsOf, monthOf, inRange, DAY } = require('./reports.range');
 
@@ -55,7 +55,7 @@ async function dispatchReport(user, query) {
       .select('number orderType status orderDate deliveryDate completedAt customer customerSnapshot items')
       .lean(),
     SalesOrder.find({ status: { $nin: NOT_OPEN } })
-      .select('number orderType status orderDate deliveryDate customer customerSnapshot items.product items.productCode items.quantity items.unit items.productionRoute items.stageWork items.stagePickup items.manufacturing')
+      .select('number orderType status orderDate deliveryDate customer customerSnapshot items.product items.productCode items.quantity items.unit items.productionRoute items.otherProcess items.stageWork items.stagePickup items.manufacturing')
       .lean(),
   ]);
 
@@ -144,7 +144,11 @@ async function dispatchReport(user, query) {
     .filter((o) => o.deliveryDate)
     .map((o) => {
       const due = endOfBusinessDay(o.deliveryDate).getTime();
-      const lines = (o.items || []).map(activeStage);
+      // An "Other process" line shows its own process name (e.g. Lamination).
+      const lines = (o.items || []).map((item) => {
+        const stage = activeStage(item);
+        return stage === 'other' ? stageName(item, stage) : stage;
+      });
       return {
         id: String(o._id),
         number: o.number,

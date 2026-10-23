@@ -146,6 +146,20 @@ router.post(
   productionController.deleteEntry
 );
 
+// A production manager closes a stage that came in under target.
+router.post(
+  '/close-stage',
+  authenticate,
+  authorize('production:update'),
+  validate([
+    body('orderId').isMongoId().withMessage('Invalid order'),
+    body('itemId').isMongoId().withMessage('Invalid line item'),
+    body('stage').isIn(FLOOR_STAGE_IDS).withMessage('Unknown stage'),
+    body('reason').isString().trim().isLength({ min: 3, max: 500 }).withMessage('Enter why this stage is being closed short'),
+  ]),
+  productionController.closeStageShort
+);
+
 router.post(
   '/complete',
   authenticate,

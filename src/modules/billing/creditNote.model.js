@@ -51,6 +51,8 @@ const creditNoteSchema = new mongoose.Schema(
 );
 creditNoteSchema.index({ customer: 1, status: 1, date: 1 });
 creditNoteSchema.index({ date: -1 });
+// The books sync picks up changed documents by updatedAt.
+creditNoteSchema.index({ updatedAt: 1 });
 
 creditNoteSchema.set('toJSON', {
   transform(_doc, ret) {

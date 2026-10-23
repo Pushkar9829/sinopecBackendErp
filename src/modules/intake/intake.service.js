@@ -11,7 +11,7 @@ const Intake = require('./intake.model');
 const { getSettings } = require('./intake.settings');
 const { readIntake, normalizeProposal } = require('./intake.reader');
 const { conversationText, stripQuoted } = require('./intake.text');
-const { matchCustomer, suggestProducts } = require('./intake.matching');
+const { matchCustomer, suggestProducts, findExistingCustomer } = require('./intake.matching');
 const { DailyLimitReached } = require('./ai');
 const reviewTasks = require('./intake.tasks');
 
@@ -429,7 +429,7 @@ async function matchInfo(id) {
   return {
     customerMatch,
     lineSuggestions: await suggestProducts(doc.customer, proposal.lines || []),
-    routes: PRODUCTION_ROUTE_LIST.map((route) => ({ id: route.id, label: route.label, orderType: route.orderType })),
+    routes: PRODUCTION_ROUTE_LIST.map((route) => ({ id: route.id, label: route.label, orderType: route.orderType, stages: route.stages })),
   };
 }
 
@@ -551,17 +551,41 @@ async function confirmCustomer(id, payload, user) {
     if (customer.isActive === false) throw new ApiError(400, 'That customer is inactive. Activate it first or pick another.');
   } else if (payload?.create && typeof payload.create === 'object') {
     if (!hasPermission(user, 'sales:create')) throw new ApiError(403, 'You cannot create customers');
-    customer = await customerService.createCustomer({ ...payload.create, products: [] });
+    // Same GST number or mobile already on file (e.g. a retry after an error): use it.
+    const existingId = await findExistingCustomer(payload.create);
+    if (existingId) {
+      customer = await customerService.getCustomer(existingId);
+      if (customer.isActive === false) {
+        throw new ApiError(400, `${customer.code} ${customer.companyName || customer.name} already has this GST number or mobile and is inactive. Activate it first.`);
+      }
+    } else {
+      customer = await customerService.createCustomer({ ...payload.create, products: [] });
+    }
   } else {
     throw new ApiError(400, 'Choose a customer or create a new one');
   }
-  doc.customer = customer.id;
-  doc.customerName = customer.companyName || customer.name;
-  doc.customerMatch = null;
-  doc.potentialOrder = true;
-  if (doc.status !== 'reading') doc.status = 'customer_confirmed';
-  doc.history.push(historyEntry(user, 'customer_confirmed', `${customer.code} ${doc.customerName}`));
-  await saveChecked(doc);
+  // Link in one atomic step that only needs the draft to still be open: a
+  // background read finishing meanwhile must not leave the customer unlinked.
+  const customerName = customer.companyName || customer.name;
+  const entry = historyEntry(user, 'customer_confirmed', `${customer.code} ${customerName}`);
+  entry.by = mongoose.isValidObjectId(entry.by) ? new mongoose.Types.ObjectId(String(entry.by)) : null;
+  const linked = await Intake.updateOne(
+    { _id: doc._id, status: { $nin: ['converted', 'discarded'] } },
+    [
+      {
+        $set: {
+          customer: new mongoose.Types.ObjectId(customer.id),
+          customerName: { $literal: customerName },
+          customerMatch: null,
+          potentialOrder: true,
+          status: { $cond: [{ $eq: ['$status', 'reading'] }, '$status', 'customer_confirmed'] },
+          history: { $concatArrays: [{ $ifNull: ['$history', []] }, { $literal: [entry] }] },
+          __v: { $add: [{ $ifNull: ['$__v', 0] }, 1] },
+        },
+      },
+    ]
+  );
+  if (!linked.matchedCount) throw new ApiError(409, 'This draft was closed while you were working on it. Reload it.');
   return getDraft(id);
 }
 
@@ -580,7 +604,7 @@ async function clearCustomer(id, payload, user) {
 
 // ---------------------------------------------------------------- convert
 
-const COPY_FIELDS = ['product', 'productCode', 'productType', 'size', 'material', 'thickness', 'width', 'length', 'color', 'unit', 'taxPercent', 'hsnCode', 'manufacturing', 'roll', 'bag', 'printing', 'holes', 'tape', 'image', 'images', 'productionRoute'];
+const COPY_FIELDS = ['product', 'productCode', 'productType', 'size', 'material', 'thickness', 'width', 'length', 'color', 'unit', 'taxPercent', 'hsnCode', 'manufacturing', 'roll', 'bag', 'printing', 'holes', 'tape', 'image', 'images', 'productionRoute', 'otherProcess'];
 
 async function baseSpec(line, customerId) {
   if (line.source === 'customer' && line.sourceId) {
@@ -615,9 +639,14 @@ async function buildItems(lines, customerId) {
     item.length = textOr(line.length, item.length);
     item.unit = textOr(line.unit, item.unit) || 'pcs';
     item.productionRoute = textOr(line.productionRoute, item.productionRoute);
+    item.otherProcess = textOr(line.otherProcess, item.otherProcess);
     item.quantity = Number(line.quantity) || 0;
     item.rate = line.rate === null || line.rate === undefined || line.rate === '' ? Number(spec.rate) || 0 : Number(line.rate) || 0;
-    item.taxPercent = item.taxPercent ?? 18;
+    // A customer's saved product keeps its real GST. Saved (template) products
+    // store tax as 0 (tax belongs to the line), so their lines start at 18%
+    // like the order form does, unless an older one carries a real rate.
+    const savedTax = spec.taxPercent === undefined || spec.taxPercent === null || spec.taxPercent === '' ? NaN : Number(spec.taxPercent);
+    item.taxPercent = Number.isFinite(savedTax) && (savedTax > 0 || !templateId) ? savedTax : 18;
     if (line.notes) {
       item.manufacturing = { ...item.manufacturing };
       item.manufacturing.specialRequirements = [item.manufacturing.specialRequirements, String(line.notes).trim()].filter(Boolean).join('. ');
@@ -633,6 +662,15 @@ function deliveryDateFrom(value) {
   const text = String(value || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
   return text >= businessYmd() ? text : null;
+}
+
+// A customer's PO is dated on or before today: past dates are normal.
+function poDateFrom(value) {
+  const text = String(value || '').trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const date = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== text) return null;
+  return text <= businessYmd() ? text : null;
 }
 
 // Step 2: turn the reviewed lines into a DRAFT sales order. Never submits it.
@@ -662,7 +700,7 @@ async function convert(id, payload, user) {
         orderType: payload.orderType === 'job_work' ? 'job_work' : 'sales_order',
         deliveryDate: payload.deliveryDate !== undefined ? payload.deliveryDate || null : deliveryDateFrom(proposal.deliveryDate),
         customerPoNumber: payload.customerPoNumber ?? proposal.poNumber ?? '',
-        customerPoDate: payload.customerPoDate !== undefined ? payload.customerPoDate || null : deliveryDateFrom(proposal.poDate),
+        customerPoDate: payload.customerPoDate !== undefined ? payload.customerPoDate || null : poDateFrom(proposal.poDate),
         billingAddress: proposal.customer?.billingAddress || '',
         shippingAddress: proposal.customer?.shippingAddress || '',
         remarks: [`From draft order ${doc.number} (${doc.channel})`, String(payload.remarks ?? proposal.notes ?? '').trim()].filter(Boolean).join('. '),
@@ -675,7 +713,19 @@ async function convert(id, payload, user) {
     throw error;
   }
 
-  // The customer's files go on the order as purchase-order attachments.
+  // Mark the draft converted as soon as the order exists, so a slow file copy
+  // (or an expired lock) can never let a second click make a second order.
+  await Intake.updateOne(
+    { _id: doc._id },
+    {
+      $set: { status: 'converted', salesOrder: order.id, salesOrderNumber: order.number, convertingAt: null },
+      $unset: { openKey: 1 },
+      $push: { history: historyEntry(user, 'converted', `Draft sales order ${order.number}`) },
+      $inc: { __v: 1 },
+    }
+  );
+
+  // The customer's files go on the order as purchase-order attachments (best effort).
   const warnings = [];
   for (const file of doc.files || []) {
     try {
@@ -686,16 +736,12 @@ async function convert(id, payload, user) {
       warnings.push(`${file.originalName}: ${error.message}`);
     }
   }
-
-  await Intake.updateOne(
-    { _id: doc._id },
-    {
-      $set: { status: 'converted', salesOrder: order.id, salesOrderNumber: order.number, convertingAt: null },
-      $unset: { openKey: 1 },
-      $push: { history: historyEntry(user, 'converted', `Draft sales order ${order.number}${warnings.length ? `. Files not copied: ${warnings.join('; ')}` : ''}`) },
-      $inc: { __v: 1 },
-    }
-  );
+  if (warnings.length) {
+    await Intake.updateOne(
+      { _id: doc._id },
+      { $push: { history: historyEntry(user, 'files_not_copied', `Files not copied to ${order.number}: ${warnings.join('; ')}`) }, $inc: { __v: 1 } }
+    ).catch(() => {});
+  }
   await reviewTasks.closeReviewTask(doc, TASK_STATUSES.DONE, user, `Converted to ${order.number}`);
   return { draft: await getDraft(id), order: { id: order.id, number: order.number }, warnings };
 }

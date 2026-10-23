@@ -62,6 +62,8 @@ purchaseBillSchema.index({ number: 1 }, { unique: true });
 purchaseBillSchema.index({ supplier: 1, supplierBillNo: 1 }, { unique: true, partialFilterExpression: { status: 'issued', supplierBillNo: { $gt: '' } } });
 purchaseBillSchema.index({ supplier: 1, status: 1, dueDate: 1 });
 purchaseBillSchema.index({ billDate: -1 });
+// The books sync picks up changed documents by updatedAt (here and below).
+purchaseBillSchema.index({ updatedAt: 1 });
 
 // Money paid to a supplier: against one bill, or their oldest bills first.
 const supplierPaymentSchema = new mongoose.Schema(
@@ -88,6 +90,7 @@ const supplierPaymentSchema = new mongoose.Schema(
   { timestamps: true }
 );
 supplierPaymentSchema.index({ supplier: 1, voidedAt: 1, paidAt: 1 });
+supplierPaymentSchema.index({ updatedAt: 1 });
 
 // A purchase return or rate difference: lowers what is owed to the supplier
 // and the input GST taken.
@@ -114,6 +117,8 @@ const debitNoteSchema = new mongoose.Schema(
   { timestamps: true }
 );
 debitNoteSchema.index({ supplier: 1, status: 1 });
+debitNoteSchema.index({ bill: 1, status: 1 });
+debitNoteSchema.index({ updatedAt: 1 });
 
 const PurchaseBill = mongoose.models.PurchaseBill || mongoose.model('PurchaseBill', purchaseBillSchema);
 const SupplierPayment = mongoose.models.SupplierPayment || mongoose.model('SupplierPayment', supplierPaymentSchema);

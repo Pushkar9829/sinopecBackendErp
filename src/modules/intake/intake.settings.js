@@ -1,3 +1,5 @@
+const ApiError = require('../../utils/ApiError');
+const { checkBaseUrl } = require('./ai/openaiCompatible');
 const IntakeSettings = require('./intakeSettings.model');
 const { parseKeywords } = require('./intake.keywords');
 const { seal, open, isEncrypted } = require('../../utils/secretBox');
@@ -105,6 +107,11 @@ function clampNumber(value, [min, max], fallback) {
 
 async function saveSettings(payload) {
   const doc = await loadDoc();
+  const previousOpenaiBase = String(doc.openaiBaseUrl || '').trim();
+  if (payload.openaiBaseUrl !== undefined) {
+    const problem = checkBaseUrl(payload.openaiBaseUrl);
+    if (problem) throw new ApiError(400, problem);
+  }
   for (const field of TEXT_FIELDS) {
     if (payload[field] !== undefined) doc[field] = String(payload[field] || '').trim();
   }
@@ -129,6 +136,11 @@ async function saveSettings(payload) {
     if (payload[clearFlag] === true) doc[field] = '';
     else if (payload[field] !== undefined && String(payload[field]).trim()) doc[field] = seal(String(payload[field]).trim());
   }
+  // The saved key is sent to the server address: a new address without a new
+  // key in the same save drops the old key, so it can't be redirected to
+  // someone else's server.
+  const newOpenaiKey = payload.openaiApiKey !== undefined && String(payload.openaiApiKey).trim();
+  if (String(doc.openaiBaseUrl || '').trim() !== previousOpenaiBase && !newOpenaiKey) doc.openaiApiKey = '';
   await doc.save();
   return getSettings();
 }

@@ -355,17 +355,23 @@ async function gstr3b(user, query = {}) {
   let carried = { igst: 0, cgst: 0, sgst: 0 };
   // Credit notes larger than a month's sales lower the next month's tax.
   let short = { igst: 0, cgst: 0, sgst: 0 };
+  // Likewise debit notes reversing more input credit than a month's bills
+  // add: the minus comes off the credit available next month.
+  let itcShort = { igst: 0, cgst: 0, sgst: 0 };
   let result = null;
   const history = [];
   for (const key of months(ctx.startYmd, month)) {
     const f = await gstMonthFigures(key, sys);
-    const credit = { igst: money(carried.igst + Math.max(0, f.itc.igst)), cgst: money(carried.cgst + Math.max(0, f.itc.cgst)), sgst: money(carried.sgst + Math.max(0, f.itc.sgst)) };
+    const avail = { igst: money(carried.igst + f.itc.igst + itcShort.igst), cgst: money(carried.cgst + f.itc.cgst + itcShort.cgst), sgst: money(carried.sgst + f.itc.sgst + itcShort.sgst) };
+    const credit = { igst: Math.max(0, avail.igst), cgst: Math.max(0, avail.cgst), sgst: Math.max(0, avail.sgst) };
+    const itcBroughtShort = itcShort;
+    itcShort = { igst: Math.min(0, avail.igst), cgst: Math.min(0, avail.cgst), sgst: Math.min(0, avail.sgst) };
     const due = { igst: money(f.outward.igst + short.igst), cgst: money(f.outward.cgst + short.cgst), sgst: money(f.outward.sgst + short.sgst) };
     const liability = { igst: Math.max(0, due.igst), cgst: Math.max(0, due.cgst), sgst: Math.max(0, due.sgst) };
     short = { igst: Math.min(0, due.igst), cgst: Math.min(0, due.cgst), sgst: Math.min(0, due.sgst) };
     const s = setOff(liability, credit);
     history.push({ month: key, tax: money(liability.igst + liability.cgst + liability.sgst), itc: money(f.itc.igst + f.itc.cgst + f.itc.sgst), cash: money(s.cash.igst + s.cash.cgst + s.cash.sgst), carried: money(s.carried.igst + s.carried.cgst + s.carried.sgst) });
-    if (key === month) result = { ...f, broughtForward: carried, creditAvailable: credit, liability, ...s, negativeCarried: short };
+    if (key === month) result = { ...f, broughtForward: carried, creditAvailable: credit, liability, ...s, negativeCarried: short, itcShortBrought: itcBroughtShort, itcShortCarried: itcShort };
     carried = s.carried;
   }
   return { ...result, history: history.slice(-12).reverse() };

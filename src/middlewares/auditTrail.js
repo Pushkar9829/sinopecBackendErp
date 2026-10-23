@@ -4,7 +4,10 @@ const { COOKIES } = require('../config/constants');
 const { verifyAccessToken } = require('../utils/tokens');
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const SKIPPED = new Set(['/api/auth/refresh', '/api/intake/whatsapp']);
+const SKIPPED = new Set(['/api/intake/whatsapp']);
+// Sign-in calls worth a log row. Anything else under /api/auth (unknown paths,
+// routine token refreshes) is not logged.
+const AUTH_LOGGED = new Set(['login', 'logout', 'logout-all', 'refresh']);
 // Calculations change nothing and run on every keystroke.
 const SKIPPED_PREFIXES = ['/api/rate-calculator/'];
 
@@ -96,7 +99,7 @@ function resolveTarget(req) {
   if (module === 'production') {
     action = PRODUCTION_ACTIONS[words.join(' ')] || words.join(' ');
   } else if (module === 'auth') {
-    action = { login: 'logged in', logout: 'logged out' }[words.join(' ')] || words.join(' ') || 'auth';
+    action = { login: 'logged in', logout: 'logged out', 'logout-all': 'signed out everywhere', refresh: 'refresh session' }[words.join(' ')] || words.join(' ') || 'auth';
   } else if (words.length) {
     const tail = words.join(' ').replace(/-/g, ' ');
     if (tail === 'attachments') action = req.method === 'DELETE' ? 'removed attachment' : 'added attachment';
@@ -208,10 +211,14 @@ function auditTrail(req, res, next) {
   if (!MUTATING.has(req.method) || SKIPPED.has(path) || SKIPPED_PREFIXES.some((prefix) => path.startsWith(prefix))) return next();
 
   const target = resolveTarget(req);
+  const authCall = target.module === 'auth' ? path.replace(/^\/api\/auth\/?/, '') : '';
+  if (target.module === 'auth' && !AUTH_LOGGED.has(authCall)) return next();
   // Anonymous calls to anything but login are rejected by authenticate; don't
-  // spend database reads or log rows on them.
+  // spend database reads or log rows on them. A sign-out with no session at
+  // all is not worth a row either.
   const anonymous = target.module !== 'auth' && !hasCredentials(req);
   if (anonymous) return next();
+  if (authCall === 'logout' && !hasCredentials(req) && !req.cookies?.[COOKIES.REFRESH]) return next();
 
   let responseBody;
   const sendJson = res.json.bind(res);
@@ -225,6 +232,11 @@ function auditTrail(req, res, next) {
     res.on('finish', () => {
       // A bad or expired token: nobody to attribute it to, nothing changed.
       if (res.statusCode === 401 && target.module !== 'auth') return;
+      // Unknown routes and records: nothing happened.
+      if (res.statusCode === 404) return;
+      // Refreshes run all the time; only an old token coming back (possible
+      // theft, every session ended) is logged.
+      if (authCall === 'refresh' && !(res.statusCode === 401 && /revoked/i.test(String(responseBody?.message || '')))) return;
       writeLog(req, res, target, before, responseBody).catch((error) => console.error('Audit log failed', error.message));
     });
     next();
