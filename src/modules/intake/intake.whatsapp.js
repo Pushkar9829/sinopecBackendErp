@@ -135,16 +135,11 @@ async function ingestMessage({ message, contactName }) {
   if (!duplicate) await service.scheduleRead(doc);
 }
 
-async function sendText(intake, to, text) {
-  const settings = await getSettings();
-  if (!settings.whatsappAccessToken || !settings.whatsappPhoneNumberId) throw new Error('WhatsApp sending is not set up');
-  if (Date.now() - new Date(intake.lastMessageAt).getTime() > REPLY_WINDOW_MS) {
-    throw Object.assign(new Error('More than 24 hours since the customer wrote; WhatsApp needs a template message'), { skip: true });
-  }
+async function postMessage(settings, body) {
   const response = await fetch(`${GRAPH()}/${encodeURIComponent(settings.whatsappPhoneNumberId)}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${settings.whatsappAccessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+    body: JSON.stringify({ messaging_product: 'whatsapp', ...body }),
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
@@ -152,4 +147,20 @@ async function sendText(intake, to, text) {
   }
 }
 
-module.exports = { verifyWebhook, verifySubscription, acceptPayload, ingestMessage, sendText };
+async function sendText(intake, to, text) {
+  const settings = await getSettings();
+  if (!settings.whatsappAccessToken || !settings.whatsappPhoneNumberId) throw new Error('WhatsApp sending is not set up');
+  if (Date.now() - new Date(intake.lastMessageAt).getTime() > REPLY_WINDOW_MS) {
+    throw Object.assign(new Error('More than 24 hours since the customer wrote; WhatsApp needs a template message'), { skip: true });
+  }
+  await postMessage(settings, { to, type: 'text', text: { body: text } });
+}
+
+// Shows the customer's message as read (blue ticks).
+async function markRead(messageId) {
+  const settings = await getSettings();
+  if (!settings.whatsappAccessToken || !settings.whatsappPhoneNumberId) throw new Error('WhatsApp sending is not set up');
+  await postMessage(settings, { status: 'read', message_id: messageId });
+}
+
+module.exports = { verifyWebhook, verifySubscription, acceptPayload, ingestMessage, sendText, markRead };

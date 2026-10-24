@@ -30,8 +30,10 @@ router.post('/panel', ...canUpdate, validate([proposalBody]), c.createPanel);
 router.post('/panel/read', ...canUpdate, upload.array('files', 5), c.readPanel);
 
 router.get('/', ...canRead, c.list);
+router.get('/customers', ...canRead, c.customers);
 router.get('/:id', ...canRead, validate([idParam]), c.getOne);
 router.get('/:id/match', ...canRead, validate([idParam]), c.match);
+router.get('/:id/products', ...canRead, validate([idParam]), c.products);
 router.get('/:id/files/:fileId', ...canRead, validate([idParam, param('fileId').isMongoId()]), c.file);
 router.put('/:id', ...canUpdate, validate([idParam, proposalBody]), c.saveProposal);
 router.post('/:id/readings/:readingId/use', ...canUpdate, validate([idParam, param('readingId').isMongoId()]), c.useReading);

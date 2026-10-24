@@ -110,13 +110,14 @@ async function finishCallback(code, state, sessionUserId = '') {
     gmailEmail: email,
     // A different mailbox starts from now, not from the old one's position.
     gmailHistoryId: email === settings.gmailEmail ? settings.gmailHistoryId : '',
+    gmailConvertedLabelId: email === settings.gmailEmail ? settings.gmailConvertedLabelId : '',
     gmailLastError: '',
   });
   return email;
 }
 
 async function disconnect() {
-  await updateSettingsFields({ gmailRefreshToken: '', gmailHistoryId: '', gmailLastError: '' });
+  await updateSettingsFields({ gmailRefreshToken: '', gmailHistoryId: '', gmailLastError: '', gmailConvertedLabelId: '' });
 }
 
 // ---------------------------------------------------------------- sync
@@ -352,6 +353,61 @@ async function fetchSkippedAttachments(intakeId) {
   }
 }
 
+// ---------------------------------------------------------------- converted
+
+const CONVERTED_LABEL = 'Sinopec/Converted';
+
+function errorStatus(error) {
+  return Number(error?.code || error?.status || error?.response?.status) || 0;
+}
+
+// Made once, then its id is kept in the settings.
+async function convertedLabelId(gmail, settings) {
+  if (settings.gmailConvertedLabelId) return settings.gmailConvertedLabelId;
+  let id = '';
+  try {
+    const created = await gmail.users.labels.create({
+      userId: 'me',
+      requestBody: { name: CONVERTED_LABEL, labelListVisibility: 'labelShow', messageListVisibility: 'show' },
+    });
+    id = created.data.id;
+  } catch (error) {
+    // Already in the mailbox (made by hand, or before a reconnect): use it.
+    if (errorStatus(error) !== 409) throw error;
+    const listed = await gmail.users.labels.list({ userId: 'me' });
+    id = (listed.data.labels || []).find((label) => label.name === CONVERTED_LABEL)?.id || '';
+    if (!id) throw error;
+  }
+  await updateSettingsFields({ gmailConvertedLabelId: id });
+  settings.gmailConvertedLabelId = id;
+  return id;
+}
+
+// After a convert: every mail of the draft gets the "Sinopec/Converted"
+// label and is marked read. Returns how many mails were changed.
+async function markConverted(intake) {
+  const settings = await getSettings();
+  if (!connected(settings)) throw new Error('Gmail is not connected');
+  const gmail = gmailFor(settings);
+  const ids = (intake.messages || []).map((m) => m.providerMessageId).filter(Boolean);
+  if (!ids.length) return 0;
+  const apply = async () =>
+    gmail.users.messages.batchModify({
+      userId: 'me',
+      requestBody: { ids, addLabelIds: [await convertedLabelId(gmail, settings)], removeLabelIds: ['UNREAD'] },
+    });
+  try {
+    await apply();
+  } catch (error) {
+    // The saved label was deleted in Gmail: make it again once.
+    if (!settings.gmailConvertedLabelId || ![400, 404].includes(errorStatus(error))) throw error;
+    settings.gmailConvertedLabelId = '';
+    await updateSettingsFields({ gmailConvertedLabelId: '' });
+    await apply();
+  }
+  return ids.length;
+}
+
 // ---------------------------------------------------------------- reply
 
 function encodeHeader(value) {
@@ -396,6 +452,8 @@ module.exports = {
   fetchMessage,
   fetchSkippedAttachments,
   sendReply,
+  markConverted,
+  CONVERTED_LABEL,
   frontendRedirect,
   isAutomated,
   // Tests swap the Gmail client for a fake one.

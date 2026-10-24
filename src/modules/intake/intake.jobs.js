@@ -12,6 +12,7 @@ function registerIntakeJobs() {
   jobs.register('whatsapp:message', (payload) => whatsapp.ingestMessage(payload), { concurrency: 3 });
   jobs.register('intake:read', (payload, job) => service.runRead(payload, job), { concurrency: 2 });
   jobs.register('intake:reply', (payload) => replies.sendReply(payload));
+  jobs.register('intake:mark-source', (payload) => service.markSource(payload));
   jobs.register('intake:retention', () => service.removeOldBodies());
 }
 

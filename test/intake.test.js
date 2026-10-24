@@ -71,6 +71,8 @@ function startFake() {
         if (req.url === '/graph/media-1') return send(200, { url: `http://127.0.0.1:${server.address().port}/graph/file-1`, mime_type: 'image/png', file_size: PNG.length });
         if (req.url === '/graph/file-1') return send(200, PNG, 'image/png');
         if (req.url === '/graph/PHONE-ID/messages') {
+          // Read receipts (sent after a convert) are not replies.
+          if (json.status === 'read') return send(200, { success: true });
           calls.graphSent.push(json);
           return send(200, { messages: [{ id: 'wamid.out' }] });
         }

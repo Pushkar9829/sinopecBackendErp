@@ -11,6 +11,8 @@ const list = asyncHandler(async (req, res) => ok(res, await intakeService.listDr
 const summary = asyncHandler(async (_req, res) => ok(res, await intakeService.summary()));
 const getOne = asyncHandler(async (req, res) => ok(res, await intakeService.getDraft(req.params.id)));
 const match = asyncHandler(async (req, res) => ok(res, await intakeService.matchInfo(req.params.id)));
+const products = asyncHandler(async (req, res) => ok(res, await intakeService.productsFor(req.params.id, req.query)));
+const customers = asyncHandler(async (req, res) => ok(res, await intakeService.findCustomers(req.query)));
 const file = asyncHandler(async (req, res) => sendStoredFile(res, await intakeService.getFile(req.params.id, req.params.fileId)));
 
 const getSettingsView = asyncHandler(async (_req, res) => ok(res, await intakeService.settingsView()));
@@ -76,6 +78,8 @@ module.exports = {
   summary,
   getOne,
   match,
+  products,
+  customers,
   file,
   getSettingsView,
   saveSettingsView,

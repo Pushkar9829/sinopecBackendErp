@@ -98,7 +98,7 @@ async function suggestProducts(customerId, lines) {
     .limit(1000)
     .lean();
   return (lines || []).map((line) => {
-    const text = [line.product, line.material, line.width && line.length ? `${line.width}x${line.length}` : ''].join(' ');
+    const text = lineText(line);
     const ranked = [
       ...own.map((p) => {
         const s = score(text, `${p.product} ${p.productCode} ${p.material} ${p.size}`);
@@ -114,6 +114,82 @@ async function suggestProducts(customerId, lines) {
       .slice(0, 3);
     return ranked.map((entry) => entry.spec);
   });
+}
+
+function lineText(line) {
+  return [line?.product, line?.material, line?.width && line?.length ? `${line.width}x${line.length}` : ''].join(' ');
+}
+
+// Every word of the search must appear somewhere in the product.
+function matchesSearch(q, text) {
+  const wanted = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+  const have = String(text || '').toLowerCase();
+  return wanted.every((w) => have.includes(w));
+}
+
+const PICKER_LIMIT = 50;
+
+// The product picker: all of the customer's products and all active saved
+// products, best matches for the draft line first, then by name. `q` narrows
+// both groups; each group is cut at `limit` and says how many there are.
+async function listProducts(customerId, { q = '', line = null, limit = PICKER_LIMIT } = {}) {
+  const max = Math.min(200, Math.max(1, Number(limit) || PICKER_LIMIT));
+  const search = String(q || '').trim().slice(0, 80);
+  const text = line ? lineText(line) : '';
+  const customer = customerId ? await Customer.findById(customerId).select('products').lean() : null;
+  const templateFilter = { isActive: { $ne: false } };
+  if (search) {
+    const pattern = new RegExp(search.split(/\s+/).map(escapeRegex).join('|'), 'i');
+    templateFilter.$or = ['name', 'code', 'product', 'productCode', 'material', 'size'].map((field) => ({ [field]: pattern }));
+  }
+  const templates = await ProductTemplate.find(templateFilter)
+    .select('name code product productCode productionRoute otherProcess size material width length unit')
+    .limit(2000)
+    .lean();
+
+  const rank = (rows) =>
+    rows
+      .sort((a, b) => b.s - a.s || a.spec.label.localeCompare(b.spec.label))
+      .map((entry) => entry.spec);
+  const own = rank(
+    (customer?.products || [])
+      .map((p) => {
+        const haystack = `${p.product} ${p.productCode} ${p.material} ${p.size}`;
+        const s = text ? score(text, haystack) : 0;
+        return { s, haystack, spec: specOf('customer', p, `${p.product}${p.size ? ` ${p.size}` : ''}`, s >= 0.75) };
+      })
+      .filter((entry) => !search || matchesSearch(search, entry.haystack))
+  );
+  const saved = rank(
+    templates
+      .map((t) => {
+        const haystack = `${t.name} ${t.product} ${t.code} ${t.productCode} ${t.material} ${t.size}`;
+        const s = text ? score(text, haystack) : 0;
+        return { s, haystack, spec: specOf('template', t, `${t.name}${t.size ? ` ${t.size}` : ''}`, s >= 0.75) };
+      })
+      .filter((entry) => !search || matchesSearch(search, entry.haystack))
+  );
+  return {
+    customer: { items: own.slice(0, max), total: own.length },
+    saved: { items: saved.slice(0, max), total: saved.length },
+  };
+}
+
+// The "find another customer" box on a draft: name, company, code, mobile,
+// email or GST number. Active customers first.
+async function searchCustomers(q, limit = 20) {
+  const text = String(q || '').trim().slice(0, 80);
+  if (text.length < 2) return [];
+  const pattern = new RegExp(escapeRegex(text), 'i');
+  const or = ['name', 'companyName', 'code', 'mobile', 'email', 'gstNumber'].map((field) => ({ [field]: pattern }));
+  const phone = normalizePhone(text);
+  if (phone.length >= 6 && phone.length <= 10) or.push({ mobile: new RegExp(phone.split('').join('[^0-9]*')) });
+  const rows = await Customer.find({ $or: or })
+    .select('code name companyName mobile email gstNumber isActive')
+    .sort({ isActive: -1, name: 1 })
+    .limit(Math.min(50, Math.max(1, Number(limit) || 20)))
+    .lean();
+  return rows.map((row) => summary(row, 'search'));
 }
 
 // A customer that already has this GST number or mobile, so creating one from
@@ -133,4 +209,4 @@ async function findExistingCustomer({ gstNumber, mobile } = {}) {
   return null;
 }
 
-module.exports = { matchCustomer, suggestProducts, findExistingCustomer };
+module.exports = { matchCustomer, suggestProducts, listProducts, searchCustomers, findExistingCustomer };

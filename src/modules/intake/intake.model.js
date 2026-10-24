@@ -71,6 +71,8 @@ const replySchema = new mongoose.Schema(
     at: { type: Date, default: Date.now },
     channel: { type: String, default: '' },
     to: { type: String, default: '' },
+    // received: "we received your order"; booked: "your order is booked as SO-…".
+    kind: { type: String, enum: ['received', 'booked'], default: 'received' },
     status: { type: String, enum: ['sent', 'skipped', 'failed'], default: 'sent' },
     reason: { type: String, default: '' },
     text: { type: String, default: '' },

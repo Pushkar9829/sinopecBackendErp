@@ -36,17 +36,23 @@ async function record(intakeId, entry) {
   await Intake.updateOne({ _id: intakeId }, { $push: { replies: { at: new Date(), ...entry } } });
 }
 
-async function decide(intake, settings, to) {
-  if (!settings.autoReplyEnabled) return 'Automatic replies are switched off';
-  if ((intake.replies || []).some((reply) => reply.status === 'sent')) return 'Already answered';
+// Checks every automatic message goes through: sender, test mode, daily cap.
+async function senderSkip(intake, settings, to) {
   if (!to) return 'No address to reply to';
-  if (['discarded', 'stored', 'converted'].includes(intake.status)) return 'Not an open order';
   const last = intake.messages[intake.messages.length - 1];
   if (last?.automated) return 'Automated mail is never answered';
   if (intake.channel === 'gmail' && settings.gmailEmail && to === settings.gmailEmail.toLowerCase()) return 'Our own address';
   if (settings.autoReplyTestMode && !inTestList(settings, intake.channel, to)) return 'Test mode: not on the test list';
   if ((await sentTodayTo(intake.channel, to)) >= (settings.autoReplyDailyPerSender || 0)) return 'Daily reply limit for this sender reached';
   return '';
+}
+
+async function decide(intake, settings, to) {
+  if (!settings.autoReplyEnabled) return 'Automatic replies are switched off';
+  if ((intake.replies || []).some((reply) => reply.status === 'sent' && reply.kind !== 'booked')) return 'Already answered';
+  if (!to) return 'No address to reply to';
+  if (['discarded', 'stored', 'converted'].includes(intake.status)) return 'Not an open order';
+  return senderSkip(intake, settings, to);
 }
 
 // Job handler.
@@ -71,4 +77,32 @@ async function sendReply({ intakeId }) {
   }
 }
 
-module.exports = { sendReply };
+// After a convert: "Your order is booked as SO-…" on WhatsApp, once per draft.
+// Returns { status: 'sent' | 'skipped' | 'failed', reason }; never throws.
+async function confirmBooked(intake) {
+  const settings = await getSettings();
+  const to = recipientOf(intake);
+  let skip = '';
+  if (intake.channel !== 'whatsapp') skip = 'Only sent on WhatsApp';
+  else if (settings.confirmConvertedWhatsapp === false) skip = 'Order confirmations are switched off';
+  else if (intake.status !== 'converted' || !intake.salesOrderNumber) skip = 'Not converted';
+  else if ((intake.replies || []).some((reply) => reply.kind === 'booked' && reply.status === 'sent')) skip = 'Already confirmed';
+  else skip = await senderSkip(intake, settings, to);
+  if (skip) {
+    await record(intake._id, { channel: intake.channel, to, kind: 'booked', status: 'skipped', reason: skip });
+    return { status: 'skipped', reason: skip };
+  }
+  const text = `Thank you. Your order is booked as ${intake.salesOrderNumber}.`;
+  try {
+    await require('./intake.whatsapp').sendText(intake, to, text);
+    await record(intake._id, { channel: intake.channel, to, kind: 'booked', status: 'sent', text });
+    return { status: 'sent', reason: '' };
+  } catch (error) {
+    const status = error.skip ? 'skipped' : 'failed';
+    const reason = String(error.message).slice(0, 300);
+    await record(intake._id, { channel: intake.channel, to, kind: 'booked', status, reason }).catch(() => {});
+    return { status, reason };
+  }
+}
+
+module.exports = { sendReply, confirmBooked };

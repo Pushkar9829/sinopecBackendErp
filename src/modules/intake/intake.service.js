@@ -11,7 +11,7 @@ const Intake = require('./intake.model');
 const { getSettings } = require('./intake.settings');
 const { readIntake, normalizeProposal } = require('./intake.reader');
 const { conversationText, stripQuoted } = require('./intake.text');
-const { matchCustomer, suggestProducts, findExistingCustomer } = require('./intake.matching');
+const { matchCustomer, suggestProducts, listProducts, searchCustomers, findExistingCustomer } = require('./intake.matching');
 const { DailyLimitReached } = require('./ai');
 const reviewTasks = require('./intake.tasks');
 
@@ -433,6 +433,19 @@ async function matchInfo(id) {
   };
 }
 
+// The product picker on the convert step. `line`: index of the draft line
+// whose best matches come first.
+async function productsFor(id, query = {}) {
+  const doc = await loadDraft(id);
+  const index = query.line === undefined || query.line === '' ? -1 : Number(query.line);
+  const line = Number.isInteger(index) && index >= 0 ? doc.proposal?.lines?.[index] || null : null;
+  return listProducts(doc.customer, { q: query.q, line, limit: query.limit });
+}
+
+function findCustomers(query = {}) {
+  return searchCustomers(query.q, query.limit);
+}
+
 // ---------------------------------------------------------------- review actions
 
 function assertEditable(doc) {
@@ -658,6 +671,12 @@ async function buildItems(lines, customerId) {
   return items;
 }
 
+// A line that starts from no saved product and was ticked "Save to this
+// customer's products".
+function isNewSavedLine(line) {
+  return line.include !== false && !['customer', 'template'].includes(line.source) && line.saveToCustomer === true;
+}
+
 function deliveryDateFrom(value) {
   const text = String(value || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
@@ -681,6 +700,9 @@ async function convert(id, payload, user) {
   if (!doc.customer) throw new ApiError(400, 'Confirm the customer first');
   const lines = Array.isArray(payload?.lines) ? payload.lines : [];
   const items = await buildItems(lines, doc.customer);
+  // Items follow the included lines in order.
+  const included = lines.filter((line) => line.include !== false);
+  const toSave = items.filter((_item, index) => isNewSavedLine(included[index]));
 
   // Only one convert at a time: two clicks must not make two orders.
   const locked = await Intake.findOneAndUpdate(
@@ -742,8 +764,72 @@ async function convert(id, payload, user) {
       { $push: { history: historyEntry(user, 'files_not_copied', `Files not copied to ${order.number}: ${warnings.join('; ')}`) }, $inc: { __v: 1 } }
     ).catch(() => {});
   }
+
+  // New products ticked "Save to this customer's products" (best effort).
+  if (toSave.length) {
+    const results = await require('../customer/customer.service')
+      .addCustomerProducts(doc.customer, toSave)
+      .catch((error) => toSave.map((item) => ({ product: item.product, status: 'failed', reason: error.message })));
+    const added = results.filter((r) => r.status === 'added').map((r) => r.product);
+    const failed = results.filter((r) => r.status === 'failed');
+    for (const r of failed) warnings.push(`${r.product || 'A product'} was not saved to the customer's products: ${r.reason}`);
+    const notes = [];
+    if (added.length) notes.push(historyEntry(user, 'products_saved', `Added to the customer's products: ${added.join(', ')}`));
+    if (failed.length) notes.push(historyEntry(user, 'products_not_saved', failed.map((r) => `${r.product}: ${r.reason}`).join('; ')));
+    if (notes.length) await Intake.updateOne({ _id: doc._id }, { $push: { history: { $each: notes } }, $inc: { __v: 1 } }).catch(() => {});
+  }
+
   await reviewTasks.closeReviewTask(doc, TASK_STATUSES.DONE, user, `Converted to ${order.number}`);
+  await scheduleMarkSource(doc);
   return { draft: await getDraft(id), order: { id: order.id, number: order.number }, warnings };
+}
+
+// ---------------------------------------------------------------- marking the source
+
+async function scheduleMarkSource(doc) {
+  if (!['gmail', 'whatsapp'].includes(doc.channel)) return;
+  try {
+    await jobs.enqueue('intake:mark-source', { intakeId: String(doc._id) }, { key: `intake:mark-source:${doc._id}`, maxAttempts: 1 });
+  } catch (error) {
+    await recordMark(doc._id, 'mark_failed', `Could not queue: ${error.message}`);
+  }
+}
+
+async function recordMark(intakeId, action, note) {
+  await Intake.updateOne({ _id: intakeId }, { $push: { history: historyEntry(null, action, String(note).slice(0, 300)) }, $inc: { __v: 1 } }).catch(() => {});
+}
+
+// Job handler: after a convert, the Gmail mails get the "Sinopec/Converted"
+// label and are marked read; on WhatsApp the customer's last message is
+// marked read and "Your order is booked as SO-..." is sent (same guards as
+// automatic replies). Best effort: the outcome goes in the draft history and
+// the convert is never undone.
+async function markSource({ intakeId }) {
+  const doc = await Intake.findById(intakeId);
+  if (!doc || doc.status !== 'converted') return;
+  if (doc.channel === 'gmail') {
+    const gmail = require('./intake.gmail');
+    try {
+      const count = await gmail.markConverted(doc);
+      await recordMark(doc._id, 'gmail_marked', `${count} mail${count === 1 ? '' : 's'} labelled ${gmail.CONVERTED_LABEL} and marked read`);
+    } catch (error) {
+      await recordMark(doc._id, 'mark_failed', `Gmail: ${error.message}`);
+    }
+    return;
+  }
+  if (doc.channel !== 'whatsapp') return;
+  const last = doc.messages[doc.messages.length - 1];
+  let readError = '';
+  try {
+    if (!last?.providerMessageId) throw new Error('No message to mark');
+    await require('./intake.whatsapp').markRead(last.providerMessageId);
+  } catch (error) {
+    readError = error.message || 'failed';
+  }
+  const reply = await require('./intake.replies').confirmBooked(doc);
+  const replyNote = reply.status === 'sent' ? 'confirmation sent' : `confirmation ${reply.status}: ${reply.reason}`;
+  if (readError) await recordMark(doc._id, 'mark_failed', `WhatsApp: not marked read (${readError}); ${replyNote}`);
+  else await recordMark(doc._id, 'whatsapp_marked', `Message marked read; ${replyNote}`);
 }
 
 // ---------------------------------------------------------------- settings / housekeeping
@@ -804,6 +890,9 @@ module.exports = {
   summary,
   getFile,
   matchInfo,
+  productsFor,
+  findCustomers,
+  markSource,
   updateProposal,
   useReading,
   reread,

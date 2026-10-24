@@ -295,6 +295,51 @@ async function mergeProducts(customerId, items, refresh) {
   return result.matchedCount > 0;
 }
 
+// Adds chosen products to a customer's list (draft order convert). Each one
+// goes through the same checks as the Customers screen; one that fails or is
+// already on the list is reported, never thrown. Returns
+// [{ product, status: 'added' | 'exists' | 'failed', reason }].
+async function addCustomerProducts(customerId, items) {
+  const Customer = require('./customer.model');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const customer = await customerRepo.findById(customerId);
+    if (!customer) return items.map((item) => ({ product: item?.product || '', status: 'failed', reason: 'Customer not found' }));
+    const existing = [...(customer.products || [])].map((product) => (product?.toObject ? product.toObject() : product));
+    // Same code, or the same name, counts as already saved.
+    const nameKey = (item) => `name:${String(item?.product || '').trim().toLowerCase()}`;
+    const known = new Set([...existing.map(productKey), ...existing.map(nameKey)].filter(Boolean));
+    const results = [];
+    for (const item of items) {
+      const product = String(item?.product || '').trim();
+      const key = productKey(item);
+      if (!key) {
+        results.push({ product, status: 'failed', reason: 'No product name' });
+        continue;
+      }
+      if (known.has(key) || known.has(nameKey(item))) {
+        results.push({ product, status: 'exists' });
+        continue;
+      }
+      try {
+        const [spec] = normalizeCustomerProducts([item]);
+        delete spec.stagePickup;
+        delete spec._id;
+        existing.push(spec);
+        known.add(key);
+        known.add(nameKey(item));
+        results.push({ product, status: 'added' });
+      } catch (error) {
+        results.push({ product, status: 'failed', reason: error.message });
+      }
+    }
+    if (!results.some((r) => r.status === 'added')) return results;
+    const kept = existing.length > MAX_SAVED_PRODUCTS ? existing.slice(-MAX_SAVED_PRODUCTS) : existing;
+    const saved = await Customer.updateOne({ _id: customerId, updatedAt: customer.updatedAt }, { $set: { products: kept } }, { runValidators: true });
+    if (saved.matchedCount) return results;
+  }
+  return items.map((item) => ({ product: item?.product || '', status: 'failed', reason: 'The customer was being changed at the same time; add it from the Customers screen' }));
+}
+
 async function deleteCustomer(id) {
   const customer = await customerRepo.findById(id);
   if (!customer) {
@@ -315,5 +360,6 @@ module.exports = {
   createCustomer,
   updateCustomer,
   attachProductsFromOrder,
+  addCustomerProducts,
   deleteCustomer,
 };

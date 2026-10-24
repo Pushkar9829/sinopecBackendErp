@@ -20,6 +20,8 @@ const intakeSettingsSchema = new mongoose.Schema(
     gmailHistoryId: { type: String, default: '' },
     gmailLastSyncAt: { type: Date, default: null },
     gmailLastError: { type: String, default: '' },
+    // Gmail label put on mail whose draft became a sales order.
+    gmailConvertedLabelId: { type: String, default: '' },
 
     orderKeywords: { type: String, default: '' },
 
@@ -45,6 +47,9 @@ const intakeSettingsSchema = new mongoose.Schema(
       default: 'Thank you, we have received your order request ({number}). Our team will check it and confirm shortly.',
     },
     autoReplyDailyPerSender: { type: Number, default: 3 },
+    // "Your order is booked as SO-…" on WhatsApp after a convert. Same guards
+    // as the replies above (test mode, daily limit, 24-hour window).
+    confirmConvertedWhatsapp: { type: Boolean, default: true },
 
     retentionDays: { type: Number, default: 30 },
     reviewSlaHours: { type: Number, default: 4 },

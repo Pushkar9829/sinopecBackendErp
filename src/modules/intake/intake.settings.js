@@ -92,6 +92,7 @@ function presentSettings(settings) {
     aiFallbackProvider: settings.aiFallbackProvider || '',
     autoReplyEnabled: Boolean(settings.autoReplyEnabled),
     autoReplyTestMode: settings.autoReplyTestMode !== false,
+    confirmConvertedWhatsapp: settings.confirmConvertedWhatsapp !== false,
   };
   for (const field of TEXT_FIELDS) view[field] = settings[field] || '';
   for (const field of Object.keys(NUMBER_FIELDS)) view[field] = settings[field];
@@ -127,7 +128,7 @@ async function saveSettings(payload) {
     doc.aiFallbackProvider = PROVIDERS.includes(payload.aiFallbackProvider) ? payload.aiFallbackProvider : '';
   }
   if (doc.aiFallbackProvider === doc.aiProvider) doc.aiFallbackProvider = '';
-  for (const field of ['autoReplyEnabled', 'autoReplyTestMode']) {
+  for (const field of ['autoReplyEnabled', 'autoReplyTestMode', 'confirmConvertedWhatsapp']) {
     if (payload[field] !== undefined) doc[field] = payload[field] === true || payload[field] === 'true';
   }
   // A blank secret keeps the saved one; `clear<Field>` removes it.
