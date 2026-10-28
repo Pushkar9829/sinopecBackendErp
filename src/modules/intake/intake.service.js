@@ -13,6 +13,7 @@ const { readIntake, normalizeProposal } = require('./intake.reader');
 const { conversationText, stripQuoted } = require('./intake.text');
 const { matchCustomer, suggestProducts, listProducts, searchCustomers, findExistingCustomer } = require('./intake.matching');
 const { DailyLimitReached } = require('./ai');
+const { startsNewOrder, orderSize } = require('./intake.formats');
 const reviewTasks = require('./intake.tasks');
 
 const MAX_READINGS = 10;
@@ -84,6 +85,14 @@ async function ingestMessage({ channel, conversationKey = '', windowMs = 0, mess
       await Intake.updateOne({ _id: open._id, openKey }, { $unset: { openKey: 1 } });
       open = null;
     }
+    let splitFrom = '';
+    if (open && channel === 'whatsapp' && startsNewOrder(open, body)) {
+      // A different order in the same chat (see startsNewOrder): the read
+      // draft is closed to new messages and this one opens its own draft.
+      await Intake.updateOne({ _id: open._id, openKey }, { $unset: { openKey: 1 } });
+      splitFrom = open.number;
+      open = null;
+    }
     const storedFiles = files.map((file) => ({ ...file, _id: new mongoose.Types.ObjectId() }));
     const entry = {
       _id: new mongoose.Types.ObjectId(),
@@ -135,7 +144,7 @@ async function ingestMessage({ channel, conversationKey = '', windowMs = 0, mess
         receivedAt,
         lastMessageAt: receivedAt,
         createdBy,
-        history: [historyEntry(null, 'received', `From ${channel}`)],
+        history: [historyEntry(null, 'received', splitFrom ? `From ${channel}; a new order after ${splitFrom}` : `From ${channel}`)],
       });
       return { doc, created: true, duplicate: false };
     } catch (error) {
@@ -639,6 +648,7 @@ function textOr(value, fallback) {
 }
 
 async function buildItems(lines, customerId) {
+  const { gauge: gaugeOf } = require('../rateCalculator/rateCalculator.service');
   const items = [];
   for (const line of lines) {
     if (line.include === false) continue;
@@ -648,8 +658,24 @@ async function buildItems(lines, customerId) {
     item.templateId = templateId;
     item.product = textOr(line.product, item.product);
     item.material = textOr(line.material, item.material);
-    item.width = textOr(line.width, item.width);
-    item.length = textOr(line.length, item.length);
+    // Inch sizes as plain numbers, mm / cm with the unit (the weight formula
+    // converts them). The flap goes on the item so the weight counts half of it.
+    const size = orderSize(line);
+    item.width = textOr(size.width, item.width);
+    item.length = textOr(size.length, item.length);
+    item.flap = textOr(size.flap, item.flap);
+    if (size.width || size.length || size.gusset) {
+      item.bag = { ...item.bag, width: item.width, length: item.length, gusset: textOr(size.gusset, item.bag?.gusset) };
+    }
+    if (size.width) item.roll = { ...item.roll, width: item.width };
+    let notes = String(line.notes || '').trim();
+    const thickness = Number(line.thickness);
+    if (thickness > 0) {
+      // The item keeps gauge; micron is turned into gauge with the calculator's rule.
+      const micron = line.thicknessKind === 'micron';
+      item.thickness = String(micron ? gaugeOf(`${thickness} micron`) : thickness);
+      if (micron) notes = [`Thickness ${thickness} micron`, notes].filter(Boolean).join('. ');
+    }
     item.unit = textOr(line.unit, item.unit) || 'pcs';
     item.productionRoute = textOr(line.productionRoute, item.productionRoute);
     item.otherProcess = textOr(line.otherProcess, item.otherProcess);
@@ -660,9 +686,9 @@ async function buildItems(lines, customerId) {
     // like the order form does, unless an older one carries a real rate.
     const savedTax = spec.taxPercent === undefined || spec.taxPercent === null || spec.taxPercent === '' ? NaN : Number(spec.taxPercent);
     item.taxPercent = Number.isFinite(savedTax) && (savedTax > 0 || !templateId) ? savedTax : 18;
-    if (line.notes) {
+    if (notes) {
       item.manufacturing = { ...item.manufacturing };
-      item.manufacturing.specialRequirements = [item.manufacturing.specialRequirements, String(line.notes).trim()].filter(Boolean).join('. ');
+      item.manufacturing.specialRequirements = [item.manufacturing.specialRequirements, notes].filter(Boolean).join('. ');
     }
     if (!item.productionRoute) throw new ApiError(400, `Choose a production route for ${item.product || 'each line'}`);
     items.push(item);

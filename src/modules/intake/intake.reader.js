@@ -2,6 +2,7 @@ const { readStoredObject } = require('../../utils/storage');
 const { getSettings } = require('./intake.settings');
 const ai = require('./ai');
 const { conversationText } = require('./intake.text');
+const formats = require('./intake.formats');
 
 const MAX_PDF_TEXT = 20000;
 const MAX_FILE_BYTES = 15 * 1024 * 1024;
@@ -45,7 +46,19 @@ function numberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeProposal(raw, extraWarnings = []) {
+function textOf(value) {
+  return value === null || value === undefined ? '' : String(value).trim();
+}
+
+// "9,000", "2k", "1.5 lakh" → a number; anything unreadable → null.
+function quantityOrNull(value) {
+  const parsed = formats.parseQuantity(value);
+  return parsed && Number.isFinite(parsed.quantity) ? parsed.quantity : null;
+}
+
+// clean: { message } tidies each line the way customers write orders (only
+// for a fresh reading; a person's saved lines are kept as typed).
+function normalizeProposal(raw, extraWarnings = [], clean = null) {
   const base = emptyProposal(extraWarnings);
   const customer = raw?.customer && typeof raw.customer === 'object' ? raw.customer : {};
   base.customer = {
@@ -58,16 +71,25 @@ function normalizeProposal(raw, extraWarnings = []) {
     shippingAddress: String(customer.shippingAddress || ''),
   };
   base.lines = Array.isArray(raw?.lines)
-    ? raw.lines.map((line) => ({
-        product: String(line?.product || ''),
-        quantity: numberOrNull(line?.quantity),
-        unit: String(line?.unit || ''),
-        rate: numberOrNull(line?.rate),
-        material: String(line?.material || ''),
-        width: String(line?.width || ''),
-        length: String(line?.length || ''),
-        notes: String(line?.notes || ''),
-      }))
+    ? raw.lines.map((line) => {
+        const shaped = {
+          product: String(line?.product || ''),
+          quantity: quantityOrNull(line?.quantity),
+          unit: String(line?.unit || ''),
+          rate: numberOrNull(line?.rate),
+          material: String(line?.material || ''),
+          width: textOf(line?.width),
+          length: textOf(line?.length),
+          flap: textOf(line?.flap),
+          gusset: textOf(line?.gusset),
+          sizeUnit: ['inch', 'mm', 'cm'].includes(line?.sizeUnit) ? line.sizeUnit : '',
+          sizeText: textOf(line?.sizeText).slice(0, 120),
+          thickness: numberOrNull(line?.thickness),
+          thicknessKind: ['gauge', 'micron'].includes(line?.thicknessKind) ? line.thicknessKind : '',
+          notes: String(line?.notes || ''),
+        };
+        return clean ? formats.cleanLine(shaped, line || {}, clean.message || '') : shaped;
+      })
     : [];
   base.deliveryDate = String(raw?.deliveryDate || '');
   base.poNumber = String(raw?.poNumber || '').slice(0, 60);
@@ -86,13 +108,6 @@ function normalizeProposal(raw, extraWarnings = []) {
   return base;
 }
 
-const SIZE_UNIT = '(?:inches|inch|in|cm|mm)?';
-const SIZE_PATTERN = new RegExp(
-  `(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT}\\s*[*x×]\\s*(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT}(?:\\s*[*x×]\\s*(\\d+(?:\\.\\d+)?)\\s*${SIZE_UNIT})?`,
-  'i'
-);
-const MONTH_WORD = /^(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)$/i;
-
 function addressIn(value) {
   const match = String(value || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   return match ? match[0] : '';
@@ -102,33 +117,12 @@ function blank(value) {
   return value === null || value === undefined || value === '' || Number.isNaN(value);
 }
 
-function findSize(text) {
-  const match = String(text || '').match(SIZE_PATTERN);
-  if (!match) return null;
-  return { width: match[1], length: match[2], gusset: match[3] || '' };
-}
-
-function findQuantity(text) {
-  const cleaned = String(text || '').replace(new RegExp(SIZE_PATTERN.source, 'gi'), ' ');
-  const withUnit = cleaned.match(/\b(\d{1,7}(?:\.\d+)?)\s*(pcs|pc|pieces|piece|nos|kg|kgs|packets?|pkt|rolls?)\b/i);
-  if (withUnit) return { quantity: Number(withUnit[1]), unit: withUnit[2].toLowerCase() };
-  const loose = cleaned.matchAll(/\b(\d{1,7})\s+([A-Za-z]{3,})/g);
-  for (const match of loose) {
-    if (MONTH_WORD.test(match[2])) continue;
-    const before = cleaned.slice(Math.max(0, match.index - 16), match.index);
-    if (/\b(rate|rs|inr|gst|rupees?)\s*$/i.test(before)) continue;
-    const quantity = Number(match[1]);
-    if (quantity >= 1900 && quantity <= 2100) continue;
-    return { quantity, unit: '' };
-  }
-  return null;
-}
-
 function productBeside(text, quantity) {
-  const match = String(text || '').match(new RegExp(`\\b${quantity}\\s+([^\\n(]{2,80})`, 'i'));
+  const plain = String(text || '').replace(/(\d),(?=\d)/g, '$1');
+  const match = plain.match(new RegExp(`\b${quantity}\s*(?:pcs|pieces|nos)?\s+([^\n(]{2,80})`, 'i'));
   if (!match) return '';
   return match[1]
-    .replace(new RegExp(SIZE_PATTERN.source, 'gi'), ' ')
+    .replace(formats.SIZE_PATTERN_ALL, ' ')
     .replace(/[^\w\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -137,6 +131,13 @@ function productBeside(text, quantity) {
     .join(' ');
 }
 
+function emptyLine() {
+  return { product: '', quantity: null, unit: '', rate: null, material: '', width: '', length: '', flap: '', gusset: '', sizeUnit: '', sizeText: '', thickness: null, thicknessKind: '', notes: '' };
+}
+
+// Facts the message text itself gives: sender, and for a one-line order the
+// size, quantity, thickness and features the reader left out; for the whole
+// draft the PO number, references and delivery; and whether it is an order.
 function applyMessageFacts(proposal, doc) {
   const text = messageText(doc);
   const senderEmail = addressIn(doc?.sender?.email);
@@ -145,34 +146,43 @@ function applyMessageFacts(proposal, doc) {
   if (senderPhone && !proposal.customer.mobile) proposal.customer.mobile = senderPhone;
   if (!proposal.customer.name && doc?.sender?.name) proposal.customer.name = String(doc.sender.name).trim();
 
-  const size = findSize(text);
-  const counted = findQuantity(text);
+  const size = formats.parseSize(text);
+  const counted = formats.findQuantity(text);
   if (!proposal.lines.length && (size || counted)) {
-    proposal.lines.push({
-      product: counted ? productBeside(text, counted.quantity) : '',
-      quantity: counted ? counted.quantity : null,
-      unit: counted?.unit || '',
-      rate: null,
-      material: '',
-      width: '',
-      length: '',
-      notes: '',
-    });
+    proposal.lines.push({ ...emptyLine(), product: counted ? productBeside(text, counted.quantity) : '', quantity: counted ? counted.quantity : null, unit: counted?.unit || '' });
   }
 
-  if (proposal.lines.length !== 1) return proposal;
-  const line = proposal.lines[0];
-  if (counted && blank(line.quantity)) {
-    line.quantity = counted.quantity;
-    if (!line.unit && counted.unit) line.unit = counted.unit;
-  }
-  if (!line.product && counted) line.product = productBeside(text, counted.quantity);
-  if (size && !line.width && !line.length) {
-    line.width = size.width;
-    line.length = size.length;
-    if (size.gusset && !/gusset/i.test(line.notes)) {
-      line.notes = [line.notes, `gusset ${size.gusset}`].filter(Boolean).join('. ');
+  if (proposal.lines.length === 1) {
+    const line = proposal.lines[0];
+    if (counted && blank(line.quantity)) {
+      line.quantity = counted.quantity;
+      if (!line.unit && counted.unit) line.unit = counted.unit;
+      if (counted.approx) line.notes = formats.mergeNotes(line.notes, ['Approx. quantity']);
     }
+    if (!line.product && counted) line.product = productBeside(text, counted.quantity);
+    if (size && !line.width && !line.length && !line.sizeText) line.sizeText = size.text;
+    if (blank(line.thickness)) {
+      const thickness = formats.findThickness(text);
+      if (thickness) Object.assign(line, { thickness: thickness.value, thicknessKind: thickness.kind });
+    }
+    if (!line.material) line.material = formats.normalizeMaterial('', `${line.product} ${text}`);
+    line.notes = formats.mergeNotes(line.notes, formats.findFeatures(text, { printing: false }));
+    Object.assign(line, formats.cleanLine(line, {}, text));
+  }
+
+  if (!proposal.poNumber) proposal.poNumber = formats.findPoNumber(text).slice(0, 60);
+  const references = formats.findReferences(text);
+  if (references.length) proposal.notes = formats.mergeNotes(proposal.notes, references);
+  const delivery = formats.findDelivery(text);
+  if (delivery && !proposal.deliveryDate) {
+    if (delivery.date) proposal.deliveryDate = delivery.date;
+    else proposal.notes = formats.mergeNotes(proposal.notes, [delivery.note]);
+  }
+
+  const reason = formats.notOrderReason({ body: text, subject: doc?.subject, fileCount: (doc?.files || []).length, lines: proposal.lines });
+  if (reason) {
+    proposal.isOrder = false;
+    proposal.warnings = [...proposal.warnings, reason];
   }
   return proposal;
 }
@@ -238,6 +248,11 @@ ${text.slice(0, MAX_PDF_TEXT)}`);
 async function readIntake(doc) {
   const settings = await getSettings();
   const input = await buildInput(doc, settings.aiProvider || 'gemini');
+  // An empty message with no file is not an order; the reader is not asked.
+  if (!messageText(doc).trim() && !(doc.files || []).length && !input.warnings.length) {
+    const proposal = applyMessageFacts(emptyProposal(), doc);
+    return { proposal, provider: '', model: '' };
+  }
   const hasContent = Boolean(messageText(doc) || doc.subject) || input.files.length || input.texts.length > 1;
   if (!hasContent) {
     if (!input.warnings.length) throw new Error('There is nothing to read on this draft');
@@ -246,7 +261,7 @@ async function readIntake(doc) {
   const result = await ai.readOrder(settings, input, doc._id);
   const warnings = result.warning ? [...input.warnings, result.warning] : input.warnings;
   return {
-    proposal: applyMessageFacts(normalizeProposal(result.raw, warnings), doc),
+    proposal: applyMessageFacts(normalizeProposal(result.raw, warnings, { message: messageText(doc) }), doc),
     provider: result.provider,
     model: result.model,
   };
@@ -254,6 +269,7 @@ async function readIntake(doc) {
 
 module.exports = {
   readIntake,
+  applyMessageFacts,
   normalizeProposal,
   emptyProposal,
 };

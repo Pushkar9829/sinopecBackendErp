@@ -24,7 +24,8 @@ test('job sheet: one page per stage on the route, with specs, targets and entrie
   const rolling = sheet.stages.find((s) => s.stage === 'rolling');
   assert.ok(rolling.lines.length >= 1);
   const line = rolling.lines[0];
-  assert.ok(line.specs.some((s) => s.label === 'Product'));
+  assert.ok(line.specs.some((s) => s.label === 'Size'));
+  assert.ok(!line.specs.some((s) => s.label === 'Product'), 'the product is in the heading, not repeated as a spec');
   assert.equal(line.unit, 'kg');
   const item = order.items.find((i) => String(i._id) === line.itemId);
   assert.equal(line.entries.length, item.stageWork.filter((w) => w.stage === 'rolling').length);

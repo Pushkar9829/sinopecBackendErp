@@ -28,23 +28,34 @@ function imagesOf(item) {
     .slice(0, 4);
 }
 
-// The specs a stage works to, as label/value pairs (empty ones left out).
+// "20 × 30 inch" and "20 × 30" are the same size: compare without units or spaces.
+const sameSize = (a, b) => {
+  const bare = (v) => String(v ?? '').toLowerCase().replace(/inch(es)?|in\b|"|mm|cm/g, '').replace(/[\s×x*]+/g, 'x').replace(/^x|x$/g, '');
+  return bare(a) !== '' && bare(a) === bare(b);
+};
+// A plain number gets its unit ("218.18" → "218.18 kg").
+const withUnit = (value, unit) => (/^\s*[\d.]+\s*$/.test(String(value ?? '')) ? `${String(value).trim()} ${unit}` : value);
+
+// The specs a stage works to, as label/value pairs. Only what that stage needs:
+// the product name and target are already in the line's heading, and a row that
+// repeats the size (or another row) is left out.
 function specRows(order, item, stage) {
   const req = stageRequirements(order, item, stage);
   const rows = [
-    ['Product', [req.product, req.productCode && req.productCode !== req.product ? `(${req.productCode})` : ''].filter(Boolean).join(' ')],
     ['Size', req.size],
     ['Flap', item.flap],
-    ['Colour', req.color],
   ];
+  if (stage !== 'dispatch') rows.push(['Colour', req.color]);
   if (stage === 'rolling') {
+    const material = [req.material, /^polymers?$/i.test(String(req.materialType || '').trim()) ? '' : req.materialType, req.materialGrade].filter(Boolean);
+    const widthLength = join(req.width, req.length);
+    const roll = req.roll?.size || join(req.roll?.width, req.roll?.length);
     rows.push(
-      ['Material', [req.material, req.materialType, req.materialGrade].filter(Boolean).join(' · ')],
-      ['Gauge', req.thickness],
-      ['Width × length', join(req.width, req.length)],
-      ['Weight to make', req.requiredWeight],
-      ['Roll', req.roll?.size || join(req.roll?.width, req.roll?.length)],
-      ['Roll weight', req.roll?.weight],
+      ['Material', [...new Set(material)].join(' · ')],
+      ['Gauge', withUnit(req.thickness, 'gauge')],
+      ['Width × length', sameSize(widthLength, req.size) ? '' : widthLength],
+      ['Roll', sameSize(roll, req.size) ? '' : roll],
+      ['Roll weight', withUnit(req.roll?.weight, 'kg')],
       ['Additives', req.additives]
     );
   } else if (stage === 'printing') {
@@ -56,8 +67,9 @@ function specRows(order, item, stage) {
   } else if (stage === 'cutting') {
     const bag = req.bag || {};
     const holes = req.holes || {};
+    const bagSize = bag.size || join(bag.width, bag.length);
     rows.push(
-      ['Bag size', bag.size || join(bag.width, bag.length)],
+      ['Bag size', sameSize(bagSize, req.size) ? '' : bagSize],
       ['Gusset', bag.gusset],
       ['Holes', holes.required ? [holes.count, holes.type, holes.size, holes.position && `at ${holes.position}`].filter(Boolean).join(' ') : 'No holes'],
       ['Tape', req.tape?.required ? req.tape.type || 'Yes' : '']
@@ -79,6 +91,8 @@ function lineFor(order, item, stage) {
     productCode: item.productCode || '',
     // The process name on an "Other process" line (e.g. Lamination).
     process: stage === 'other' ? stageName(item, stage) : '',
+    // This line's own route, so the floor sees where it goes next.
+    route: routeStages(item.productionRoute).map((s) => stageName(item, s)),
     unit: stats.unit,
     target: r2(stats.target),
     done: r2(stats.output),

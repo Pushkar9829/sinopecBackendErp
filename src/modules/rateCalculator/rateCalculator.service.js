@@ -194,4 +194,4 @@ function defaults() {
   return { jobWork: { ...JOB_WORK_EXAMPLE }, salesOrder: { ...SALES_ORDER_EXAMPLE }, printChart: PRINT_CHART };
 }
 
-module.exports = { jobWork, salesOrder, rolling, defaults };
+module.exports = { jobWork, salesOrder, rolling, defaults, gauge };
