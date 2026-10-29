@@ -134,6 +134,9 @@ async function jobSheet(user, orderId, { stage } = {}) {
       customer: customerFor(user, order),
       productionInstructions: order.productionInstructions || '',
       remarks: operator ? '' : order.remarks || '',
+      customerPoNumber: operator ? '' : order.customerPoNumber || '',
+      // Values for owner-added "filled on each order" fields (Settings → Documents).
+      documentFields: order.documentFields || {},
     },
     stages: wanted.map((s) => ({
       stage: s,

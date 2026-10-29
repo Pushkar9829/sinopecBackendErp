@@ -5,6 +5,8 @@ const mongoose = require('mongoose');
 const lineSchema = new mongoose.Schema(
   {
     itemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    // Set on a charge line (freight...) copied from the order's charges.
+    chargeId: { type: mongoose.Schema.Types.ObjectId, default: null },
     product: { type: String, default: '', trim: true },
     productCode: { type: String, default: '', trim: true },
     hsnCode: { type: String, default: '', trim: true },
@@ -66,6 +68,9 @@ const invoiceSchema = new mongoose.Schema(
     roundOff: { type: Number, default: 0 },
     total: { type: Number, required: true, min: 0 },
     notes: { type: String, default: '', trim: true },
+    // The order's document values (Dispatched through, Destination...) when billed.
+    documentFields: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
+    paymentTerms: { type: String, default: '' },
     // The owner billed more than was dispatched (e.g. goods held for the customer), and why.
     billAhead: { type: Boolean, default: false },
     billAheadReason: { type: String, default: '', trim: true },

@@ -100,7 +100,7 @@ function roundMoney(value) {
 // is spread over the lines in proportion to their value, then each line is
 // taxed at its own rate on what is left. Keep in sync with calcOrder in
 // frontend/src/lib/sales.js.
-function calcTotals(items, orderDiscount, advanceAmount, paidAmount = 0) {
+function calcTotals(items, orderDiscount, advanceAmount, paidAmount = 0, charges = []) {
   const lines = items.map(calcLine);
   const subtotal = lines.reduce((sum, line) => sum + line.taxable, 0);
   const discount = Math.min(Math.max(0, num(orderDiscount)), subtotal);
@@ -109,11 +109,18 @@ function calcTotals(items, orderDiscount, advanceAmount, paidAmount = 0) {
     const share = subtotal > 0 ? (discount * line.taxable) / subtotal : 0;
     tax += roundMoney(((line.taxable - share) * num(items[index].taxPercent)) / 100);
   });
-  const grandTotal = Math.max(0, subtotal - discount + tax);
+  // Charges (freight...) are not discounted; each carries its own GST.
+  let chargeTotal = 0;
+  for (const charge of charges || []) {
+    chargeTotal += num(charge.amount);
+    tax += roundMoney((num(charge.amount) * num(charge.gstPercent)) / 100);
+  }
+  const grandTotal = Math.max(0, subtotal - discount + chargeTotal + tax);
   const remainingAmount = Math.max(0, grandTotal - Math.max(0, num(advanceAmount)) - Math.max(0, num(paidAmount)));
   return {
     subtotal: roundMoney(subtotal),
     discount: roundMoney(discount),
+    charges: roundMoney(chargeTotal),
     tax: roundMoney(tax),
     grandTotal: roundMoney(grandTotal),
     remainingAmount: roundMoney(remainingAmount),
@@ -351,6 +358,8 @@ function toPublicOrder(order) {
     remarks: order.remarks || '',
     productionInstructions: order.productionInstructions || '',
     items,
+    charges: (order.charges || []).map((charge) => ({ id: String(charge._id), name: charge.name, sac: charge.sac || '', amount: charge.amount || 0, gstPercent: charge.gstPercent || 0 })),
+    documentFields: order.documentFields || {},
     subtotal: order.subtotal || 0,
     discount: order.discount || 0,
     tax: order.tax || 0,
@@ -395,6 +404,7 @@ function stripCommercial(order) {
   delete next.creditCheck;
   delete next.creditOverride;
   delete next.subtotal;
+  delete next.charges;
   delete next.discount;
   delete next.tax;
   delete next.grandTotal;
@@ -746,7 +756,7 @@ async function loadCustomer(customerId) {
 }
 
 function applyTotals(doc, items, discount, advanceAmount) {
-  const totals = calcTotals(items, discount, advanceAmount, doc.paidAmount);
+  const totals = calcTotals(items, discount, advanceAmount, doc.paidAmount, doc.charges);
   doc.items = items;
   doc.subtotal = totals.subtotal;
   doc.discount = totals.discount;
@@ -756,7 +766,25 @@ function applyTotals(doc, items, discount, advanceAmount) {
   return totals;
 }
 
+function normalizeCharges(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ApiError(400, 'Charges must be a list');
+  const rows = raw.filter((row) => str(row?.name) || num(row?.amount) > 0);
+  if (rows.length > 10) throw new ApiError(400, 'At most 10 charge lines on an order');
+  return rows.map((row) => {
+    const name = str(row.name).slice(0, 80);
+    if (!name) throw new ApiError(400, 'Give every charge line a name');
+    const amount = num(row.amount);
+    const gstPercent = num(row.gstPercent);
+    if (amount < 0) throw new ApiError(400, `${name}: amount cannot be negative`);
+    if (gstPercent < 0 || gstPercent > 100) throw new ApiError(400, `${name}: GST % must be between 0 and 100`);
+    return { ...(row.id && mongoose.isValidObjectId(row.id) ? { _id: row.id } : {}), name, sac: str(row.sac).slice(0, 12), amount: roundMoney(amount), gstPercent };
+  });
+}
+
 function applyHeader(doc, payload, snapshot) {
+  if (payload.charges !== undefined) doc.charges = normalizeCharges(payload.charges);
+  if (payload.documentFields !== undefined) doc.documentFields = require('../documentLayouts/documentLayouts.service').cleanOrderValues(payload.documentFields);
   if (payload.orderDate !== undefined) {
     doc.orderDate = parseDate(payload.orderDate, 'Order date', { required: true });
     assertOrderDateWindow(doc.orderDate);
@@ -1160,6 +1188,8 @@ async function createOrder(user, payload, options = {}) {
 
   doc.items = items;
   doc.discount = Math.max(0, num(payload.discount));
+  doc.charges = normalizeCharges(payload.charges);
+  doc.documentFields = require('../documentLayouts/documentLayouts.service').cleanOrderValues(payload.documentFields);
   assertOrderNumbers(doc);
   applyTotals(doc, items, payload.discount, doc.advanceAmount);
   assertNotOverpaid(doc);

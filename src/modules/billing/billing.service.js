@@ -125,9 +125,27 @@ async function invoicedByItem(orderId) {
   const rows = await Invoice.find({ salesOrder: orderId, status: 'issued', kind: 'sale' }).select('lines').lean();
   const totals = new Map();
   for (const invoice of rows) {
-    for (const line of invoice.lines) totals.set(String(line.itemId), (totals.get(String(line.itemId)) || 0) + line.quantity);
+    for (const line of invoice.lines) {
+      if (line.chargeId) continue;
+      totals.set(String(line.itemId), (totals.get(String(line.itemId)) || 0) + line.quantity);
+    }
   }
   return totals;
+}
+
+// Order charges already on an issued invoice (each is billed once).
+async function billedCharges(orderId) {
+  const rows = await Invoice.find({ salesOrder: orderId, status: 'issued', kind: 'sale', 'lines.chargeId': { $type: 'objectId' } }).select('lines.chargeId').lean();
+  return new Set(rows.flatMap((invoice) => invoice.lines.filter((line) => line.chargeId).map((line) => String(line.chargeId))));
+}
+
+function priceCharge(charge, intraState) {
+  const taxable = money(Number(charge.amount) || 0);
+  const tax = (taxable * (Number(charge.gstPercent) || 0)) / 100;
+  const cgst = intraState ? money(tax / 2) : 0;
+  const sgst = intraState ? money(tax / 2) : 0;
+  const igst = intraState ? 0 : money(tax);
+  return { taxable, discount: 0, cgst, sgst, igst, amount: money(taxable + cgst + sgst + igst) };
 }
 
 async function loadOrder(orderId) {
@@ -141,7 +159,7 @@ async function loadOrder(orderId) {
 async function invoiceDraft(user, orderId) {
   assert(canView(user), 'You cannot see invoices');
   const order = await loadOrder(orderId);
-  const [customer, company, invoiced] = await Promise.all([loadCustomer(order.customer), companyService.getSettings(), invoicedByItem(order._id)]);
+  const [customer, company, invoiced, chargesDone] = await Promise.all([loadCustomer(order.customer), companyService.getSettings(), invoicedByItem(order._id), billedCharges(order._id)]);
   const buyer = buyerOf(customer, order);
   const intraState = intraStateOf(buyer, company);
   const shares = discountShares(order);
@@ -182,6 +200,14 @@ async function invoiceDraft(user, orderId) {
     intraState,
     creditDays: creditDaysOf(customer, company, order),
     lines,
+    charges: (order.charges || []).map((charge) => ({
+      id: String(charge._id),
+      name: charge.name,
+      sac: charge.sac || '',
+      amount: charge.amount || 0,
+      gstPercent: charge.gstPercent || 0,
+      billed: chargesDone.has(String(charge._id)),
+    })),
   };
 }
 
@@ -259,6 +285,26 @@ async function createInvoice(user, orderId, payload = {}) {
       });
     });
     if (!lines.length) throw new ApiError(400, 'Enter a quantity on at least one line');
+    // Charges go on with the goods, once per order. Without a choice sent, every
+    // charge not yet billed is added.
+    const done = await billedCharges(order._id);
+    const chosen = Array.isArray(payload.charges) ? new Set(payload.charges.map(String)) : null;
+    for (const charge of order.charges || []) {
+      const id = String(charge._id);
+      if (done.has(id) || (chosen && !chosen.has(id))) continue;
+      lines.push({
+        itemId: null,
+        chargeId: charge._id,
+        product: charge.name,
+        productCode: '',
+        hsnCode: charge.sac || '',
+        quantity: 0,
+        unit: '',
+        rate: 0,
+        gstPercent: Number(charge.gstPercent) || 0,
+        ...priceCharge(charge, intraState),
+      });
+    }
 
     const sum = (key) => money(lines.reduce((total, line) => total + line[key], 0));
     const exact = sum('taxable') + sum('cgst') + sum('sgst') + sum('igst');
@@ -302,6 +348,8 @@ async function createInvoice(user, orderId, payload = {}) {
           roundOff: money(total - exact),
           total,
           notes: str(payload.notes),
+          documentFields: order.documentFields || {},
+          paymentTerms: order.paymentTerms || '',
           billAhead: ahead,
           billAheadReason: ahead ? aheadReason : '',
           createdBy: user._id,

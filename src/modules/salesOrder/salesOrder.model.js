@@ -207,6 +207,17 @@ const customerSnapshotSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// Extra rows billed with the goods, e.g. Outward freight (SAC 996511) with its GST.
+const chargeSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    sac: { type: String, default: '', trim: true },
+    amount: { type: Number, default: 0, min: 0 },
+    gstPercent: { type: Number, default: 0, min: 0, max: 100 },
+  },
+  { _id: true }
+);
+
 const salesOrderSchema = new mongoose.Schema(
   {
     number: { type: String, required: true, unique: true, trim: true },
@@ -258,6 +269,10 @@ const salesOrderSchema = new mongoose.Schema(
     remarks: { type: String, default: '', trim: true },
     productionInstructions: { type: String, default: '', trim: true },
     items: { type: [lineItemSchema], default: [] },
+    charges: { type: [chargeSchema], default: [] },
+    // Values printed on the order's documents (Dispatched through, Destination,
+    // owner-added fields...), keyed as in Settings → Documents.
+    documentFields: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
     subtotal: { type: Number, default: 0, min: 0 },
     discount: { type: Number, default: 0, min: 0 },
     tax: { type: Number, default: 0, min: 0 },
