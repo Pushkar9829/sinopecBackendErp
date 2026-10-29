@@ -47,9 +47,10 @@ function countAll() {
   return InventoryItem.countDocuments();
 }
 
-function takeQuantity(id, qty) {
+// allowNegative: company raw stock may run below zero (the store catches up later).
+function takeQuantity(id, qty, { allowNegative = false } = {}) {
   return InventoryItem.findOneAndUpdate(
-    { _id: id, quantity: { $gte: qty - 1e-9 } },
+    allowNegative ? { _id: id } : { _id: id, quantity: { $gte: qty - 1e-9 } },
     { $inc: { quantity: -qty } },
     { new: true }
   );

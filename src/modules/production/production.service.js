@@ -183,6 +183,12 @@ function stageTitle(stage) {
   return FLOOR_STAGES.find((item) => item.id === stage)?.label || stage;
 }
 
+// Company raw material (not WIP, not a customer's own material) may run into
+// negative stock: the floor is never stopped because the store is behind.
+function canGoNegative(lot) {
+  return Boolean(lot) && lot.category === INVENTORY_CATEGORIES.RAW && lot.kind !== 'wip' && !lot.salesOrder;
+}
+
 function toPublicLot(lot, fromStage) {
   if (!lot) return null;
   return {
@@ -194,6 +200,7 @@ function toPublicLot(lot, fromStage) {
     kind: lot.kind || 'catalog',
     category: lot.category,
     notes: lot.notes || '',
+    canGoNegative: canGoNegative(lot),
   };
 }
 
@@ -265,16 +272,20 @@ async function listSourceLots(order, item, stage, cache = null) {
     const rawName = String(item.manufacturing?.rawMaterial || item.material || '').toLowerCase();
     const rawItems = await loadRawLots(cache);
     const ownLot = (row) => Boolean(row.salesOrder) && String(row.salesOrder?._id || row.salesOrder) === String(order._id);
-    const inStock = rawItems.filter((row) => Number(row.quantity) > 0 && (!row.salesOrder || ownLot(row)));
+    const own = rawItems.filter((row) => ownLot(row) && Number(row.quantity) > 0);
+    const company = rawItems.filter((row) => !row.salesOrder);
     const words = rawName.split(/[^a-z0-9]+/).filter((word) => word.length > 1 && word !== 'granules');
     const matches = (row) => {
       const hay = `${row.name || ''} ${row.materialType || ''}`.toLowerCase();
       if (hay.includes(rawName)) return true;
       return words.length > 0 && words.every((word) => hay.includes(word));
     };
-    const own = inStock.filter(ownLot);
     // A line with no raw material named is offered only its own (customer) lots.
-    const shared = rawName ? inStock.filter((row) => !ownLot(row) && matches(row)) : [];
+    // Matching company stock is offered even at zero or below; when nothing
+    // matches the name, any company raw material can be picked.
+    let shared = rawName ? company.filter(matches) : [];
+    if (rawName && !shared.length) shared = company;
+    shared = [...shared].sort((a, b) => (Number(b.quantity) || 0) - (Number(a.quantity) || 0));
     return [...own, ...shared].map((lot) => toPublicLot(lot, ''));
   }
 
@@ -429,7 +440,7 @@ function logUndoFailure(error) {
 
 async function takeFromLot(lot, qty) {
   if (!lot) throw new ApiError(400, 'That inventory lot was not found');
-  const updated = await itemRepo.takeQuantity(lot._id, qty);
+  const updated = await itemRepo.takeQuantity(lot._id, qty, { allowNegative: canGoNegative(lot) });
   if (!updated) {
     const fresh = await itemRepo.findById(lot._id);
     throw new ApiError(400, `Only ${qtyText(fresh?.quantity)} is left on ${lot.name || 'that lot'}.`);
@@ -857,7 +868,7 @@ function chooseLot(lots, payload, needed) {
   const wanted = String(payload.lotId || '');
   const match = wanted
     ? lots.find((lot) => lot.id === wanted)
-    : lots.find((lot) => Number(lot.quantity) + 1e-9 >= needed);
+    : lots.find((lot) => Number(lot.quantity) + 1e-9 >= needed) || lots.find((lot) => lot.canGoNegative);
   if (wanted && !match) {
     throw new ApiError(400, 'That material is not available for this entry');
   }
@@ -868,7 +879,7 @@ function chooseLot(lots, payload, needed) {
       onHand > 0 ? `Only ${qtyText(onHand)} is in store. Enter that much or less.` : 'Nothing is in store for this entry'
     );
   }
-  if (Number(match.quantity) + 1e-9 < needed) {
+  if (!match.canGoNegative && Number(match.quantity) + 1e-9 < needed) {
     throw new ApiError(400, `Only ${qtyText(match.quantity)} is left on ${match.name}`);
   }
   return match;
@@ -1116,7 +1127,7 @@ async function restoreSource(order, item, row, qty, unit) {
 async function takeBack(lot, qty, message) {
   if (qty <= EPS) return;
   if (!lot) throw new ApiError(400, message);
-  const updated = await itemRepo.takeQuantity(lot._id, qty);
+  const updated = await itemRepo.takeQuantity(lot._id, qty, { allowNegative: canGoNegative(lot) });
   if (!updated) throw new ApiError(400, message);
 }
 

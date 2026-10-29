@@ -11,7 +11,8 @@ const itemSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     materialType: { type: String, required: true, trim: true },
     unit: { type: String, required: true, trim: true },
-    quantity: { type: Number, required: true, min: 0, default: 0 },
+    // Company raw stock can go negative when the floor uses more than was entered.
+    quantity: { type: Number, required: true, default: 0 },
     unitPrice: { type: Number, default: null, min: 0 },
     stage: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryStage', default: null },
     notes: { type: String, default: '', trim: true },

@@ -76,9 +76,10 @@ function text(value, label, { required = false } = {}) {
   return out;
 }
 
-function quantityOf(value) {
+function quantityOf(value, { allowNegative = false } = {}) {
   const qty = Number(value);
-  if (!Number.isFinite(qty) || qty < 0) throw new ApiError(400, 'Quantity must be a number 0 or greater');
+  if (!Number.isFinite(qty)) throw new ApiError(400, 'Quantity must be a number');
+  if (!allowNegative && qty < 0) throw new ApiError(400, 'Quantity must be a number 0 or greater');
   return qty;
 }
 
@@ -186,9 +187,11 @@ async function updateItem(id, payload, user = null) {
   let quantityDelta = 0;
   let expectedQuantity = Number(item.quantity) || 0;
   if (payload.quantity !== undefined) {
-    const wanted = quantityOf(payload.quantity);
+    // Raw stock may already be below zero from floor entries.
+    const allowNegative = category === INVENTORY_CATEGORIES.RAW;
+    const wanted = quantityOf(payload.quantity, { allowNegative });
     if (payload.expectedQuantity !== undefined && payload.expectedQuantity !== null && payload.expectedQuantity !== '') {
-      expectedQuantity = quantityOf(payload.expectedQuantity);
+      expectedQuantity = quantityOf(payload.expectedQuantity, { allowNegative: true });
     }
     quantityDelta = wanted - expectedQuantity;
   }

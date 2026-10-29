@@ -97,7 +97,7 @@ router.patch(
     body('name').optional().trim().notEmpty().withMessage('Name cannot be empty'),
     body('materialType').optional().trim().notEmpty().withMessage('Material type cannot be empty'),
     body('unit').optional().trim().notEmpty().withMessage('Unit cannot be empty'),
-    body('quantity').optional().isFloat({ min: 0 }).withMessage('Quantity must be 0 or greater'),
+    body('quantity').optional().isFloat().withMessage('Quantity must be a number'),
     body('stageId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid stage'),
   ]),
   inventoryController.updateItem

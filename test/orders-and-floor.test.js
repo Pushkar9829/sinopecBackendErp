@@ -1,6 +1,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const h = require('./helpers');
+const { ObjectId } = require('mongodb');
 
 let db;
 let owner;
@@ -158,9 +159,14 @@ test('photos sent inline are stored as files; the order keeps only the link', as
   assert.match(saved.items[0].image.url, /^\/uploads\/products\//);
 });
 
-test('floor error messages round quantities', async () => {
+test('company raw stock can be picked below zero', async () => {
   const { job, stage } = await freshFloorJob();
-  const res = await owner.post('/api/production/pickup', { orderId: job.orderId, itemId: job.itemId, stage, lotId: job.sourceLots[0].id, qty: 1e9 });
-  assert.equal(res.status, 400);
-  assert.doesNotMatch(res.data.message, /\d\.\d{4,}/);
+  const lotId = job.sourceLots[0].id;
+  const before = await lots.findOne({ _id: new ObjectId(lotId) });
+  const res = await owner.post('/api/production/pickup', { orderId: job.orderId, itemId: job.itemId, stage, lotId, qty: before.quantity + 25 });
+  assert.equal(res.status, 200, res.data.message);
+  const after = await lots.findOne({ _id: new ObjectId(lotId) });
+  assert.ok(Math.abs(after.quantity - -25) < 1e-6);
+  // A negative lot can still be edited from Inventory.
+  assert.equal((await owner.patch(`/api/inventory/items/${lotId}`, { notes: 'short', quantity: after.quantity })).status, 200);
 });

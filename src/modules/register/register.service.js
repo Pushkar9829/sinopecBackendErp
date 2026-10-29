@@ -446,7 +446,7 @@ async function getByOrder(user, orderId) {
         line.ready && item
           ? await require('../production/production.service').sourceLots(order, item, stage.id, lotCache)
           : [];
-      const hasMaterial = inHand || line.noStock || lots.some((lot) => Number(lot.quantity) > 0);
+      const hasMaterial = inHand || line.noStock || lots.length > 0;
       line.canEnter = Boolean(line.canMark && hasMaterial);
       line.blockedReason = line.canMark && !hasMaterial ? 'Nothing in store' : '';
     }
@@ -477,7 +477,7 @@ async function getStage(user, stage, query = {}) {
         ? await require('../production/production.service').sourceLots(order, item, stage, lotCache)
         : [];
       const inHand = item.stagePickup?.stage === stage && Number(item.stagePickup.qty) > 0;
-      const hasMaterial = inHand || line.noStock || sourceLots.some((lot) => Number(lot.quantity) > 0);
+      const hasMaterial = inHand || line.noStock || sourceLots.length > 0;
       if (line.ready && hasMaterial) {
         open.push({
           orderId: String(order._id),
